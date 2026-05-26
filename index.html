@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Western Blot Fold Change Analyzer</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Western blot analysis</p>
+            <h1>Fold Change Analyzer</h1>
+          </div>
+          <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
+        </header>
+
+        <section class="panel settings-bar" aria-label="Workflow settings">
+          <label>
+            Analysis mode
+            <select id="analysisMode">
+              <option value="shared">Multiple samples, one control</option>
+              <option value="comparison">Compare sample/control pairs</option>
+            </select>
+          </label>
+          <label id="sharedCountWrap">
+            Number of sample files
+            <input id="sampleCount" type="number" min="1" max="12" step="1" value="1" />
+          </label>
+          <label id="pairCountWrap" hidden>
+            Number of sample/control pairs
+            <input id="pairCount" type="number" min="2" max="12" step="1" value="2" />
+          </label>
+          <label id="comparisonChartWrap" hidden>
+            Comparison graph
+            <select id="comparisonChartType">
+              <option value="grouped">Grouped bars</option>
+              <option value="points">Average bar with points</option>
+            </select>
+          </label>
+        </section>
+
+        <section id="sharedWorkflow">
+          <section class="panel input-grid" aria-label="Workbook inputs">
+            <div class="upload-column">
+              <div class="section-heading">
+                <span class="badge sample">Samples</span>
+                <h2>Sample protein files</h2>
+              </div>
+              <div id="sampleInputs" class="stacked-inputs"></div>
+            </div>
+
+            <div class="upload-column">
+              <div class="section-heading">
+                <span class="badge control">Control</span>
+                <h2>Shared loading control file</h2>
+              </div>
+              <label class="file-drop">
+                <input id="controlFile" type="file" accept=".xlsx,.xls,.csv,.tsv" />
+                <span id="controlFileName">Choose Excel or CSV file</span>
+              </label>
+              <div class="field-row">
+                <label for="controlProtein">Protein name</label>
+                <input id="controlProtein" type="text" placeholder="e.g. GAPDH" />
+              </div>
+              <div class="mapping-grid">
+                <label>
+                  Sheet
+                  <select id="controlSheet"></select>
+                </label>
+                <label>
+                  Lane column
+                  <select id="controlLaneColumn"></select>
+                </label>
+                <label>
+                  Signal column
+                  <select id="controlSignalColumn"></select>
+                </label>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section id="comparisonWorkflow" hidden>
+          <section class="panel">
+            <div class="comparison-heading">
+              <div>
+                <span class="badge sample">Pairs</span>
+                <h2>Sample/control pairs for one sample protein</h2>
+              </div>
+            </div>
+            <div id="pairInputs" class="pair-grid"></div>
+          </section>
+        </section>
+
+        <section class="panel settings-bar" aria-label="Analysis settings">
+          <label>
+            Normalization lane
+            <select id="normalizationLane"></select>
+          </label>
+          <label>
+            Grouping mode
+            <select id="groupMode">
+              <option value="interleaved">Group every N lanes</option>
+              <option value="blocks">First N lanes, next N lanes</option>
+              <option value="custom">Pick lanes manually</option>
+            </select>
+          </label>
+          <label>
+            Group size
+            <input id="groupSize" type="number" min="2" max="24" step="1" value="2" />
+          </label>
+          <label class="checkbox-line" id="groupToggleWrap">
+            <input id="enableGroupedGraphs" type="checkbox" />
+            Show grouped graphs
+          </label>
+          <button class="primary-button" id="analyzeButton" type="button">Analyze</button>
+        </section>
+
+        <section id="sharedResults">
+          <div class="panel tabs-panel" id="sampleTabsPanel" hidden>
+            <div id="sampleTabs" class="tabs"></div>
+          </div>
+
+          <section class="results-layout" aria-label="Analysis results">
+            <div class="panel chart-panel">
+              <div class="chart-header">
+                <div>
+                  <p class="eyebrow">Adjusted expression</p>
+                  <h2 id="chartTitle">Upload files to begin</h2>
+                </div>
+                <div class="button-row">
+                  <button class="ghost-button" id="downloadChartButton" type="button" disabled>Export JPG</button>
+                  <button class="ghost-button" id="downloadCsvButton" type="button" disabled>Export CSV</button>
+                </div>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="foldChart" width="960" height="520" aria-label="Fold change bar chart"></canvas>
+              </div>
+            </div>
+
+            <div class="panel table-panel">
+              <h2>Computed data</h2>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Graph label</th>
+                      <th>Sample %</th>
+                      <th>Control %</th>
+                      <th>Fold change</th>
+                    </tr>
+                  </thead>
+                  <tbody id="resultTableBody">
+                    <tr>
+                      <td colspan="4">No analysis yet.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel label-panel" id="labelPanel" hidden>
+            <div class="chart-header">
+              <div>
+                <p class="eyebrow">Graph labels</p>
+                <h2>Edit lane names</h2>
+              </div>
+            </div>
+            <div class="label-grid" id="labelEditor"></div>
+          </section>
+
+          <section class="panel group-panel" id="groupPanel" hidden>
+            <h2>Grouped graphs</h2>
+            <p>
+              Use interleaved grouping for patterns like lanes 1, 3, 5 and 2, 4, 6. Use block
+              grouping for the first N lanes, then the next N lanes. Use custom grouping to pick
+              exactly which lanes belong together.
+            </p>
+            <div id="customGroupingPanel" class="custom-grouping" hidden>
+              <div class="custom-grouping-header">
+                <h3>Custom lane groups</h3>
+                <button class="ghost-button" id="addCustomGroupButton" type="button">Add group</button>
+              </div>
+              <div id="customGroups" class="custom-group-grid"></div>
+            </div>
+            <div id="groupSummary" class="group-grid"></div>
+            <div id="blockGraphs" class="mini-chart-grid"></div>
+          </section>
+        </section>
+
+        <section id="comparisonResults" hidden>
+          <section class="panel label-panel" id="comparisonLabelPanel" hidden>
+            <div class="chart-header">
+              <div>
+                <p class="eyebrow">Comparison labels</p>
+                <h2>Match lanes across samples</h2>
+              </div>
+            </div>
+            <div id="comparisonLabelEditor" class="comparison-labels"></div>
+          </section>
+
+          <section class="panel chart-panel" id="comparisonChartPanel" hidden>
+            <div class="chart-header">
+                <div>
+                  <p class="eyebrow">Common lanes only</p>
+                  <h2 id="comparisonChartTitle">Comparison graph</h2>
+                </div>
+                <button class="ghost-button" id="downloadComparisonChartButton" type="button" disabled>Export JPG</button>
+              </div>
+            <div class="chart-wrap">
+              <canvas id="comparisonChart" width="1080" height="560" aria-label="Comparison graph"></canvas>
+            </div>
+          </section>
+
+          <section class="panel group-panel" id="comparisonGroupPanel" hidden>
+            <h2>Grouped comparison graphs</h2>
+            <p>
+              Grouping uses only lane labels that are present in every sample/control pair.
+            </p>
+            <div id="comparisonCustomGroupingPanel" class="custom-grouping" hidden>
+              <div class="custom-grouping-header">
+                <h3>Custom comparison groups</h3>
+                <button class="ghost-button" id="addComparisonCustomGroupButton" type="button">Add group</button>
+              </div>
+              <div id="comparisonCustomGroups" class="custom-group-grid"></div>
+            </div>
+            <div id="comparisonGroupSummary" class="group-grid"></div>
+            <div id="comparisonGroupedCharts" class="mini-chart-grid"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
