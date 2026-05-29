@@ -1,24 +1,38 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Western Blot Fold Change Analyzer</title>
-    <link rel="stylesheet" href="./styles.css" />
-    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
-    <script src="./app.js" defer></script>
-  </head>
-  <body>
-    <main class="app-shell">
-      <section class="workspace">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Western blot analysis</p>
-            <h1>Fold Change Analyzer</h1>
-          </div>
-          <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
-        </header>
 
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Western Blot Fold Change Analyzer</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+
+<body>
+  <main class="app-shell">
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Western blot analysis</p>
+          <h1>Fold Change Analyzer</h1>
+        </div>
+        <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
+      </header>
+
+      <nav class="main-tabs" aria-label="Main navigation">
+        <button class="main-tab-button active" type="button" data-main-tab="quantification">
+          Quantification
+        </button>
+        <button class="main-tab-button" type="button" data-main-tab="blot-browser">
+          Blot Browser
+        </button>
+      </nav>
+
+      <div id="tab-quantification">
         <section class="panel settings-bar" aria-label="Workflow settings">
           <label>
             Analysis mode
@@ -46,6 +60,8 @@
 
         <section id="sharedWorkflow">
           <section class="panel input-grid" aria-label="Workbook inputs">
+
+            <!-- Samples column -->
             <div class="upload-column">
               <div class="section-heading">
                 <span class="badge sample">Samples</span>
@@ -54,34 +70,69 @@
               <div id="sampleInputs" class="stacked-inputs"></div>
             </div>
 
+            <!-- Control column -->
             <div class="upload-column">
               <div class="section-heading">
                 <span class="badge control">Control</span>
                 <h2>Shared loading control file</h2>
               </div>
-              <label class="file-drop">
-                <input id="controlFile" type="file" accept=".xlsx,.xls,.csv,.tsv" />
-                <span id="controlFileName">Choose Excel or CSV file</span>
-              </label>
-              <div class="field-row">
-                <label for="controlProtein">Protein name</label>
-                <input id="controlProtein" type="text" placeholder="e.g. GAPDH" />
+
+              <div class="source-toggle">
+                <button class="source-btn active" type="button" data-source-group="control-0"
+                  onclick="switchSource(this, 'control', 0, 'file')">
+                  📁 Upload file
+                </button>
+                <button class="source-btn" type="button" data-source-group="control-0"
+                  onclick="switchSource(this, 'control', 0, 'blot')">
+                  🔬 Use blot
+                </button>
               </div>
-              <div class="mapping-grid">
-                <label>
-                  Sheet
-                  <select id="controlSheet"></select>
+
+              <div id="control-file-0">
+                <label class="file-drop">
+                  <input id="controlFile" type="file" accept=".xlsx,.xls,.csv,.tsv" />
+                  <span id="controlFileName">Choose Excel or CSV file</span>
                 </label>
-                <label>
-                  Lane column
-                  <select id="controlLaneColumn"></select>
-                </label>
-                <label>
-                  Signal column
-                  <select id="controlSignalColumn"></select>
-                </label>
+                <div class="field-row">
+                  <label for="controlProtein">Protein name</label>
+                  <input id="controlProtein" type="text" placeholder="e.g. GAPDH" />
+                </div>
+                <div class="mapping-grid">
+                  <label>
+                    Sheet
+                    <select id="controlSheet"></select>
+                  </label>
+                  <label>
+                    Lane column
+                    <select id="controlLaneColumn"></select>
+                  </label>
+                  <label>
+                    Signal column
+                    <select id="controlSignalColumn"></select>
+                  </label>
+                </div>
+              </div>
+
+              <div id="control-blot-0" class="source-panel" hidden>
+                <div class="field-row">
+                  <label>
+                    Blot
+                    <select data-blot-source-blot="control-0" onchange="refreshScanDropdown('control', 0)">
+                      <option value="">-- Select blot --</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="field-row">
+                  <label>
+                    Protein scan
+                    <select data-blot-source-scan="control-0">
+                      <option value="">-- Select scan --</option>
+                    </select>
+                  </label>
+                </div>
               </div>
             </div>
+
           </section>
         </section>
 
@@ -192,6 +243,19 @@
             <div id="groupSummary" class="group-grid"></div>
             <div id="blockGraphs" class="mini-chart-grid"></div>
           </section>
+
+          <section class="panel pptx-panel" id="pptxPanel" hidden>
+            <div class="chart-header">
+              <div>
+                <p class="eyebrow">Export</p>
+                <h2>Generate PowerPoint</h2>
+              </div>
+              <button class="primary-button" id="generatePptxBtn" type="button" onclick="generatePowerPoint()">
+                Export PowerPoint
+              </button>
+            </div>
+            <p>Generates a presentation with all blot images on slide 1, followed by one graph slide per sample protein.</p>
+          </section>
         </section>
 
         <section id="comparisonResults" hidden>
@@ -207,12 +271,12 @@
 
           <section class="panel chart-panel" id="comparisonChartPanel" hidden>
             <div class="chart-header">
-                <div>
-                  <p class="eyebrow">Common lanes only</p>
-                  <h2 id="comparisonChartTitle">Comparison graph</h2>
-                </div>
-                <button class="ghost-button" id="downloadComparisonChartButton" type="button" disabled>Export JPG</button>
+              <div>
+                <p class="eyebrow">Common lanes only</p>
+                <h2 id="comparisonChartTitle">Comparison graph</h2>
               </div>
+              <button class="ghost-button" id="downloadComparisonChartButton" type="button" disabled>Export JPG</button>
+            </div>
             <div class="chart-wrap">
               <canvas id="comparisonChart" width="1080" height="560" aria-label="Comparison graph"></canvas>
             </div>
@@ -234,7 +298,40 @@
             <div id="comparisonGroupedCharts" class="mini-chart-grid"></div>
           </section>
         </section>
-      </section>
-    </main>
-  </body>
+      </div>
+
+      <div id="tab-blot-browser" hidden>
+        <section class="panel blot-browser-panel" aria-label="Blot browser">
+          <div class="blot-browser-header">
+            <div>
+              <p class="eyebrow">Image viewer</p>
+              <h2>Blot Browser</h2>
+            </div>
+            <label class="file-drop blot-zip-drop">
+              <input id="zipFileInput" type="file" accept=".zip" multiple />
+              <span>Choose ZIP file(s) — multiple allowed</span>
+            </label>
+          </div>
+
+          <div class="blot-browser-layout">
+            <div class="blot-list-wrap">
+              <p class="eyebrow">Loaded blots</p>
+              <div id="blotList" class="blot-list">
+                <p class="blot-empty-state">No blots loaded yet.</p>
+              </div>
+            </div>
+
+            <div class="blot-viewer-wrap">
+              <div id="blotPreview" class="blot-preview">
+                <p class="blot-empty-state">Select a blot to preview</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+    </section>
+  </main>
+</body>
+
 </html>

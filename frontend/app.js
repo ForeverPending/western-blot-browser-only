@@ -1,3 +1,4 @@
+const BACKEND_URL = CONFIG.BACKEND_URL;
 const state = {
   mode: "shared",
   sharedSamples: [],
@@ -9,7 +10,6 @@ const state = {
   comparisonCustomGroups: [],
   chartTitle: "",
 };
-
 const els = {
   analysisMode: document.querySelector("#analysisMode"),
   sharedCountWrap: document.querySelector("#sharedCountWrap"),
@@ -175,29 +175,66 @@ function sampleCardHtml(index) {
   return `
     <div class="sample-card">
       <h3>Sample ${index + 1}</h3>
-      <label class="file-drop">
-        <input data-shared-sample-file="${index}" type="file" accept=".xlsx,.xls,.csv,.tsv" />
-        <span data-shared-sample-file-name="${index}">${state.sharedSamples[index]?.fileLabel || "Choose Excel or CSV file"}</span>
-      </label>
-      <div class="field-row">
-        <label>
-          Protein name
-          <input data-shared-sample-protein="${index}" type="text" placeholder="e.g. pERK" value="${escapeHtml(state.sharedSamples[index]?.proteinName || "")}" />
-        </label>
+
+      <div class="source-toggle">
+        <button class="source-btn active" type="button"
+          data-source-target="sample-file-${index}"
+          data-source-group="sample-${index}"
+          onclick="switchSource(this, 'sample', ${index}, 'file')">
+          📁 Upload file
+        </button>
+        <button class="source-btn" type="button"
+          data-source-target="sample-blot-${index}"
+          data-source-group="sample-${index}"
+          onclick="switchSource(this, 'sample', ${index}, 'blot')">
+          🔬 Use blot
+        </button>
       </div>
-      <div class="mapping-grid">
-        <label>
-          Sheet
-          <select data-shared-sample-sheet="${index}"></select>
+
+      <div id="sample-file-${index}" class="source-panel">
+        <label class="file-drop">
+          <input data-shared-sample-file="${index}" type="file" accept=".xlsx,.xls,.csv,.tsv" />
+          <span data-shared-sample-file-name="${index}">${state.sharedSamples[index]?.fileLabel || "Choose Excel or CSV file"}</span>
         </label>
-        <label>
-          Lane column
-          <select data-shared-sample-lane="${index}"></select>
-        </label>
-        <label>
-          Signal column
-          <select data-shared-sample-signal="${index}"></select>
-        </label>
+        <div class="field-row">
+          <label>
+            Protein name
+            <input data-shared-sample-protein="${index}" type="text" placeholder="e.g. pERK" value="${escapeHtml(state.sharedSamples[index]?.proteinName || "")}" />
+          </label>
+        </div>
+        <div class="mapping-grid">
+          <label>
+            Sheet
+            <select data-shared-sample-sheet="${index}"></select>
+          </label>
+          <label>
+            Lane column
+            <select data-shared-sample-lane="${index}"></select>
+          </label>
+          <label>
+            Signal column
+            <select data-shared-sample-signal="${index}"></select>
+          </label>
+        </div>
+      </div>
+
+      <div id="sample-blot-${index}" class="source-panel" hidden>
+        <div class="field-row">
+          <label>
+            Blot
+            <select data-blot-source-blot="sample-${index}" onchange="refreshScanDropdown('sample', ${index})">
+              <option value="">-- Select blot --</option>
+            </select>
+          </label>
+        </div>
+        <div class="field-row">
+          <label>
+            Protein scan
+            <select data-blot-source-scan="sample-${index}">
+              <option value="">-- Select scan --</option>
+            </select>
+          </label>
+        </div>
       </div>
     </div>
   `;
@@ -440,12 +477,35 @@ function findHeader(headers, terms) {
 
 function refreshNormalizationLanes() {
   const previous = els.normalizationLane.value;
-  const source = state.mode === "comparison" ? state.pairedSets[0]?.sample : state.sharedSamples[0];
-  const controls = state.mode === "comparison" ? pairControls[0]?.sample : sharedSampleControls[0];
-  const lanes = source && controls ? extractLaneNames(source, controls) : [];
+  let lanes = [];
+
+  if (state.mode === "comparison") {
+    const source = state.pairedSets[0]?.sample;
+    const controls = pairControls[0]?.sample;
+    lanes = source && controls ? extractLaneNames(source, controls) : [];
+  } else {
+    // Check if sample 0 is using blot source mode
+    const blotPanel = document.getElementById("sample-blot-0");
+    const usingBlot = blotPanel && !blotPanel.hidden;
+
+    if (usingBlot) {
+      const blotSelect = document.querySelector(`[data-blot-source-blot="sample-0"]`);
+      const scanSelect = document.querySelector(`[data-blot-source-scan="sample-0"]`);
+      if (blotSelect?.value && scanSelect?.value !== "") {
+        const scan = blotState.scans[blotSelect.value]?.[Number(scanSelect.value)];
+        lanes = scan ? scan.lanes.map(lane => lane.name) : [];
+      }
+    } else {
+      const source = state.sharedSamples[0];
+      const controls = sharedSampleControls[0];
+      lanes = source && controls ? extractLaneNames(source, controls) : [];
+    }
+  }
+
   els.normalizationLane.innerHTML = lanes
     .map((lane) => `<option value="${escapeHtml(lane)}">${escapeHtml(lane)}</option>`)
     .join("");
+
   if (lanes.includes(previous)) {
     els.normalizationLane.value = previous;
   } else if (lanes.length) {
@@ -477,19 +537,55 @@ function renderCurrentGrouping() {
 
 function runSharedAnalysis() {
   try {
-    const controlRows = buildRows(state.sharedControl, sharedControlControls());
-    if (!controlRows.length) throw new Error("The shared control file needs readable lanes and signals.");
+    // Get control dataset — file or blot
+    let controlDataset, controlProteinName;
+    const controlBlotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
+    const controlScanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
+    const controlUsingBlot = controlBlotSelect && !document.getElementById("control-blot-0")?.hidden;
+
+    if (controlUsingBlot && controlBlotSelect.value && controlScanSelect.value !== "") {
+      controlDataset = scanToDataset(controlBlotSelect.value, Number(controlScanSelect.value));
+      controlProteinName = controlDataset.proteinName;
+    } else {
+      controlDataset = state.sharedControl;
+      controlProteinName = els.controlProtein.value.trim() || "Loading control";
+    }
+
+    const controlRows = buildRows(controlDataset, controlUsingBlot
+      ? { lane: { value: "Name" }, signal: { value: "Signal" } }
+      : sharedControlControls()
+    );
+    if (!controlRows.length) throw new Error("The control needs readable lanes and signals.");
 
     state.sharedAnalyses = state.sharedSamples.map((sampleDataset, index) => {
-      const controls = sharedSampleControls[index];
-      const sampleRows = buildRows(sampleDataset, controls);
+      const blotSelect = document.querySelector(`[data-blot-source-blot="sample-${index}"]`);
+      const scanSelect = document.querySelector(`[data-blot-source-scan="sample-${index}"]`);
+      const usingBlot = blotSelect && !document.getElementById(`sample-blot-${index}`)?.hidden;
+
+      let dataset, sampleProtein;
+      if (usingBlot && blotSelect.value && scanSelect.value !== "") {
+        dataset = scanToDataset(blotSelect.value, Number(scanSelect.value));
+        sampleProtein = dataset.proteinName;
+      } else {
+        dataset = sampleDataset;
+        const controls = sharedSampleControls[index];
+        sampleProtein = controls.protein.value.trim() || `Sample ${index + 1}`;
+      }
+
+      const controls = usingBlot
+        ? { lane: { value: "Name" }, signal: { value: "Signal" } }
+        : sharedSampleControls[index];
+
+      const sampleRows = buildRows(dataset, controls);
       if (!sampleRows.length) throw new Error(`Sample ${index + 1} needs readable lanes and signals.`);
 
-      const sampleProtein = controls.protein.value.trim() || `Sample ${index + 1}`;
       sampleDataset.proteinName = sampleProtein;
-      const controlProtein = els.controlProtein.value.trim() || "Loading control";
-      const title = `${sampleProtein} - ${controlProtein} fold change`;
-      return createAnalysisState(sampleProtein, title, computeFoldChange(sampleRows, controlRows, els.normalizationLane.value));
+      const title = `${sampleProtein} - ${controlProteinName} fold change`;
+      return createAnalysisState(
+        sampleProtein,
+        title,
+        computeFoldChange(sampleRows, controlRows, els.normalizationLane.value)
+      );
     });
 
     state.activeSampleIndex = Math.min(state.activeSampleIndex, state.sharedAnalyses.length - 1);
@@ -613,6 +709,7 @@ function renderActiveSharedAnalysis() {
   els.downloadChartButton.disabled = false;
   els.downloadCsvButton.disabled = false;
   els.labelPanel.hidden = false;
+  document.getElementById("pptxPanel").hidden = false;
 }
 
 function drawEmptyChart(canvas) {
@@ -1304,6 +1401,7 @@ function showSharedError(message) {
   els.downloadCsvButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
+  document.getElementById("pptxPanel").hidden = true;
 }
 
 function downloadGeneratedChart(event) {
@@ -1372,4 +1470,822 @@ function filenameSafe(value) {
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return cleaned || "western-blot-chart";
+}
+// ─── Main tab switching ────────────────────────────────────────────────────
+
+document.querySelectorAll(".main-tab-button").forEach(button => {
+  button.addEventListener("click", () => {
+    // Update active tab button
+    document.querySelectorAll(".main-tab-button").forEach(b => b.classList.remove("active"));
+    button.classList.add("active");
+
+    // Show correct content panel
+    const tab = button.dataset.mainTab;
+    document.getElementById("tab-quantification").hidden = tab !== "quantification";
+    document.getElementById("tab-blot-browser").hidden = tab !== "blot-browser";
+  });
+});
+
+// ─── Blot browser ─────────────────────────────────────────────────────────
+
+const blotState = {
+  blots: [],
+  activeBlotIndex: null,
+  scans: {},  // key: blotId, value: array of {proteinName, channel, bgAxis, lanes: [{name, signal}]}
+};
+
+document.querySelector("#zipFileInput")?.addEventListener("change", async (event) => {
+  const files = Array.from(event.target.files);
+  for (const file of files) {
+    await uploadZip(file);
+  }
+  event.target.value = "";
+});
+
+document.querySelector("#blotList")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-blot-index]");
+  if (!button) return;
+  selectBlot(Number(button.dataset.blotIndex));
+});
+
+function renderBlotList() {
+  const container = document.querySelector("#blotList");
+  if (!container) return;
+
+  if (!blotState.blots.length) {
+    container.innerHTML = `<p class="blot-empty-state">No blots loaded yet.</p>`;
+    return;
+  }
+
+  container.innerHTML = blotState.blots
+    .map((blot, index) => `
+      <button class="blot-list-item ${index === blotState.activeBlotIndex ? "active" : ""}"
+        type="button"
+        data-blot-index="${index}">
+        ${escapeHtml(blot.name)}
+      </button>
+    `)
+    .join("");
+}
+
+function switchSource(button, role, index, mode) {
+  const group = button.dataset.sourceGroup;
+  document.querySelectorAll(`[data-source-group="${group}"]`).forEach(btn => {
+    btn.classList.remove("active");
+  });
+  button.classList.add("active");
+
+  document.getElementById(`${role}-file-${index}`).hidden = mode === "blot";
+  document.getElementById(`${role}-blot-${index}`).hidden = mode === "file";
+
+  if (mode === "blot") {
+    refreshBlotSourceDropdowns();
+    // Wire up scan dropdown change to refresh normalization lanes
+    const scanSelect = document.querySelector(`[data-blot-source-scan="${role}-${index}"]`);
+    scanSelect?.addEventListener("change", refreshNormalizationLanes);
+  } else {
+    refreshNormalizationLanes();
+  }
+}
+
+function refreshBlotSourceDropdowns() {
+  document.querySelectorAll("[data-blot-source-blot]").forEach(select => {
+    const currentValue = select.value;
+    select.innerHTML = `<option value="">-- Select blot --</option>` +
+      blotState.blots
+        .filter(blot => blotState.scans[blot.id]?.length > 0)
+        .map(blot => `<option value="${escapeHtml(blot.id)}" ${blot.id === currentValue ? "selected" : ""}>${escapeHtml(blot.name)}</option>`)
+        .join("");
+  });
+}
+
+function refreshScanDropdown(role, index) {
+  const blotSelect = document.querySelector(`[data-blot-source-blot="${role}-${index}"]`);
+  const scanSelect = document.querySelector(`[data-blot-source-scan="${role}-${index}"]`);
+  if (!blotSelect || !scanSelect) return;
+
+  const blotId = blotSelect.value;
+  const scans = blotState.scans[blotId] || [];
+
+  scanSelect.innerHTML = `<option value="">-- Select scan --</option>` +
+    scans.map((scan, i) => `
+      <option value="${i}">${escapeHtml(scan.proteinName)} (${scan.lanes.length} lanes)</option>
+    `).join("");
+
+  // Add this line:
+  refreshNormalizationLanes();
+}
+
+async function uploadZip(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try {
+    const response = await fetch(`${BACKEND_URL}/upload-zip`, {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+
+    // Merge new blots into existing list
+    blotState.blots.push(...data.blots);
+    renderBlotList();
+  } catch (error) {
+    alert(`Failed to load ZIP: ${error.message}`);
+  }
+}
+
+async function selectBlot(index) {
+  blotState.activeBlotIndex = index;
+  renderBlotList();
+
+  const blot = blotState.blots[index];
+  const preview = document.querySelector("#blotPreview");
+  if (!preview) return;
+
+  // Show loading state
+  preview.innerHTML = `<p class="blot-empty-state">Loading...</p>`;
+
+  try {
+    // Build the viewer UI
+    preview.innerHTML = `
+      <div class="blot-viewer">
+
+        <div class="blot-controls-bar">
+          <div class="blot-control-group">
+            <label>Color mode
+              <select id="colorMode">
+                <option value="color">Red / Green</option>
+                <option value="grayscale">Black & White</option>
+              </select>
+            </label>
+            <label>Quantify channel
+              <select id="quantChannel">
+                <option value="700">700nm</option>
+                <option value="800">800nm</option>
+              </select>
+            </label>
+            <label>Background
+              <select id="bgAxis">
+                <option value="leftright">Left & Right</option>
+                <option value="topbottom">Top & Bottom</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="blot-control-group">
+            <span class="channel-label red">700nm</span>
+            <label>Brightness
+              <input type="range" min="0.1" max="3" step="0.05" value="1" id="brightness700" />
+            </label>
+            <label>Contrast
+              <input type="range" min="0.1" max="5" step="0.1" value="1" id="contrast700" />
+            </label>
+          </div>
+
+          <div class="blot-control-group">
+            <span class="channel-label green">800nm</span>
+            <label>Brightness
+              <input type="range" min="0.1" max="3" step="0.05" value="1" id="brightness800" />
+            </label>
+            <label>Contrast
+              <input type="range" min="0.1" max="5" step="0.1" value="1" id="contrast800" />
+            </label>
+          </div>
+
+          <div class="blot-control-group">
+            <label>Mode
+              <div class="mode-toggle">
+                <button class="mode-btn active" id="modePan" type="button">✋ Pan</button>
+                <button class="mode-btn" id="modeDraw" type="button">⬚ Draw</button>
+              </div>
+            </label>
+            <button class="ghost-button" id="extractSignalsBtn" type="button">Extract signals</button>
+            <button class="ghost-button" id="clearBoxesBtn" type="button">Clear all</button>
+          </div>
+        </div>
+
+        <div class="blot-canvas-wrap">
+          <canvas id="blotCanvas"></canvas>
+        </div>
+
+        <div class="blot-box-list-wrap">
+          <p class="eyebrow" style="margin-bottom:8px;">Drawn boxes</p>
+          <div id="blotBoxList" class="blot-box-list">
+            <p class="blot-empty-state">No boxes drawn yet.</p>
+          </div>
+        </div>
+
+      </div>
+    `;
+
+    // Initialize canvas
+    initCanvas(blot.id);
+
+    // Wire up sliders and color mode to reload the canvas image
+    ["brightness700", "contrast700", "brightness800", "contrast800", "colorMode"].forEach(id => {
+      document.getElementById(id)?.addEventListener("input", () => {
+        loadCanvasImage(blot.id);
+      });
+      document.getElementById(id)?.addEventListener("change", () => {
+        loadCanvasImage(blot.id);
+      });
+    });
+
+  } catch (error) {
+    preview.innerHTML = `<p class="blot-empty-state">Failed to load blot: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+// ─── Blot canvas engine ───────────────────────────────────────────────────────
+
+let canvasState = {
+  image: null,          // HTMLImageElement
+  boxes: [],            // array of {x, y, w, h} in image coords
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  mode: "pan",          // "pan" or "draw"
+  isPanning: false,
+  isDrawing: false,
+  startX: 0,
+  startY: 0,
+  lastPanX: 0,
+  lastPanY: 0,
+  currentBlotId: null,
+  imageWidth: 0,
+  imageHeight: 0,
+};
+
+function initCanvas(blotId) {
+  canvasState.boxes = [];
+  canvasState.zoom = 1;
+  canvasState.panX = 0;
+  canvasState.panY = 0;
+  canvasState.mode = "pan";
+  canvasState.currentBlotId = blotId;
+
+  const canvas = document.getElementById("blotCanvas");
+  if (!canvas) return;
+
+  // Set canvas size to fill its container
+  const wrap = canvas.parentElement;
+  canvas.width = wrap.clientWidth || 800;
+  canvas.height = 520;
+
+  // Load composite image onto canvas
+  loadCanvasImage(blotId);
+
+  // Wire up mode buttons
+  document.getElementById("modePan")?.addEventListener("click", () => setCanvasMode("pan"));
+  document.getElementById("modeDraw")?.addEventListener("click", () => setCanvasMode("draw"));
+  document.getElementById("clearBoxesBtn")?.addEventListener("click", () => {
+    canvasState.boxes = [];
+    renderCanvas();
+    renderBoxList(blotId);
+  });
+  document.getElementById("extractSignalsBtn")?.addEventListener("click", () => extractSignals(blotId));
+
+  // Mouse events
+  canvas.addEventListener("mousedown", onMouseDown);
+  canvas.addEventListener("mousemove", onMouseMove);
+  canvas.addEventListener("mouseup", onMouseUp);
+  canvas.addEventListener("mouseleave", onMouseUp);
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+}
+
+function setCanvasMode(mode) {
+  canvasState.mode = mode;
+  const canvas = document.getElementById("blotCanvas");
+  if (canvas) canvas.style.cursor = mode === "draw" ? "crosshair" : "grab";
+  document.getElementById("modePan")?.classList.toggle("active", mode === "pan");
+  document.getElementById("modeDraw")?.classList.toggle("active", mode === "draw");
+}
+
+async function loadCanvasImage(blotId) {
+  const url = buildCompositeUrl(blotId);
+  const img = new Image();
+  img.onload = () => {
+    canvasState.image = img;
+    canvasState.imageWidth = img.naturalWidth;
+    canvasState.imageHeight = img.naturalHeight;
+
+    // Fit image to canvas on first load
+    const canvas = document.getElementById("blotCanvas");
+    if (!canvas) return;
+    const scale = Math.min(canvas.width / img.naturalWidth, canvas.height / img.naturalHeight) * 0.9;
+    canvasState.zoom = scale;
+    canvasState.panX = (canvas.width  - img.naturalWidth  * scale) / 2;
+    canvasState.panY = (canvas.height - img.naturalHeight * scale) / 2;
+    renderCanvas();
+  };
+  img.src = url;
+}
+
+function buildCompositeUrl(blotId) {
+  const brightness700 = document.getElementById("brightness700")?.value ?? 1;
+  const contrast700   = document.getElementById("contrast700")?.value   ?? 1;
+  const brightness800 = document.getElementById("brightness800")?.value ?? 1;
+  const contrast800   = document.getElementById("contrast800")?.value   ?? 1;
+  const colorMode     = document.getElementById("colorMode")?.value     ?? "color";
+
+  const params = new URLSearchParams({
+    brightness_700: brightness700,
+    contrast_700:   contrast700,
+    brightness_800: brightness800,
+    contrast_800:   contrast800,
+    colormode:      colorMode,
+  });
+
+  return `${BACKEND_URL}/blot/${encodeURIComponent(blotId)}/composite?${params}`;
+}
+
+function renderCanvas() {
+  const canvas = document.getElementById("blotCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Dark background
+  ctx.fillStyle = "#1a1a1a";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (canvasState.image) {
+    ctx.save();
+    ctx.translate(canvasState.panX, canvasState.panY);
+    ctx.scale(canvasState.zoom, canvasState.zoom);
+    ctx.drawImage(canvasState.image, 0, 0);
+
+    // Draw boxes in image space
+    canvasState.boxes.forEach((box, index) => {
+      ctx.strokeStyle = "#facc15";
+      ctx.lineWidth = 2 / canvasState.zoom;
+      ctx.strokeRect(box.x, box.y, box.w, box.h);
+
+      // Number label
+      ctx.fillStyle = "#facc15";
+      ctx.font = `bold ${14 / canvasState.zoom}px Inter, sans-serif`;
+      ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
+    });
+
+    ctx.restore();
+  }
+}
+
+// ─── Mouse event handlers ─────────────────────────────────────────────────────
+
+function getImageCoords(canvas, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const canvasX = (clientX - rect.left) * scaleX;
+  const canvasY = (clientY - rect.top)  * scaleY;
+  return {
+    x: (canvasX - canvasState.panX) / canvasState.zoom,
+    y: (canvasY - canvasState.panY) / canvasState.zoom,
+  };
+}
+
+function onMouseDown(event) {
+  const canvas = event.target;
+  if (canvasState.mode === "pan") {
+    canvasState.isPanning = true;
+    canvasState.lastPanX = event.clientX;
+    canvasState.lastPanY = event.clientY;
+    canvas.style.cursor = "grabbing";
+  } else if (canvasState.mode === "draw") {
+    canvasState.isDrawing = true;
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    canvasState.startX = coords.x;
+    canvasState.startY = coords.y;
+  }
+}
+
+function onMouseMove(event) {
+  const canvas = event.target;
+  if (canvasState.isPanning) {
+    canvasState.panX += event.clientX - canvasState.lastPanX;
+    canvasState.panY += event.clientY - canvasState.lastPanY;
+    canvasState.lastPanX = event.clientX;
+    canvasState.lastPanY = event.clientY;
+    renderCanvas();
+  } else if (canvasState.isDrawing) {
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    // Draw preview box
+    renderCanvas();
+    const ctx = canvas.getContext("2d");
+    ctx.save();
+    ctx.translate(canvasState.panX, canvasState.panY);
+    ctx.scale(canvasState.zoom, canvasState.zoom);
+    ctx.strokeStyle = "#facc15";
+    ctx.lineWidth = 2 / canvasState.zoom;
+    ctx.setLineDash([4 / canvasState.zoom, 4 / canvasState.zoom]);
+    ctx.strokeRect(
+      canvasState.startX,
+      canvasState.startY,
+      coords.x - canvasState.startX,
+      coords.y - canvasState.startY
+    );
+    ctx.restore();
+  }
+}
+
+function onMouseUp(event) {
+  const canvas = document.getElementById("blotCanvas");
+  if (canvasState.isPanning) {
+    canvasState.isPanning = false;
+    if (canvas) canvas.style.cursor = "grab";
+  } else if (canvasState.isDrawing) {
+    canvasState.isDrawing = false;
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    const w = coords.x - canvasState.startX;
+    const h = coords.y - canvasState.startY;
+
+    // Only reject clicks with no drag at all
+    if (Math.abs(w) > 0.5 && Math.abs(h) > 0.5) {
+      canvasState.boxes.push({
+        x: w > 0 ? canvasState.startX : coords.x,
+        y: h > 0 ? canvasState.startY : coords.y,
+        w: Math.abs(w),
+        h: Math.abs(h),
+        signal: null,
+      });
+      renderCanvas();
+      renderBoxList(canvasState.currentBlotId);
+    }
+  }
+}
+
+function onWheel(event) {
+  event.preventDefault();
+  const canvas = document.getElementById("blotCanvas");
+  if (!canvas) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = (event.clientX - rect.left) * (canvas.width / rect.width);
+  const mouseY = (event.clientY - rect.top)  * (canvas.height / rect.height);
+
+  const zoomFactor = event.deltaY < 0 ? 1.1 : 0.9;
+  const newZoom = Math.min(20, Math.max(0.1, canvasState.zoom * zoomFactor));
+
+  // Zoom toward mouse position
+  canvasState.panX = mouseX - (mouseX - canvasState.panX) * (newZoom / canvasState.zoom);
+  canvasState.panY = mouseY - (mouseY - canvasState.panY) * (newZoom / canvasState.zoom);
+  canvasState.zoom = newZoom;
+  renderCanvas();
+}
+
+// ─── Box list ─────────────────────────────────────────────────────────────────
+
+function renderBoxList(blotId) {
+  const container = document.getElementById("blotBoxList");
+  if (!container) return;
+
+  if (!canvasState.boxes.length) {
+    container.innerHTML = `<p class="blot-empty-state">No boxes drawn yet.</p>`;
+    return;
+  }
+
+  container.innerHTML = `
+    ${canvasState.boxes.map((box, index) => `
+      <div class="box-list-item">
+        <span class="box-number">${index + 1}</span>
+        <input
+          type="text"
+          class="box-lane-name"
+          value="${escapeHtml(box.laneName || `Lane ${index + 1}`)}"
+          data-box-index="${index}"
+          placeholder="Lane name"
+        />
+        ${box.signal !== null ? `
+          <span class="box-signal">
+            <strong>${box.signal.adjusted_signal.toLocaleString()}</strong>
+            <span class="muted-text">(raw: ${box.signal.raw_signal.toLocaleString()})</span>
+          </span>
+        ` : `<span class="box-signal muted">No signal yet</span>`}
+        <div class="box-actions">
+          <button class="ghost-button box-btn" type="button"
+            onclick="moveBox(${index}, -1, '${escapeHtml(blotId)}')">↑</button>
+          <button class="ghost-button box-btn" type="button"
+            onclick="moveBox(${index}, 1, '${escapeHtml(blotId)}')">↓</button>
+          <button class="ghost-button box-btn danger" type="button"
+            onclick="deleteBox(${index}, '${escapeHtml(blotId)}')">✕</button>
+        </div>
+      </div>
+    `).join("")}
+
+    <div class="save-scan-bar">
+      <input type="text" id="scanProteinName" placeholder="Protein name (e.g. pERK)" />
+      <button class="primary-button" type="button" id="saveScanBtn">Save scan</button>
+    </div>
+
+    <div id="savedScansWrap">
+      ${renderSavedScans(blotId)}
+    </div>
+  `;
+
+  // Wire up lane name editing
+  container.querySelectorAll(".box-lane-name").forEach(input => {
+    input.addEventListener("input", (e) => {
+      const index = Number(e.target.dataset.boxIndex);
+      canvasState.boxes[index].laneName = e.target.value;
+    });
+  });
+
+  // Wire up save scan button
+  document.getElementById("saveScanBtn")?.addEventListener("click", () => saveScan(blotId));
+}
+
+function renderSavedScans(blotId) {
+  const scans = blotState.scans[blotId] || [];
+  if (!scans.length) return `<p class="blot-empty-state" style="margin-top:12px;">No scans saved yet.</p>`;
+
+  return `
+    <div class="saved-scans">
+      <p class="eyebrow" style="margin: 12px 0 8px;">Saved scans</p>
+      ${scans.map((scan, index) => `
+        <div class="saved-scan-item">
+          <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
+          <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.bgAxis}</span>
+          <button class="ghost-button box-btn danger" type="button"
+            onclick="deleteScan('${escapeHtml(blotId)}', ${index})"
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function saveScan(blotId) {
+  const proteinName = document.getElementById("scanProteinName")?.value.trim();
+  if (!proteinName) {
+    alert("Please enter a protein name before saving.");
+    return;
+  }
+
+  const hasSignals = canvasState.boxes.every(box => box.signal !== null);
+  if (!hasSignals) {
+    alert("Please extract signals before saving the scan.");
+    return;
+  }
+
+  const channel = document.getElementById("quantChannel")?.value ?? "700";
+  const bgAxis  = document.getElementById("bgAxis")?.value ?? "leftright";
+
+  const scan = {
+    proteinName,
+    channel,
+    bgAxis,
+    lanes: canvasState.boxes.map((box, index) => ({
+      name: box.laneName || `Lane ${index + 1}`,
+      signal: box.signal.adjusted_signal,
+    })),
+  };
+
+  if (!blotState.scans[blotId]) blotState.scans[blotId] = [];
+  blotState.scans[blotId].push(scan);
+
+  // Clear boxes for next scan
+  canvasState.boxes = [];
+  renderCanvas();
+  renderBoxList(blotId);
+
+  // Refresh quantification dropdowns if they exist
+  refreshBlotSourceDropdowns();
+}
+
+function deleteScan(blotId, scanIndex) {
+  if (!blotState.scans[blotId]) return;
+  blotState.scans[blotId].splice(scanIndex, 1);
+  renderBoxList(blotId);
+  refreshBlotSourceDropdowns();
+}
+
+function moveBox(index, direction, blotId) {
+  const newIndex = index + direction;
+  if (newIndex < 0 || newIndex >= canvasState.boxes.length) return;
+  const boxes = canvasState.boxes;
+  [boxes[index], boxes[newIndex]] = [boxes[newIndex], boxes[index]];
+  renderCanvas();
+  renderBoxList(blotId);
+}
+
+function deleteBox(index, blotId) {
+  canvasState.boxes.splice(index, 1);
+  renderCanvas();
+  renderBoxList(blotId);
+}
+
+async function extractSignals(blotId) {
+  if (!canvasState.boxes.length) {
+    alert("Draw some boxes first.");
+    return;
+  }
+
+  const channel = document.getElementById("quantChannel")?.value ?? "700";
+  const bgAxis  = document.getElementById("bgAxis")?.value ?? "leftright";
+
+  try {
+    const response = await fetch(`${BACKEND_URL}/blot/${encodeURIComponent(blotId)}/extract`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        boxes: canvasState.boxes.map(b => ({ x: b.x, y: b.y, w: b.w, h: b.h })),
+        channel,
+        background_axis: bgAxis,
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+
+    // Store signals back on boxes
+    data.results.forEach((result, index) => {
+      canvasState.boxes[index].signal = result;
+    });
+
+    renderBoxList(blotId);
+  } catch (error) {
+    alert(`Signal extraction failed: ${error.message}`);
+  }
+}
+
+// ─── Data Set Conversion ─────────────────────────────────────────────────────────────
+function scanToDataset(blotId, scanIndex) {
+  const scan = blotState.scans[blotId]?.[scanIndex];
+  if (!scan) return null;
+
+  const rows = scan.lanes.map(lane => ({
+    Name: lane.name,
+    Signal: lane.signal,
+  }));
+
+  return {
+    workbook: {
+      sheetNames: ["Data"],
+      getRows() { return rows; }
+    },
+    sheetName: "Data",
+    rows,
+    headers: ["Name", "Signal"],
+    fileLabel: `${scan.proteinName} (blot scan)`,
+    proteinName: scan.proteinName,
+  };
+}
+
+// ─── PowerPoint export ────────────────────────────────────────────────────────
+
+function canvasToBase64(canvas) {
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+async function urlToBase64(url) {
+  const response = await fetch(url);
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function generatePowerPoint() {
+  if (!state.sharedAnalyses.length) {
+    alert("Please run an analysis first.");
+    return;
+  }
+
+  const btn = document.getElementById("generatePptxBtn");
+  if (btn) {
+    btn.textContent = "Generating...";
+    btn.disabled = true;
+  }
+
+  try {
+    const slides = [];
+
+    // ── Slide 1: all blot images ──────────────────────────────────────────────
+    const imageSlide = { type: "images", images: [] };
+
+    for (let i = 0; i < state.sharedAnalyses.length; i++) {
+      const blotSelect = document.querySelector(`[data-blot-source-blot="sample-${i}"]`);
+      const scanSelect = document.querySelector(`[data-blot-source-scan="sample-${i}"]`);
+      const usingBlot  = blotSelect && !document.getElementById(`sample-blot-${i}`)?.hidden;
+
+      if (usingBlot && blotSelect?.value) {
+        const url = buildCompositeUrlForBlot(blotSelect.value);
+        const b64 = await urlToBase64(url);
+        const analysis = state.sharedAnalyses[i];
+        imageSlide.images.push({
+          image: b64,
+          label: `anti-${analysis.name}`,
+        });
+      }
+    }
+
+    // Control blot image
+    const controlBlotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
+    const controlUsingBlot  = controlBlotSelect && !document.getElementById("control-blot-0")?.hidden;
+    if (controlUsingBlot && controlBlotSelect?.value) {
+      const url = buildCompositeUrlForBlot(controlBlotSelect.value);
+      const b64 = await urlToBase64(url);
+      const controlScanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
+      const scan = blotState.scans[controlBlotSelect.value]?.[Number(controlScanSelect?.value)];
+      imageSlide.images.push({
+        image: b64,
+        label: `anti-${scan?.proteinName || "Loading control"}`,
+      });
+    }
+
+    if (imageSlide.images.length) slides.push(imageSlide);
+
+    // ── Slides 2+: one graph slide per sample analysis ────────────────────────
+    for (let i = 0; i < state.sharedAnalyses.length; i++) {
+      const analysis = state.sharedAnalyses[i];
+      const graphs = [];
+
+      // Main fold change chart — render to offscreen canvas
+      const mainCanvas = document.createElement("canvas");
+      mainCanvas.width  = 960;
+      mainCanvas.height = 520;
+      drawBarChart(mainCanvas, analysis.results, analysis.title);
+      graphs.push(canvasToBase64(mainCanvas));
+
+      // Grouped graphs if enabled
+      if (els.enableGroupedGraphs.checked) {
+        const prevActive = state.activeSampleIndex;
+        state.activeSampleIndex = i;
+        const groups = buildGroupedRows(analysis);
+        state.activeSampleIndex = prevActive;
+
+        for (const group of groups) {
+          const groupCanvas = document.createElement("canvas");
+          groupCanvas.width  = 640;
+          groupCanvas.height = 360;
+          const baseline = group.rows[0]?.foldChange || 1;
+          drawBarChart(
+            groupCanvas,
+            group.rows.map(row => ({ ...row, foldChange: row.foldChange / baseline })),
+            group.name
+          );
+          graphs.push(canvasToBase64(groupCanvas));
+        }
+      }
+
+      slides.push({
+        type: "graphs",
+        title: analysis.title,
+        graphs,
+      });
+    }
+
+    // ── Send to backend ───────────────────────────────────────────────────────
+    const response = await fetch(`${BACKEND_URL}/generate-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slides }),
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || "Failed to generate PowerPoint");
+    }
+
+    const blob = await response.blob();
+    const url  = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href     = url;
+    link.download = "western-blot-analysis.pptx";
+    link.click();
+    URL.revokeObjectURL(url);
+
+  } catch (error) {
+    alert(`PowerPoint generation failed: ${error.message}`);
+  } finally {
+    if (btn) {
+      btn.textContent = "Export PowerPoint";
+      btn.disabled = false;
+    }
+  }
+}
+
+function buildCompositeUrlForBlot(blotId) {
+  // Find the current brightness/contrast settings if this blot is active
+  // otherwise use defaults
+  const brightness700 = document.getElementById("brightness700")?.value ?? "1";
+  const contrast700   = document.getElementById("contrast700")?.value   ?? "1";
+  const brightness800 = document.getElementById("brightness800")?.value ?? "1";
+  const contrast800   = document.getElementById("contrast800")?.value   ?? "1";
+  const colorMode     = document.getElementById("colorMode")?.value     ?? "grayscale";
+
+  const params = new URLSearchParams({
+    brightness_700: brightness700,
+    contrast_700:   contrast700,
+    brightness_800: brightness800,
+    contrast_800:   contrast800,
+    colormode:      colorMode,
+  });
+
+  return `${BACKEND_URL}/blot/${encodeURIComponent(blotId)}/composite?${params}`;
 }
