@@ -5,22 +5,59 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Western Blot Fold Change Analyzer</title>
-  <link rel="stylesheet" href="./styles.css" />
-  <script src="./config.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
-  <script src="./app.js" defer></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css?v=visual-4" />
+  <script src="./config.js?v=auth-2"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"
+    integrity="sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT"
+    crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.108.2/dist/umd/supabase.js"
+    integrity="sha384-nD3dwv4+ZqdYnmZKe/249ImlV04om7xTCcsoSeQYI+RO+XlKPoqAWaJR1M5SJH9p"
+    crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/tus-js-client@4.3.1/dist/tus.min.js"
+    integrity="sha384-UlHjK3F7TCQCEUpnoa1ohMbP2oaWB3Aypv4gMo511vaZ86uUZ0Zv7UzZ0J1zRUT1"
+    crossorigin="anonymous" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
+    integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
+    crossorigin="anonymous" defer></script>
+  <script src="./app.js?v=visual-4" defer></script>
 </head>
 
 <body>
-  <main class="app-shell">
+  <section class="auth-shell" id="authGate" aria-labelledby="authTitle">
+    <form class="auth-panel" id="authForm">
+      <p class="eyebrow">Western blot analysis</p>
+      <h1 id="authTitle">Sign in</h1>
+      <label>
+        Email
+        <input id="authEmail" type="email" autocomplete="email" required />
+      </label>
+      <label>
+        Password
+        <input id="authPassword" type="password" autocomplete="current-password" required />
+      </label>
+      <p class="auth-message" id="authMessage" role="status" hidden></p>
+      <div class="auth-actions">
+        <button class="primary-button" id="signInButton" type="submit">Sign in</button>
+        <button class="ghost-button" id="magicLinkButton" type="button">Email sign-in link</button>
+      </div>
+    </form>
+  </section>
+
+  <main class="app-shell" id="appWorkspace" hidden>
     <section class="workspace">
       <header class="topbar">
         <div>
           <p class="eyebrow">Western blot analysis</p>
           <h1>Fold Change Analyzer</h1>
         </div>
-        <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
+        <div class="topbar-actions">
+          <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
+          <span class="user-identity" id="userIdentity"></span>
+          <button class="ghost-button" id="signOutButton" type="button">Sign out</button>
+        </div>
       </header>
 
       <nav class="main-tabs" aria-label="Main navigation">
@@ -32,7 +69,7 @@
         </button>
       </nav>
 
-      <div id="tab-quantification">
+      <div id="tabQuantification">
         <section class="panel settings-bar" aria-label="Workflow settings">
           <label>
             Analysis mode
@@ -78,17 +115,17 @@
               </div>
 
               <div class="source-toggle">
-                <button class="source-btn active" type="button" data-source-group="control-0"
-                  onclick="switchSource(this, 'control', 0, 'file')">
-                  📁 Upload file
+                <button class="source-button active" type="button" data-source-group="control-0"
+                  data-source-role="control" data-source-index="0" data-source-mode="file">
+                  Upload file
                 </button>
-                <button class="source-btn" type="button" data-source-group="control-0"
-                  onclick="switchSource(this, 'control', 0, 'blot')">
-                  🔬 Use blot
+                <button class="source-button" type="button" data-source-group="control-0"
+                  data-source-role="control" data-source-index="0" data-source-mode="blot">
+                  Use blot
                 </button>
               </div>
 
-              <div id="control-file-0">
+              <div id="controlFile0">
                 <label class="file-drop">
                   <input id="controlFile" type="file" accept=".xlsx,.xls,.csv,.tsv" />
                   <span id="controlFileName">Choose Excel or CSV file</span>
@@ -113,11 +150,11 @@
                 </div>
               </div>
 
-              <div id="control-blot-0" class="source-panel" hidden>
+              <div id="controlBlot0" class="source-panel" hidden>
                 <div class="field-row">
                   <label>
                     Blot
-                    <select data-blot-source-blot="control-0" onchange="refreshScanDropdown('control', 0)">
+                    <select data-blot-source-blot="control-0" data-refresh-scan-role="control" data-refresh-scan-index="0">
                       <option value="">-- Select blot --</option>
                     </select>
                   </label>
@@ -250,7 +287,7 @@
                 <p class="eyebrow">Export</p>
                 <h2>Generate PowerPoint</h2>
               </div>
-              <button class="primary-button" id="generatePptxBtn" type="button" onclick="generatePowerPoint()">
+              <button class="primary-button" id="generatePptxButton" type="button">
                 Export PowerPoint
               </button>
             </div>
@@ -300,7 +337,7 @@
         </section>
       </div>
 
-      <div id="tab-blot-browser" hidden>
+      <div id="tabBlotBrowser" hidden>
         <section class="panel blot-browser-panel" aria-label="Blot browser">
           <div class="blot-browser-header">
             <div>
@@ -311,6 +348,7 @@
               <input id="zipFileInput" type="file" accept=".zip" multiple />
               <span>Choose ZIP file(s) — multiple allowed</span>
             </label>
+            <p class="upload-status" id="zipUploadStatus" role="status" hidden></p>
           </div>
 
           <div class="blot-browser-layout">
