@@ -159,3 +159,33 @@ backend/*.pyc
 
 # Node (just in case)
 node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+backend/.env
+
+# Local app data
+backend/data/
+*.sqlite
+*.sqlite3
+
+# Node / frontend tooling, if added later
+node_modules/
+dist/
+build/
+.cache/
+.vite/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Test/cache output
+.pytest_cache/
+.coverage
+htmlcov/
