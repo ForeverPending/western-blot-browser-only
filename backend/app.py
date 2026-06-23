@@ -2,21 +2,15 @@ import os
 import io
 import json
 import re
-import shutil
-import sqlite3
-import ssl
+import tempfile
 import uuid
 import zipfile
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from functools import wraps
-from hashlib import sha256
-from time import time
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import numpy as np
-from flask import Flask, request, jsonify, send_file, g
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -28,11 +22,6 @@ from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 import base64
-
-try:
-    import certifi
-except ImportError:
-    certifi = None
 
 app = Flask(__name__)
 
@@ -66,23 +55,34 @@ LOCAL_ORIGINS = [
     "http://127.0.0.1:5500",
     "http://[::1]:5500",
 ]
-ALLOWED_ORIGINS = [
-    origin.strip().rstrip("/")
-    for origin in os.environ.get("ALLOWED_ORIGINS", ",".join(LOCAL_ORIGINS)).split(",")
-    if origin.strip()
-]
+def configured_allowed_origins():
+    origins = [
+        origin.strip().rstrip("/")
+        for origin in os.environ.get("ALLOWED_ORIGINS", ",".join(LOCAL_ORIGINS)).split(",")
+        if origin.strip()
+    ]
+    for origin in origins:
+        parsed = urlparse(origin)
+        if origin == "*" or parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise RuntimeError("ALLOWED_ORIGINS must contain exact http(s) origins; wildcards are not allowed.")
+        if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+            raise RuntimeError("ALLOWED_ORIGINS entries must not contain paths, query strings, or fragments.")
+    return origins
+
+
+ALLOWED_ORIGINS = configured_allowed_origins()
 CORS(
     app,
     origins=ALLOWED_ORIGINS,
-    methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Blot-Session"],
     supports_credentials=False,
     max_age=600,
 )
 
 # ─── Rate limiting ─────────────────────────────────────────────────────────────
 limiter = Limiter(
-    lambda: getattr(g, "owner_id", None) or get_remote_address(),
+    get_remote_address,
     app=app,
     default_limits=["200 per day", "50 per hour"],
     storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
@@ -91,7 +91,6 @@ limiter = Limiter(
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", 250 * 1024 * 1024))
 MAX_TIF_BYTES = int(os.environ.get("MAX_TIF_BYTES", 100 * 1024 * 1024))
-MAX_BLOTS     = 100
 MAX_ZIP_ENTRIES = 400
 MAX_ZIP_UNCOMPRESSED = int(os.environ.get("MAX_ZIP_UNCOMPRESSED_BYTES", 400 * 1024 * 1024))
 MAX_ZIP_COMPRESSION_RATIO = 200
@@ -138,316 +137,29 @@ BLOT_FILE_FIELDS = {
     "800": ("has_800", "tif_800_bytes", "800.tif"),
 }
 ALL_BLOT_FILE_KINDS = tuple(BLOT_FILE_FIELDS)
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR      = os.environ.get("BLOT_DATA_DIR", os.path.join(BASE_DIR, "data"))
-BLOT_FILE_DIR = os.path.join(DATA_DIR, "blots")
-DB_PATH       = os.environ.get("BLOT_DB_PATH", os.path.join(DATA_DIR, "western_blot.sqlite3"))
-STORAGE_BACKEND = os.environ.get("BLOT_STORAGE_BACKEND", "local").lower()
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
-SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "western-blots")
-USE_SUPABASE = STORAGE_BACKEND == "supabase"
+BLOT_FILE_LIMITS = {
+    "jpg": MAX_JPEG_BYTES,
+    "700": MAX_TIF_BYTES,
+    "800": MAX_TIF_BYTES,
+}
+SAFE_PATH_PART_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+SESSION_FILE_NAMES = {field[2] for field in BLOT_FILE_FIELDS.values()}
+TEMP_STORAGE_BACKEND = os.environ.get("BLOT_TEMP_STORAGE", "local").lower().replace("_", "-")
+LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
+    tempfile.gettempdir(),
+    "western-blot-browser-only",
+)
+USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
+BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
+BLOB_API_VERSION = "10"
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
-# ─── In-memory blot store ─────────────────────────────────────────────────────
-blot_store = {}
-auth_token_cache = OrderedDict()
-MAX_AUTH_CACHE_ENTRIES = 512
-
-# ─── Persistent storage ───────────────────────────────────────────────────────
-
 def init_storage():
-    validate_app_config()
-    if USE_SUPABASE:
-        validate_supabase_config()
+    if USE_VERCEL_BLOB:
+        if not os.environ.get("BLOB_READ_WRITE_TOKEN"):
+            raise RuntimeError("BLOB_READ_WRITE_TOKEN is required when BLOT_TEMP_STORAGE=vercel-blob.")
         return
-
-    os.makedirs(BLOT_FILE_DIR, exist_ok=True)
-    with db_connection() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS blots (
-                id TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL DEFAULT 'default',
-                name TEXT NOT NULL,
-                folder TEXT NOT NULL,
-                has_jpg INTEGER NOT NULL DEFAULT 0,
-                has_700 INTEGER NOT NULL DEFAULT 0,
-                has_800 INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                blot_id TEXT NOT NULL,
-                owner_id TEXT NOT NULL,
-                protein_name TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                bg_axis TEXT NOT NULL,
-                lanes_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (blot_id) REFERENCES blots(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_scans_blot_id ON scans(blot_id);
-            CREATE INDEX IF NOT EXISTS idx_scans_owner_id ON scans(owner_id);
-            CREATE INDEX IF NOT EXISTS idx_blots_owner_id ON blots(owner_id);
-        """)
-        ensure_local_column(conn, "blots", "owner_id", "TEXT NOT NULL DEFAULT ''")
-        ensure_local_column(conn, "scans", "owner_id", "TEXT NOT NULL DEFAULT ''")
-
-
-def ensure_local_column(conn, table, column, definition):
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def db_connection():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def validate_app_config():
-    missing = [
-        name for name, value in (
-            ("SUPABASE_URL", SUPABASE_URL),
-            ("SUPABASE_PUBLISHABLE_KEY", SUPABASE_PUBLISHABLE_KEY),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError("Missing authentication configuration: " + ", ".join(missing))
-    if SUPABASE_PUBLISHABLE_KEY.startswith("sb_secret_"):
-        raise RuntimeError("SUPABASE_PUBLISHABLE_KEY must be a browser-safe publishable key.")
-
-
-class AuthenticationError(Exception):
-    pass
-
-
-class SupabaseRequestError(RuntimeError):
-    def __init__(self, status, details):
-        super().__init__(f"Supabase request failed ({status})")
-        self.status = status
-        self.details = details
-
-
-def require_user(route_fn):
-    @wraps(route_fn)
-    def wrapped(*args, **kwargs):
-        authorization = request.headers.get("Authorization", "")
-        if not authorization.startswith("Bearer "):
-            return jsonify({"error": "Authentication required."}), 401
-        token = authorization[7:].strip()
-        try:
-            user_id = verify_supabase_token(token)
-        except AuthenticationError:
-            return jsonify({"error": "Your session is invalid or expired."}), 401
-        g.owner_id = user_id
-        g.access_token = token
-        return route_fn(*args, **kwargs)
-    return limiter.limit("120 per minute", key_func=get_remote_address)(wrapped)
-
-
-def current_owner_id():
-    owner_id = getattr(g, "owner_id", None)
-    if not owner_id:
-        raise RuntimeError("Authenticated owner context is required.")
-    return owner_id
-
-
-def verify_supabase_token(token):
-    token_hash = sha256(token.encode("utf-8")).hexdigest()
-    cached = auth_token_cache.get(token_hash)
-    now = int(time())
-    if cached and cached["expires_at"] > now + 15:
-        auth_token_cache.move_to_end(token_hash)
-        return cached["user_id"]
-
-    request_to_auth = Request(
-        f"{SUPABASE_URL}/auth/v1/user",
-        headers={
-            "apikey": SUPABASE_PUBLISHABLE_KEY,
-            "Authorization": f"Bearer {token}",
-        },
-        method="GET",
-    )
-    try:
-        with urlopen(request_to_auth, timeout=15, context=supabase_ssl_context()) as response:
-            user = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, ValueError) as error:
-        raise AuthenticationError() from error
-
-    try:
-        user_id = str(uuid.UUID(user["id"]))
-        payload = decode_jwt_payload(token)
-        expires_at = int(payload["exp"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise AuthenticationError() from error
-    if expires_at <= now:
-        raise AuthenticationError()
-
-    auth_token_cache[token_hash] = {"user_id": user_id, "expires_at": expires_at}
-    auth_token_cache.move_to_end(token_hash)
-    while len(auth_token_cache) > MAX_AUTH_CACHE_ENTRIES:
-        auth_token_cache.popitem(last=False)
-    return user_id
-
-
-def decode_jwt_payload(token):
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise ValueError("Invalid JWT")
-    encoded = parts[1] + "=" * (-len(parts[1]) % 4)
-    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
-
-
-def validate_supabase_config():
-    missing = [
-        name for name, value in (
-            ("SUPABASE_URL", SUPABASE_URL),
-            ("SUPABASE_BUCKET", SUPABASE_BUCKET),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(
-            "Supabase storage is enabled, but these environment variables are missing: "
-            + ", ".join(missing)
-        )
-def supabase_user_headers(extra=None):
-    headers = {
-        "apikey": SUPABASE_PUBLISHABLE_KEY,
-        "Authorization": f"Bearer {g.access_token}",
-    }
-    if extra:
-        headers.update(extra)
-    return headers
-
-
-def supabase_request(method, path, body=None, raw_body=None, headers=None, max_response_bytes=None):
-    data = None
-    request_headers = supabase_user_headers(headers)
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        request_headers.setdefault("Content-Type", "application/json")
-    elif raw_body is not None:
-        data = raw_body
-
-    request = Request(
-        f"{SUPABASE_URL}{path}",
-        data=data,
-        headers=request_headers,
-        method=method,
-    )
-    try:
-        with urlopen(request, timeout=60, context=supabase_ssl_context()) as response:
-            response_body = response.read(max_response_bytes + 1 if max_response_bytes else -1)
-            if max_response_bytes and len(response_body) > max_response_bytes:
-                raise PublicError("Stored upload exceeds the configured size limit.", 413)
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        app.logger.warning("Supabase request failed with status %s: %s", error.code, details[:500])
-        raise SupabaseRequestError(error.code, details) from error
-
-    if "application/json" in content_type:
-        return json.loads(response_body.decode("utf-8") or "null")
-    return response_body
-
-
-def supabase_ssl_context():
-    if certifi:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
-
-
-def supabase_storage_path(blot_id, filename):
-    return f"{current_owner_id()}/blots/{safe_id(blot_id)}/{filename}"
-
-
-def supabase_upload_file(blot_id, filename, file_bytes, content_type):
-    if not file_bytes:
-        return
-    object_path = quote(supabase_storage_path(blot_id, filename), safe="/")
-    bucket = quote(SUPABASE_BUCKET, safe="")
-    supabase_request(
-        "POST",
-        f"/storage/v1/object/{bucket}/{object_path}",
-        raw_body=file_bytes,
-        headers={
-            "Content-Type": content_type,
-            "x-upsert": "true",
-        },
-    )
-
-
-def supabase_download_file(blot_id, filename):
-    object_path = quote(supabase_storage_path(blot_id, filename), safe="/")
-    bucket = quote(SUPABASE_BUCKET, safe="")
-    try:
-        return supabase_request("GET", f"/storage/v1/object/authenticated/{bucket}/{object_path}")
-    except SupabaseRequestError as error:
-        if not is_missing_storage_object(error):
-            raise
-        legacy_path = quote(f"blots/{safe_id(blot_id)}/{filename}", safe="/")
-        return supabase_request("GET", f"/storage/v1/object/authenticated/{bucket}/{legacy_path}")
-
-
-def supabase_delete_blot_files(blot_id, blot):
-    object_paths = [
-        supabase_storage_path(blot_id, filename)
-        for has_field, _bytes_field, filename in BLOT_FILE_FIELDS.values()
-        if blot.get(has_field)
-    ]
-    if not object_paths:
-        return
-    bucket = quote(SUPABASE_BUCKET, safe="")
-    supabase_request(
-        "DELETE",
-        f"/storage/v1/object/{bucket}",
-        body={"prefixes": object_paths},
-    )
-
-
-def is_missing_storage_object(error):
-    if error.status == 404:
-        return True
-    if error.status != 400:
-        return False
-    try:
-        details = json.loads(error.details)
-    except (TypeError, ValueError):
-        details = {}
-    status_code = str(details.get("statusCode", ""))
-    message = str(details.get("message", "")).lower()
-    return status_code == "404" or "not found" in message
-
-
-def supabase_download_upload(object_path):
-    object_path = validate_owned_upload_path(object_path)
-    bucket = quote(SUPABASE_BUCKET, safe="")
-    encoded_path = quote(object_path, safe="/")
-    return supabase_request(
-        "GET",
-        f"/storage/v1/object/authenticated/{bucket}/{encoded_path}",
-        max_response_bytes=MAX_ZIP_BYTES,
-    )
-
-
-def validate_owned_upload_path(object_path):
-    if not isinstance(object_path, str) or len(object_path) > 500:
-        raise PublicError("Invalid upload path.")
-    normalized = object_path.replace("\\", "/").strip("/")
-    parts = normalized.split("/")
-    if any(not part or part in (".", "..") for part in parts):
-        raise PublicError("Invalid upload path.")
-    expected_prefix = [current_owner_id(), "uploads"]
-    if parts[:2] != expected_prefix or len(parts) != 3 or not parts[2].lower().endswith(".zip"):
-        raise PublicError("Upload does not belong to the authenticated user.", 403)
-    return normalized
+    os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
 
 
 def now_iso():
@@ -485,182 +197,253 @@ def safe_id(value):
     return cleaned.strip("._") or uuid.uuid4().hex
 
 
-def blot_dir(blot_id):
-    return os.path.join(BLOT_FILE_DIR, safe_id(current_owner_id()), safe_id(blot_id))
+def request_session_id(data=None):
+    if data is None:
+        data = {}
+    candidate = (
+        request.headers.get("X-Blot-Session")
+        or request.form.get("sessionId")
+        or data.get("sessionId")
+        or data.get("session_id")
+        or ""
+    )
+    return safe_id(candidate)[:80] if candidate else uuid.uuid4().hex
 
 
-def write_optional_file(directory, filename, file_bytes):
-    if not file_bytes:
-        return
-    with open(os.path.join(directory, filename), "wb") as handle:
-        handle.write(file_bytes)
+def temp_object_path(session_id, blot_id, filename):
+    return f"sessions/{safe_id(session_id)}/{safe_id(blot_id)}/{safe_id(filename)}"
 
 
-def read_optional_file(directory, filename):
-    path = os.path.join(directory, filename)
-    if not os.path.exists(path):
+def validate_temp_path(path, session_id=None, allow_uploads=False):
+    path = str(path or "")
+    if len(path) > 500 or not path:
+        raise PublicError("Invalid temporary file reference.")
+    if "\\" in path or path.startswith("/") or "\x00" in path:
+        raise PublicError("Invalid temporary file reference.")
+    parts = path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise PublicError("Invalid temporary file reference.")
+    if any(not SAFE_PATH_PART_PATTERN.fullmatch(part) for part in parts):
+        raise PublicError("Invalid temporary file reference.")
+    allowed_roots = {"sessions"}
+    if allow_uploads:
+        allowed_roots.add("uploads")
+    if parts[0] not in allowed_roots:
+        raise PublicError("Invalid temporary file reference.")
+    if parts[0] == "sessions":
+        if len(parts) != 4 or parts[3] not in SESSION_FILE_NAMES:
+            raise PublicError("Invalid temporary file reference.")
+    if parts[0] == "uploads":
+        if len(parts) != 3 or not parts[2].lower().endswith(".zip"):
+            raise PublicError("Invalid temporary file reference.")
+    if session_id and len(parts) > 1 and parts[1] != safe_id(session_id):
+        raise PublicError("Temporary file does not belong to this browser session.", 403)
+    return "/".join(parts)
+
+
+def descriptor_path(descriptor, session_id=None, allow_uploads=False):
+    if not isinstance(descriptor, dict):
+        raise PublicError("Invalid temporary file reference.")
+    path = descriptor.get("pathname") or descriptor.get("path")
+    return validate_temp_path(path, session_id, allow_uploads=allow_uploads)
+
+
+def local_temp_file_path(path):
+    path = validate_temp_path(path, allow_uploads=True)
+    full_path = os.path.abspath(os.path.join(LOCAL_TEMP_DIR, *path.split("/")))
+    root = os.path.abspath(LOCAL_TEMP_DIR)
+    if not full_path.startswith(root + os.sep):
+        raise PublicError("Invalid temporary file reference.")
+    return full_path
+
+
+def descriptor_from_blob_result(result, fallback_path, content_type):
+    result = result or {}
+    return {
+        "backend": "vercel-blob",
+        "path": result.get("pathname") or result.get("path") or fallback_path,
+        "pathname": result.get("pathname") or result.get("path") or fallback_path,
+        "url": result.get("url"),
+        "downloadUrl": result.get("downloadUrl") or result.get("download_url"),
+        "contentType": result.get("contentType") or result.get("content_type") or content_type,
+    }
+
+
+def vercel_blob_token():
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is required when BLOT_TEMP_STORAGE=vercel-blob.")
+    return token
+
+
+def is_allowed_vercel_blob_host(hostname):
+    host = (hostname or "").lower().rstrip(".")
+    return host == "blob.vercel-storage.com" or host.endswith(".blob.vercel-storage.com")
+
+
+def validate_vercel_blob_url(url, expected_path=None):
+    if not isinstance(url, str):
+        raise PublicError("Invalid temporary file reference.")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not is_allowed_vercel_blob_host(parsed.hostname):
+        raise PublicError("Invalid temporary file reference.")
+    if expected_path is not None:
+        decoded_path = unquote(parsed.path.lstrip("/"))
+        if decoded_path != expected_path:
+            raise PublicError("Temporary file URL does not match its storage path.", 403)
+    return url
+
+
+def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None):
+    validate_vercel_blob_url(url)
+    request_headers = {
+        "authorization": f"Bearer {vercel_blob_token()}",
+        "x-api-version": BLOB_API_VERSION,
+    }
+    if headers:
+        request_headers.update(headers)
+    request = Request(url, data=body, headers=request_headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if max_response_bytes is None:
+                response_body = response.read()
+            else:
+                response_body = response.read(max_response_bytes + 1)
+                if len(response_body) > max_response_bytes:
+                    raise PublicError("Temporary file exceeds the configured size limit.", 413)
+            content_type = response.headers.get("Content-Type", "")
+    except (HTTPError, URLError, TimeoutError) as error:
+        raise PublicError("Temporary Blob storage request failed.", 502) from error
+    if not response_body:
         return None
-    with open(path, "rb") as handle:
-        return handle.read()
+    if "application/json" in content_type:
+        return json.loads(response_body.decode("utf-8"))
+    return response_body
 
 
-def persist_blot(blot_id, blot):
-    created_at = blot.get("created_at") or now_iso()
-    if USE_SUPABASE:
-        supabase_upload_file(blot_id, "preview.jpg", blot.get("jpg_bytes"), "image/jpeg")
-        supabase_upload_file(blot_id, "700.tif", blot.get("tif_700_bytes"), "image/tiff")
-        supabase_upload_file(blot_id, "800.tif", blot.get("tif_800_bytes"), "image/tiff")
-        supabase_request(
-            "POST",
-            "/rest/v1/blots?on_conflict=id",
-            body={
-                "id": blot_id,
-                "owner_id": current_owner_id(),
-                "name": blot["name"],
-                "folder": blot["folder"],
-                "has_jpg": bool(blot.get("jpg_bytes")),
-                "has_700": bool(blot.get("tif_700_bytes")),
-                "has_800": bool(blot.get("tif_800_bytes")),
-                "created_at": created_at,
-            },
-            headers={
-                "Prefer": "resolution=merge-duplicates",
-            },
-        )
-        return
-
-    directory = blot_dir(blot_id)
-    os.makedirs(directory, exist_ok=True)
-    write_optional_file(directory, "preview.jpg", blot.get("jpg_bytes"))
-    write_optional_file(directory, "700.tif", blot.get("tif_700_bytes"))
-    write_optional_file(directory, "800.tif", blot.get("tif_800_bytes"))
-
-    with db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO blots
-                (id, owner_id, name, folder, has_jpg, has_700, has_800, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                owner_id = excluded.owner_id,
-                name = excluded.name,
-                folder = excluded.folder,
-                has_jpg = excluded.has_jpg,
-                has_700 = excluded.has_700,
-                has_800 = excluded.has_800,
-                created_at = excluded.created_at
-            """,
-            (
-                blot_id,
-                current_owner_id(),
-                blot["name"],
-                blot["folder"],
-                1 if blot.get("jpg_bytes") else 0,
-                1 if blot.get("tif_700_bytes") else 0,
-                1 if blot.get("tif_800_bytes") else 0,
-                created_at,
-            ),
-        )
+def vercel_blob_put(path, file_bytes, content_type):
+    encoded_path = quote(path, safe="/")
+    return vercel_blob_request(
+        "PUT",
+        f"{BLOB_API_BASE_URL}/?pathname={encoded_path}",
+        body=file_bytes,
+        headers={
+            "access": "private",
+            "x-content-type": content_type,
+            "x-cache-control-max-age": "60",
+            "x-allow-overwrite": "0",
+        },
+    )
 
 
-def blot_from_row(row):
-    """Convert either a PostgREST object or SQLite row into cached metadata."""
-    return {
-        "name": row["name"],
-        "folder": row["folder"],
-        "has_jpg": bool(row["has_jpg"]),
-        "has_700": bool(row["has_700"]),
-        "has_800": bool(row["has_800"]),
-    }
+def vercel_blob_read(descriptor, path, max_bytes=None):
+    url = descriptor.get("downloadUrl") or descriptor.get("url")
+    validate_vercel_blob_url(url, path)
+    return vercel_blob_request("GET", url, max_response_bytes=max_bytes)
 
 
-def load_blot_files(blot_id, blot, file_kinds):
-    """Load only the image files required by the current endpoint."""
-    directory = None if USE_SUPABASE else blot_dir(blot_id)
-    for kind in file_kinds:
-        has_field, bytes_field, filename = BLOT_FILE_FIELDS[kind]
-        if bytes_field in blot:
+def vercel_blob_delete(descriptor_paths):
+    urls = []
+    for descriptor, path in descriptor_paths:
+        if not isinstance(descriptor, dict) or not isinstance(descriptor.get("url"), str):
             continue
-        if not blot[has_field]:
-            blot[bytes_field] = None
-        elif USE_SUPABASE:
-            blot[bytes_field] = supabase_download_file(blot_id, filename)
-        else:
-            blot[bytes_field] = read_optional_file(directory, filename)
-    return blot
+        try:
+            urls.append(validate_vercel_blob_url(descriptor["url"], path))
+        except PublicError:
+            continue
+    if not urls:
+        return
+    body = json.dumps({"urls": urls}).encode("utf-8")
+    vercel_blob_request(
+        "POST",
+        f"{BLOB_API_BASE_URL}/delete",
+        body=body,
+        headers={"Content-Type": "application/json"},
+    )
 
 
-def get_blot(blot_id, file_kinds=ALL_BLOT_FILE_KINDS):
-    """Authorize a blot lookup and lazily load the requested image channels."""
-    owner_id = current_owner_id()
-    cache_key = (owner_id, blot_id)
-    blot = blot_store.get(cache_key)
+def store_temp_file(session_id, blot_id, filename, file_bytes, content_type):
+    if not file_bytes:
+        return None
+    path = temp_object_path(session_id, blot_id, filename)
+    if USE_VERCEL_BLOB:
+        result = vercel_blob_put(path, file_bytes, content_type)
+        return descriptor_from_blob_result(result, path, content_type)
 
-    if not blot:
-        if USE_SUPABASE:
-            rows = supabase_request(
-                "GET",
-                f"/rest/v1/blots?id=eq.{quote(blot_id, safe='')}&owner_id=eq.{quote(owner_id, safe='')}&select=*",
-            )
-            row = rows[0] if rows else None
-        else:
-            with db_connection() as conn:
-                row = conn.execute(
-                    "SELECT * FROM blots WHERE id = ? AND owner_id = ?",
-                    (blot_id, owner_id),
-                ).fetchone()
-        if not row:
-            return None
-        blot = blot_from_row(row)
-        blot_store[cache_key] = blot
-
-    return load_blot_files(blot_id, blot, file_kinds)
-
-
-def scan_row_to_dict(row):
-    lanes = row["lanes_json"]
-    if isinstance(lanes, str):
-        lanes = json.loads(lanes)
+    full_path = local_temp_file_path(path)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    with open(full_path, "wb") as handle:
+        handle.write(file_bytes)
     return {
-        "id": row["id"],
-        "proteinName": row["protein_name"],
-        "channel": row["channel"],
-        "backgroundAxis": row["bg_axis"],
-        "lanes": lanes,
-        "createdAt": row["created_at"],
+        "backend": "local",
+        "path": path,
+        "pathname": path,
+        "contentType": content_type,
     }
 
 
-def get_scans_for_blot(blot_id):
-    if USE_SUPABASE:
-        rows = supabase_request(
-            "GET",
-            f"/rest/v1/scans?blot_id=eq.{quote(blot_id, safe='')}&owner_id=eq.{quote(current_owner_id(), safe='')}&select=*&order=id.asc",
+def read_temp_file(descriptor, session_id=None, allow_uploads=False, max_bytes=None):
+    path = descriptor_path(descriptor, session_id, allow_uploads=allow_uploads)
+    if USE_VERCEL_BLOB:
+        return vercel_blob_read(descriptor, path, max_bytes=max_bytes)
+
+    full_path = local_temp_file_path(path)
+    if not os.path.exists(full_path):
+        raise PublicError("Temporary file was not found.", 404)
+    with open(full_path, "rb") as handle:
+        if max_bytes is None:
+            return handle.read()
+        file_bytes = handle.read(max_bytes + 1)
+    if len(file_bytes) > max_bytes:
+        raise PublicError("Temporary file exceeds the configured size limit.", 413)
+    return file_bytes
+
+
+def delete_temp_files(descriptors, session_id=None, allow_uploads=False):
+    checked_descriptors = []
+    for descriptor in descriptors:
+        try:
+            path = descriptor_path(descriptor, session_id, allow_uploads=allow_uploads)
+            checked_descriptors.append((descriptor, path))
+        except PublicError:
+            continue
+    if not checked_descriptors:
+        return
+    if USE_VERCEL_BLOB:
+        vercel_blob_delete(checked_descriptors)
+        return
+    for _descriptor, path in checked_descriptors:
+        full_path = local_temp_file_path(path)
+        if os.path.exists(full_path):
+            os.remove(full_path)
+
+
+def collect_blot_file_descriptors(blots):
+    descriptors = []
+    for blot in blots or []:
+        files = blot.get("files", {}) if isinstance(blot, dict) else {}
+        for descriptor in files.values():
+            if descriptor:
+                descriptors.append(descriptor)
+    return descriptors
+
+
+def load_payload_blot(blot, file_kinds=ALL_BLOT_FILE_KINDS, session_id=None):
+    if not isinstance(blot, dict):
+        raise PublicError("Blot data is missing.")
+    files = blot.get("files")
+    if not isinstance(files, dict):
+        raise PublicError("Blot temporary file references are missing.")
+    loaded = {"id": blot.get("id"), "name": blot.get("name", "Untitled blot"), "files": files}
+    for kind in file_kinds:
+        descriptor = files.get(kind)
+        bytes_field = BLOT_FILE_FIELDS[kind][1]
+        loaded[bytes_field] = (
+            read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[kind])
+            if descriptor
+            else None
         )
-        return [scan_row_to_dict(row) for row in rows]
-
-    with db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM scans
-            WHERE blot_id = ? AND owner_id = ?
-            ORDER BY id
-            """,
-            (blot_id, current_owner_id()),
-        ).fetchall()
-    return [scan_row_to_dict(row) for row in rows]
-
-
-def blot_summary_from_row(row, scan_count=0):
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "hasJpg": bool(row["has_jpg"]),
-        "has700": bool(row["has_700"]),
-        "has800": bool(row["has_800"]),
-        "scanCount": scan_count,
-        "createdAt": row["created_at"],
-    }
+    return loaded
 
 
 init_storage()
@@ -668,13 +451,14 @@ init_storage()
 # ─── Health check ─────────────────────────────────────────────────────────────
 
 @app.route("/health")
+@app.route("/api/health")
 def health():
     return jsonify({"status": "ok"})
 
 # ─── ZIP upload & parsing ─────────────────────────────────────────────────────
 
 @app.route("/upload-zip", methods=["POST"])
-@require_user
+@app.route("/api/upload-zip", methods=["POST"])
 @limiter.limit("10 per minute")
 def upload_zip():
     if "file" not in request.files:
@@ -699,7 +483,7 @@ def upload_zip():
         return jsonify({"error": "Invalid ZIP file."}), 400
 
     try:
-        blots = parse_zip(file_bytes)
+        blots = parse_zip(file_bytes, request_session_id())
         return jsonify({"blots": blots})
     except PublicError as error:
         return error_response(error, "ZIP import failed.")
@@ -709,15 +493,18 @@ def upload_zip():
 
 
 @app.route("/process-upload", methods=["POST"])
-@require_user
+@app.route("/api/process-upload", methods=["POST"])
 @limiter.limit("10 per minute")
 def process_storage_upload():
     data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    upload_descriptor = data.get("upload") or data.get("blob") or {}
     try:
-        file_bytes = supabase_download_upload(data.get("objectPath"))
+        file_bytes = read_temp_file(upload_descriptor, session_id, allow_uploads=True, max_bytes=MAX_ZIP_BYTES)
         if not is_valid_zip(file_bytes):
             raise PublicError("Stored object is not a valid ZIP file.")
-        blots = parse_zip(file_bytes)
+        blots = parse_zip(file_bytes, session_id)
+        delete_temp_files([upload_descriptor], session_id, allow_uploads=True)
         return jsonify({"blots": blots})
     except PublicError as error:
         return error_response(error, "ZIP import failed.")
@@ -736,7 +523,7 @@ def enforce_zip_member_size(zf, filename, limit, message):
         raise PublicError(message, 413)
 
 
-def parse_zip(file_bytes):
+def parse_zip(file_bytes, session_id):
     blots = []
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
         validate_zip_archive(zf)
@@ -775,34 +562,18 @@ def parse_zip(file_bytes):
             # Generate a unique unpredictable ID
             blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
 
-            # Evict oldest blots if store is full
-            if len(blot_store) >= MAX_BLOTS:
-                oldest_keys = list(blot_store.keys())[:10]
-                for key in oldest_keys:
-                    del blot_store[key]
-
             jpg_bytes = zf.read(jpg_file) if jpg_file else None
             tif_700_bytes = zf.read(tif_700) if tif_700 else None
             tif_800_bytes = zf.read(tif_800) if tif_800 else None
             validate_tif_pixels(tif_700_bytes, "700nm TIF")
             validate_tif_pixels(tif_800_bytes, "800nm TIF")
 
-            # Cache the parsed blot once, then persist the same object.
-            cache_key = (current_owner_id(), blot_id)
-            blot = {
-                "name": blot_name,
-                "folder": folder,
-                "has_jpg": jpg_bytes is not None,
-                "has_700": tif_700_bytes is not None,
-                "has_800": tif_800_bytes is not None,
-                "created_at": created_at,
-                "jpg_bytes":      jpg_bytes,
-                "tif_700_bytes":  tif_700_bytes,
-                "tif_800_bytes":  tif_800_bytes,
+            files = {
+                "jpg": store_temp_file(session_id, blot_id, "preview.jpg", jpg_bytes, "image/jpeg"),
+                "700": store_temp_file(session_id, blot_id, "700.tif", tif_700_bytes, "image/tiff"),
+                "800": store_temp_file(session_id, blot_id, "800.tif", tif_800_bytes, "image/tiff"),
             }
-            blot_store[cache_key] = blot
-            persist_blot(blot_id, blot)
-
+            files = {key: value for key, value in files.items() if value}
             blots.append({
                 "id": blot_id,
                 "name": blot_name,
@@ -811,6 +582,7 @@ def parse_zip(file_bytes):
                 "has800": tif_800 is not None,
                 "scanCount": 0,
                 "createdAt": created_at,
+                "files": files,
             })
 
     return blots
@@ -939,226 +711,25 @@ def sanitize_tif_pixels(image, label):
     return np.nan_to_num(image, copy=True, nan=0.0, posinf=limit, neginf=-limit)
 
 
-@app.route("/blots")
-@require_user
-@limiter.limit("60 per minute")
-def list_blots():
-    if USE_SUPABASE:
-        rows = supabase_request(
-            "GET",
-            f"/rest/v1/blots?owner_id=eq.{quote(current_owner_id(), safe='')}&select=*&order=created_at.asc,name.asc",
-        )
-        scans_by_blot = {}
-        scan_rows = supabase_request(
-            "GET",
-            f"/rest/v1/scans?owner_id=eq.{quote(current_owner_id(), safe='')}&select=*&order=id.asc",
-        )
-        for row in scan_rows:
-            scans_by_blot.setdefault(row["blot_id"], []).append(scan_row_to_dict(row))
-
-        blots = [
-            blot_summary_from_row(row, len(scans_by_blot.get(row["id"], [])))
-            for row in rows
-        ]
-        scans = {blot["id"]: scans_by_blot.get(blot["id"], []) for blot in blots}
-        return jsonify({"blots": blots, "scans": scans})
-
-    with db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT blots.*, COUNT(scans.id) AS scan_count
-            FROM blots
-            LEFT JOIN scans ON scans.blot_id = blots.id
-            WHERE blots.owner_id = ?
-            GROUP BY blots.id
-            ORDER BY blots.created_at ASC, blots.name
-            """,
-            (current_owner_id(),),
-        ).fetchall()
-
-    blots = [blot_summary_from_row(row, row["scan_count"]) for row in rows]
-    scans = {blot["id"]: get_scans_for_blot(blot["id"]) for blot in blots}
-    return jsonify({"blots": blots, "scans": scans})
-
-
-@app.route("/blots/<blot_id>", methods=["DELETE"])
-@require_user
-@limiter.limit("30 per minute")
-def delete_blot(blot_id):
-    blot = get_blot(blot_id, ())
-    if not blot:
-        return jsonify({"error": "Blot not found"}), 404
-
-    owner_id = current_owner_id()
-    if USE_SUPABASE:
-        supabase_delete_blot_files(blot_id, blot)
-        rows = supabase_request(
-            "DELETE",
-            f"/rest/v1/blots?id=eq.{quote(blot_id, safe='')}&owner_id=eq.{quote(owner_id, safe='')}",
-            headers={"Prefer": "return=representation"},
-        )
-        if not rows:
-            return jsonify({"error": "Blot not found"}), 404
-    else:
-        directory = blot_dir(blot_id)
-        if os.path.isdir(directory):
-            shutil.rmtree(directory)
-        with db_connection() as conn:
-            conn.execute(
-                "DELETE FROM scans WHERE blot_id = ? AND owner_id = ?",
-                (blot_id, owner_id),
-            )
-            cursor = conn.execute(
-                "DELETE FROM blots WHERE id = ? AND owner_id = ?",
-                (blot_id, owner_id),
-            )
-            if cursor.rowcount == 0:
-                return jsonify({"error": "Blot not found"}), 404
-
-    blot_store.pop((owner_id, blot_id), None)
-    return jsonify({"status": "deleted"})
-
-
-@app.route("/blots/<blot_id>/scans")
-@require_user
-@limiter.limit("60 per minute")
-def list_scans(blot_id):
-    if not get_blot(blot_id, ()):
-        return jsonify({"error": "Blot not found"}), 404
-    return jsonify({"scans": get_scans_for_blot(blot_id)})
-
-
-@app.route("/blots/<blot_id>/scans", methods=["POST"])
-@require_user
-@limiter.limit("30 per minute")
-def save_scan(blot_id):
-    if not get_blot(blot_id, ()):
-        return jsonify({"error": "Blot not found"}), 404
-
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-
-    protein_name = str(data.get("proteinName", "")).strip()
-    channel = str(data.get("channel", "700"))
-    background_axis = str(data.get("backgroundAxis", "leftright"))
-    lanes = data.get("lanes", [])
-
-    if not protein_name:
-        return jsonify({"error": "Protein name is required."}), 400
-    if len(protein_name) > MAX_NAME_LENGTH:
-        return jsonify({"error": f"Protein name must be {MAX_NAME_LENGTH} characters or fewer."}), 400
-    if channel not in ("700", "800"):
-        return jsonify({"error": "Invalid channel."}), 400
-    if background_axis not in ("leftright", "topbottom"):
-        return jsonify({"error": "Invalid background mode."}), 400
-    if not isinstance(lanes, list) or not lanes:
-        return jsonify({"error": "At least one lane is required."}), 400
-    if len(lanes) > 200:
-        return jsonify({"error": "Too many lanes. Maximum is 200."}), 400
-
-    cleaned_lanes = []
-    for index, lane in enumerate(lanes):
-        if not isinstance(lane, dict):
-            return jsonify({"error": f"Lane {index + 1} is invalid."}), 400
-        name = str(lane.get("name", f"Lane {index + 1}")).strip() or f"Lane {index + 1}"
-        if len(name) > MAX_NAME_LENGTH:
-            return jsonify({"error": f"Lane {index + 1} name is too long."}), 400
-        try:
-            signal = float(lane.get("signal"))
-        except (TypeError, ValueError):
-            return jsonify({"error": f"Lane {index + 1} has an invalid signal."}), 400
-        if not np.isfinite(signal):
-            return jsonify({"error": f"Lane {index + 1} has an invalid signal."}), 400
-        cleaned_lanes.append({"name": name, "signal": signal})
-
-    if USE_SUPABASE:
-        rows = supabase_request(
-            "POST",
-            "/rest/v1/scans",
-            body={
-                "blot_id": blot_id,
-                "owner_id": current_owner_id(),
-                "protein_name": protein_name,
-                "channel": channel,
-                "bg_axis": background_axis,
-                "lanes_json": cleaned_lanes,
-                "created_at": now_iso(),
-            },
-            headers={"Prefer": "return=representation"},
-        )
-        row = rows[0]
-    else:
-        with db_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO scans (blot_id, owner_id, protein_name, channel, bg_axis, lanes_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (blot_id, current_owner_id(), protein_name, channel, background_axis, json.dumps(cleaned_lanes), now_iso()),
-            )
-            scan_id = cursor.lastrowid
-            row = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
-
-    return jsonify({"scan": scan_row_to_dict(row)}), 201
-
-
-@app.route("/blots/<blot_id>/scans/<int:scan_id>", methods=["DELETE"])
-@require_user
-@limiter.limit("30 per minute")
-def delete_scan(blot_id, scan_id):
-    if not get_blot(blot_id, ()):
-        return jsonify({"error": "Scan not found"}), 404
-    if USE_SUPABASE:
-        rows = supabase_request(
-            "DELETE",
-            f"/rest/v1/scans?id=eq.{scan_id}&blot_id=eq.{quote(blot_id, safe='')}&owner_id=eq.{quote(current_owner_id(), safe='')}",
-            headers={"Prefer": "return=representation"},
-        )
-        if not rows:
-            return jsonify({"error": "Scan not found"}), 404
-        return jsonify({"status": "deleted"})
-
-    with db_connection() as conn:
-        cursor = conn.execute(
-            "DELETE FROM scans WHERE id = ? AND blot_id = ? AND owner_id = ?",
-            (scan_id, blot_id, current_owner_id()),
-        )
-        if cursor.rowcount == 0:
-            return jsonify({"error": "Scan not found"}), 404
-    return jsonify({"status": "deleted"})
-
-# ─── Serve JPG preview ────────────────────────────────────────────────────────
-
-@app.route("/blots/<blot_id>/preview")
-@require_user
-@limiter.limit("60 per minute")
-def blot_preview(blot_id):
-    blot = get_blot(blot_id, ("jpg",))
-    if not blot or not blot["jpg_bytes"]:
-        return jsonify({"error": "Preview not found"}), 404
-    return send_file(io.BytesIO(blot["jpg_bytes"]), mimetype="image/jpeg")
-
 # ─── TIF composite rendering ──────────────────────────────────────────────────
 
-@app.route("/blots/<blot_id>/composite")
-@require_user
+@app.route("/render-composite", methods=["POST"])
+@app.route("/api/render-composite", methods=["POST"])
 @limiter.limit("60 per minute")
-def blot_composite(blot_id):
-    blot = get_blot(blot_id, ("700", "800"))
-    if not blot:
-        return jsonify({"error": "Blot not found"}), 404
-    if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
-        return jsonify({"error": "TIF files not found for this blot"}), 404
-
+def render_composite():
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
     try:
-        brightness_700 = float(request.args.get("brightness700", 1.0))
-        contrast_700 = float(request.args.get("contrast700", 1.0))
-        brightness_800 = float(request.args.get("brightness800", 1.0))
-        contrast_800 = float(request.args.get("contrast800", 1.0))
-        color_mode = request.args.get("colorMode", "color")
+        blot = load_payload_blot(data.get("blot"), ("700", "800"), session_id)
+        if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
+            return jsonify({"error": "TIF files not found for this blot"}), 404
 
-        # Clamp adjustment values to safe ranges
+        brightness_700 = float(data.get("brightness700", 1.0))
+        contrast_700 = float(data.get("contrast700", 1.0))
+        brightness_800 = float(data.get("brightness800", 1.0))
+        contrast_800 = float(data.get("contrast800", 1.0))
+        color_mode = data.get("colorMode", "color")
+
         brightness_700 = max(0.1, min(5.0, brightness_700))
         contrast_700 = max(0.1, min(10.0, contrast_700))
         brightness_800 = max(0.1, min(5.0, brightness_800))
@@ -1176,7 +747,8 @@ def blot_composite(blot_id):
         img.save(buf, format="JPEG", quality=92)
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg")
-
+    except PublicError as error:
+        return error_response(error, "Could not render blot image.")
     except Exception as error:
         app.logger.exception("Composite render failed")
         return error_response(error, "Could not render blot image.")
@@ -1228,40 +800,33 @@ def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, 
 
 # ─── Signal extraction ────────────────────────────────────────────────────────
 
-@app.route("/blots/<blot_id>/extract", methods=["POST"])
-@require_user
+@app.route("/extract", methods=["POST"])
+@app.route("/api/extract", methods=["POST"])
 @limiter.limit("30 per minute")
-def extract_signals(blot_id):
-    blot = get_blot(blot_id, ())
-    if not blot:
-        return jsonify({"error": "Blot not found"}), 404
-
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-
-    boxes           = data.get("boxes", [])
-    channel         = data.get("channel", "700")
-    background_axis = data.get("backgroundAxis", "leftright")
-
-    # Validate channel
-    if channel not in ("700", "800"):
-        return jsonify({"error": "Invalid channel"}), 400
-    if background_axis not in ("leftright", "topbottom"):
-        return jsonify({"error": "Invalid background mode"}), 400
-    if not isinstance(boxes, list):
-        return jsonify({"error": "Boxes must be a list."}), 400
-
-    # Limit number of boxes
-    if len(boxes) > 200:
-        return jsonify({"error": "Too many boxes. Maximum is 200."}), 400
+def extract_payload_signals():
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
     try:
+        blot = load_payload_blot(data.get("blot"), (), session_id)
+        boxes = data.get("boxes", [])
+        channel = data.get("channel", "700")
+        background_axis = data.get("backgroundAxis", "leftright")
+
+        if channel not in ("700", "800"):
+            return jsonify({"error": "Invalid channel"}), 400
+        if background_axis not in ("leftright", "topbottom"):
+            return jsonify({"error": "Invalid background mode"}), 400
+        if not isinstance(boxes, list):
+            return jsonify({"error": "Boxes must be a list."}), 400
+        if len(boxes) > 200:
+            return jsonify({"error": "Too many boxes. Maximum is 200."}), 400
+
         for box in boxes:
             validate_box(box)
-        load_blot_files(blot_id, blot, (channel,))
-        tif_bytes = blot["tif_700_bytes"] if channel == "700" else blot["tif_800_bytes"]
-        if not tif_bytes:
+        descriptor = blot["files"].get(channel)
+        if not descriptor:
             return jsonify({"error": f"No {channel}nm TIF found"}), 404
+        tif_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel])
         arr = read_raw_channel(tif_bytes)
         results = [extract_box_signal(arr, box, background_axis) for box in boxes]
         return jsonify({"results": results})
@@ -1345,10 +910,27 @@ def validate_box(box):
     if box["w"] * box["h"] > MAX_IMAGE_PIXELS:
         raise PublicError("A selected box is too large.")
 
+
+@app.route("/cleanup", methods=["POST"])
+@app.route("/api/cleanup", methods=["POST"])
+@limiter.limit("30 per minute")
+def cleanup_temp_files():
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    descriptors = []
+    descriptors.extend(collect_blot_file_descriptors(data.get("blots", [])))
+    if isinstance(data.get("files"), list):
+        descriptors.extend(data["files"])
+    if isinstance(data.get("upload"), dict):
+        descriptors.append(data["upload"])
+    delete_temp_files(descriptors, session_id, allow_uploads=True)
+    return jsonify({"status": "deleted"})
+
+
 # ─── PowerPoint generation ────────────────────────────────────────────────────
 
 @app.route("/generate-pptx", methods=["POST"])
-@require_user
+@app.route("/api/generate-pptx", methods=["POST"])
 @limiter.limit("10 per minute")
 def generate_pptx():
     try:
@@ -1436,8 +1018,8 @@ def validate_pptx_payload(slides_data):
 def validate_data_url_size(value):
     if not isinstance(value, str):
         raise PublicError("Invalid image data.")
-    if not value.startswith("data:image/") or ";base64," not in value[:100]:
-        raise PublicError("Export images must be base64 image data URLs.")
+    if not re.match(r"^data:image/(jpeg|jpg|png);base64,", value, re.IGNORECASE):
+        raise PublicError("Export images must be JPEG or PNG base64 data URLs.")
     encoded = value.split(",", 1)[-1]
     approx_bytes = (len(encoded) * 3) // 4
     if approx_bytes > MAX_PPTX_IMAGE_BYTES:

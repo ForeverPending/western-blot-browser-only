@@ -1,8 +1,24 @@
-const BACKEND_URL = CONFIG.BACKEND_URL;
-const SUPABASE_BUCKET = CONFIG.SUPABASE_BUCKET || "western-blots";
-let supabaseClient = null;
-let authSession = null;
-let activeUserId = null;
+const BACKEND_URL = (CONFIG.BACKEND_URL || "").replace(/\/$/, "");
+const SESSION_STORAGE_KEY = "western-blot:browser-session-id";
+const BLOB_CLIENT_IMPORT_URL = CONFIG.BLOB_CLIENT_IMPORT_URL || "https://esm.sh/@vercel/blob/client";
+const ALLOWED_TABULAR_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx"]);
+const ALLOWED_ZIP_MIME_TYPES = new Set(["", "application/zip", "application/x-zip-compressed", "application/octet-stream"]);
+let blobClientPromise = null;
+
+function browserSessionId() {
+  let sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+  if (!sessionId) {
+    sessionId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  }
+  return sessionId;
+}
+
+const activeSessionId = browserSessionId();
+
+function apiUrl(path) {
+  return `${BACKEND_URL}${path}`;
+}
 
 function themeToken(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -18,31 +34,6 @@ function chartSeriesColors() {
     themeToken(`--chart-series-${index + 1}`)
   );
 }
-const configuredInactivityMinutes = Number(CONFIG.INACTIVITY_TIMEOUT_MINUTES);
-const inactivityMinutes = Number.isFinite(configuredInactivityMinutes) && configuredInactivityMinutes > 0
-  ? configuredInactivityMinutes
-  : 30;
-const INACTIVITY_TIMEOUT_MS = inactivityMinutes * 60 * 1000;
-const AUTH_MESSAGE_KEY = "western-blot:auth-message";
-let inactivityTimer = null;
-let lastActivityAt = 0;
-let lastActivityBroadcastAt = 0;
-let activityTrackingInitialized = false;
-let activityChannel = null;
-let signOutPromise = null;
-
-const authEls = {
-  gate: document.querySelector("#authGate"),
-  workspace: document.querySelector("#appWorkspace"),
-  form: document.querySelector("#authForm"),
-  email: document.querySelector("#authEmail"),
-  password: document.querySelector("#authPassword"),
-  message: document.querySelector("#authMessage"),
-  signIn: document.querySelector("#signInButton"),
-  magicLink: document.querySelector("#magicLinkButton"),
-  signOut: document.querySelector("#signOutButton"),
-  identity: document.querySelector("#userIdentity"),
-};
 const state = {
   mode: "shared",
   sharedSamples: [],
@@ -55,247 +46,18 @@ const state = {
   chartTitle: "",
 };
 
-function validateSupabaseConfig() {
-  return Boolean(
-    CONFIG.SUPABASE_URL
-    && !CONFIG.SUPABASE_URL.includes("YOUR_PROJECT_REF")
-    && CONFIG.SUPABASE_PUBLISHABLE_KEY
-    && !CONFIG.SUPABASE_PUBLISHABLE_KEY.includes("REPLACE_ME")
-  );
+function initializeApp() {
+  const workspace = document.querySelector("#appWorkspace");
+  if (workspace) workspace.hidden = false;
 }
 
-async function initializeAuth() {
-  if (!validateSupabaseConfig() || !window.supabase?.createClient) {
-    showAuthMessage("Supabase authentication is not configured in config.js.");
-    authEls.signIn.disabled = true;
-    authEls.magicLink.disabled = true;
-    return;
-  }
-
-  supabaseClient = window.supabase.createClient(
-    CONFIG.SUPABASE_URL,
-    CONFIG.SUPABASE_PUBLISHABLE_KEY,
-    {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true,
-      },
-    },
-  );
-
-  authEls.form.addEventListener("submit", signInWithPassword);
-  authEls.magicLink.addEventListener("click", sendMagicLink);
-  authEls.signOut.addEventListener("click", signOut);
-  initializeActivityTracking();
-
-  const { data, error } = await supabaseClient.auth.getSession();
-  if (error) showAuthMessage(error.message);
-  await applyAuthSession(data.session);
-  const authMessage = window.sessionStorage.getItem(AUTH_MESSAGE_KEY);
-  window.sessionStorage.removeItem(AUTH_MESSAGE_KEY);
-  if (!data.session && authMessage) showAuthMessage(authMessage);
-
-  supabaseClient.auth.onAuthStateChange((_event, session) => {
-    window.setTimeout(() => applyAuthSession(session), 0);
-  });
-}
-
-async function signInWithPassword(event) {
-  event.preventDefault();
-  setAuthBusy(true);
-  showAuthMessage("");
-  const { error } = await supabaseClient.auth.signInWithPassword({
-    email: authEls.email.value.trim(),
-    password: authEls.password.value,
-  });
-  if (error) showAuthMessage(error.message);
-  setAuthBusy(false);
-}
-
-async function sendMagicLink() {
-  const email = authEls.email.value.trim();
-  if (!email) {
-    showAuthMessage("Enter your invited email address first.");
-    return;
-  }
-  setAuthBusy(true);
-  const { error } = await supabaseClient.auth.signInWithOtp({
-    email,
-    options: {
-      shouldCreateUser: false,
-      emailRedirectTo: `${window.location.origin}${window.location.pathname}`,
-    },
-  });
-  showAuthMessage(
-    error ? error.message : "Sign-in link sent. Check your email.",
-    !error,
-  );
-  setAuthBusy(false);
-}
-
-async function signOut() {
-  return performSignOut();
-}
-
-async function performSignOut(message = "") {
-  if (signOutPromise) return signOutPromise;
-  signOutPromise = finishSignOut(message);
-  return signOutPromise;
-}
-
-async function finishSignOut(message) {
-  stopInactivityTimer();
-  await applyAuthSession(null);
-  try {
-    await supabaseClient?.auth.signOut();
-  } finally {
-    if (message) window.sessionStorage.setItem(AUTH_MESSAGE_KEY, message);
-    window.location.reload();
-  }
-}
-
-function initializeActivityTracking() {
-  if (activityTrackingInitialized) return;
-  activityTrackingInitialized = true;
-
-  ["pointerdown", "keydown", "scroll", "touchstart"].forEach((eventName) => {
-    window.addEventListener(eventName, recordUserActivity, { capture: true, passive: true });
-  });
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") checkInactivity();
-  });
-
-  if ("BroadcastChannel" in window) {
-    activityChannel = new BroadcastChannel("western-blot:activity");
-    activityChannel.addEventListener("message", (event) => {
-      if (event.data?.type !== "activity" || event.data.userId !== activeUserId) return;
-      lastActivityAt = Date.now();
-      scheduleInactivityTimer();
-    });
-  }
-}
-
-function recordUserActivity() {
-  if (!authSession) return;
-  const now = Date.now();
-  lastActivityAt = now;
-  scheduleInactivityTimer();
-  if (activityChannel && now - lastActivityBroadcastAt >= 15000) {
-    lastActivityBroadcastAt = now;
-    activityChannel.postMessage({ type: "activity", userId: activeUserId });
-  }
-}
-
-function startInactivityTimer() {
-  lastActivityAt = Date.now();
-  scheduleInactivityTimer();
-}
-
-function stopInactivityTimer() {
-  if (inactivityTimer !== null) window.clearTimeout(inactivityTimer);
-  inactivityTimer = null;
-  lastActivityAt = 0;
-}
-
-function scheduleInactivityTimer() {
-  if (inactivityTimer !== null) window.clearTimeout(inactivityTimer);
-  inactivityTimer = null;
-  if (!authSession || !lastActivityAt) return;
-  const remaining = INACTIVITY_TIMEOUT_MS - (Date.now() - lastActivityAt);
-  if (remaining <= 0) {
-    void signOutForInactivity();
-    return;
-  }
-  inactivityTimer = window.setTimeout(checkInactivity, remaining);
-}
-
-function checkInactivity() {
-  if (!authSession || !lastActivityAt) return;
-  if (Date.now() - lastActivityAt >= INACTIVITY_TIMEOUT_MS) {
-    void signOutForInactivity();
-  } else {
-    scheduleInactivityTimer();
-  }
-}
-
-function signOutForInactivity() {
-  return performSignOut(`Signed out after ${inactivityMinutes} minutes of inactivity.`);
-}
-
-async function applyAuthSession(session) {
-  const nextUserId = session?.user?.id || null;
-  const previousUserId = activeUserId;
-  const userChanged = nextUserId !== previousUserId;
-  authSession = session;
-  activeUserId = nextUserId;
-
-  if (previousUserId && nextUserId && previousUserId !== nextUserId) {
-    window.location.reload();
-    return;
-  }
-
-  if (userChanged) resetBlotWorkspace();
-  authEls.gate.hidden = Boolean(session);
-  authEls.workspace.hidden = !session;
-  authEls.identity.textContent = session?.user?.email || "";
-
-  if (!session) {
-    stopInactivityTimer();
-    authEls.password.value = "";
-    return;
-  }
-  startInactivityTimer();
-  if (userChanged) await loadPersistedBlots();
-}
-
-function setAuthBusy(isBusy) {
-  authEls.signIn.disabled = isBusy;
-  authEls.magicLink.disabled = isBusy;
-}
-
-function showAuthMessage(message, success = false) {
-  authEls.message.textContent = message;
-  authEls.message.hidden = !message;
-  authEls.message.classList.toggle("success", success);
-}
-
-async function currentAccessToken(forceRefresh = false) {
-  const result = forceRefresh
-    ? await supabaseClient.auth.refreshSession()
-    : await supabaseClient.auth.getSession();
-  if (result.error || !result.data.session) {
-    throw new Error("Your session has expired. Please sign in again.");
-  }
-  authSession = result.data.session;
-  return authSession.access_token;
-}
-
-async function authFetch(url, options = {}, allowRetry = true) {
-  if (!supabaseClient) throw new Error("Authentication is not configured.");
-  const token = await currentAccessToken(false);
+async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(url, {
+  headers.set("X-Blot-Session", activeSessionId);
+  return fetch(url, {
     ...options,
     headers,
   });
-  if (response.status === 401 && allowRetry) {
-    try {
-      const refreshedToken = await currentAccessToken(true);
-      const retryHeaders = new Headers(options.headers || {});
-      retryHeaders.set("Authorization", `Bearer ${refreshedToken}`);
-      return authFetch(url, { ...options, headers: retryHeaders }, false);
-    } catch (error) {
-      await signOut();
-      throw error;
-    }
-  }
-  if (response.status === 401) {
-    await signOut();
-    throw new Error("Your session has expired. Please sign in again.");
-  }
-  return response;
 }
 
 async function apiErrorMessage(response, fallback) {
@@ -309,9 +71,9 @@ async function apiErrorMessage(response, fallback) {
   }
 }
 
-// Fetches authenticated JSON and converts every unsuccessful response into one consistent error.
-async function authJson(url, options = {}, fallback = "Request failed.") {
-  const response = await authFetch(url, options);
+// Fetches JSON and converts every unsuccessful response into one consistent error.
+async function apiJson(url, options = {}, fallback = "Request failed.") {
+  const response = await apiFetch(url, options);
   let data;
   try {
     data = await response.json();
@@ -738,6 +500,14 @@ async function loadDatasetFile(event, dataset, controls) {
 
 async function readTabularFile(file) {
   const extension = file.name.split(".").pop().toLowerCase();
+  const maxBytes = Number(CONFIG.MAX_TABULAR_UPLOAD_BYTES || 25 * 1024 * 1024);
+  if (!ALLOWED_TABULAR_EXTENSIONS.has(extension)) {
+    throw new Error("Use a CSV, TSV, XLS, or XLSX file.");
+  }
+  if (file.size > maxBytes) {
+    throw new Error(`File is too large. Maximum size is ${Math.floor(maxBytes / 1024 / 1024)} MB.`);
+  }
+
   if (extension === "csv" || extension === "tsv") {
     const text = await file.text();
     const delimiter = extension === "tsv" ? "\t" : ",";
@@ -1707,7 +1477,7 @@ function downloadSharedCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${analysis.name.replace(/\W+/g, "-").toLowerCase()}-fold-change.csv`;
+  link.download = `${filenameSafe(analysis.name)}-fold-change.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -1785,7 +1555,7 @@ function formatNumber(value) {
 
 function csvCell(value) {
   let text = String(value ?? "");
-  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  if (/^\s*[=+\-@\t\r]/.test(text)) text = `'${text}`;
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
@@ -1849,7 +1619,7 @@ const blotListElement = document.querySelector("#blotList");
 const blotScrollUpButton = document.querySelector("#blotScrollUp");
 const blotScrollDownButton = document.querySelector("#blotScrollDown");
 
-initializeAuth();
+initializeApp();
 
 document.querySelector("#zipFileInput")?.addEventListener("change", async (event) => {
   const files = Array.from(event.target.files);
@@ -1879,25 +1649,8 @@ if (window.ResizeObserver && blotListElement) {
 }
 
 async function loadPersistedBlots() {
-  const requestedUserId = activeUserId;
-  try {
-    const data = await authJson(`${BACKEND_URL}/blots`, {}, "Could not load saved blots.");
-    if (!requestedUserId || requestedUserId !== activeUserId) return;
-    const activeBlotId = blotState.blots[blotState.activeBlotIndex]?.id;
-
-    blotState.blots = data.blots || [];
-    blotState.scans = data.scans || {};
-    sortBlotsByCreatedAt();
-    blotState.activeBlotIndex = activeBlotId
-      ? blotState.blots.findIndex((blot) => blot.id === activeBlotId)
-      : null;
-    if (blotState.activeBlotIndex < 0) blotState.activeBlotIndex = null;
-
-    renderBlotList();
-    refreshBlotSourceDropdowns();
-  } catch (error) {
-    console.warn("Could not load persisted blots.", error);
-  }
+  renderBlotList();
+  refreshBlotSourceDropdowns();
 }
 
 function resetBlotWorkspace() {
@@ -2025,20 +1778,11 @@ function ensureActiveBlotVisible() {
 
 async function deleteBlot(index, button) {
   const blot = blotState.blots[index];
-  if (!blot || !window.confirm(`Delete “${blot.name}” and all of its saved scans? This cannot be undone.`)) return;
+  if (!blot || !window.confirm(`Remove “${blot.name}” and its session scans? This cannot be undone.`)) return;
 
   button.disabled = true;
   button.textContent = "Deleting…";
-  try {
-    await authJson(`${BACKEND_URL}/blots/${encodeURIComponent(blot.id)}`, {
-      method: "DELETE",
-    }, "Could not delete blot.");
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = "Delete";
-    alert(`Blot delete failed: ${error.message}`);
-    return;
-  }
+  void cleanupBlots([blot]);
 
   const deletionIndex = blotState.blots.findIndex((candidate) => candidate.id === blot.id);
   if (deletionIndex < 0) return;
@@ -2163,7 +1907,8 @@ function refreshScanDropdown(role, index) {
 
 async function uploadZip(file) {
   const maxBytes = Number(CONFIG.MAX_ZIP_UPLOAD_BYTES || 262144000);
-  if (!file.name.toLowerCase().endsWith(".zip")) {
+  const mimeType = String(file.type || "").toLowerCase();
+  if (!file.name.toLowerCase().endsWith(".zip") || !ALLOWED_ZIP_MIME_TYPES.has(mimeType)) {
     alert("Please select a ZIP file.");
     return;
   }
@@ -2172,23 +1917,9 @@ async function uploadZip(file) {
     return;
   }
 
-  const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const objectPath = `${authSession.user.id}/uploads/${uploadId}.zip`;
-  let uploaded = false;
-
   try {
-    setZipUploadStatus(`Uploading ${file.name}: 0%`);
-    await uploadZipWithTus(file, objectPath, (percentage) => {
-      setZipUploadStatus(`Uploading ${file.name}: ${percentage}%`);
-    });
-    uploaded = true;
     setZipUploadStatus(`Processing ${file.name}...`);
-
-    const data = await authJson(`${BACKEND_URL}/process-upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ objectPath }),
-    }, "ZIP processing failed.");
+    const data = await processZipFile(file);
 
     mergeBlots(data.blots || []);
     if (data.scans) {
@@ -2202,69 +1933,47 @@ async function uploadZip(file) {
   } catch (error) {
     setZipUploadStatus("");
     alert(`Failed to load ZIP: ${error.message}`);
-  } finally {
-    if (uploaded) {
-      const { error } = await supabaseClient.storage.from(SUPABASE_BUCKET).remove([objectPath]);
-      if (error) console.warn("Temporary ZIP cleanup failed.", error.message);
-    }
   }
 }
 
-function uploadZipWithTus(file, objectPath, onProgress) {
-  if (!window.tus?.Upload) {
-    return Promise.reject(new Error("The resumable upload client did not load."));
+async function processZipFile(file) {
+  if (CONFIG.USE_VERCEL_BLOB_UPLOADS) {
+    setZipUploadStatus(`Uploading ${file.name}...`);
+    const blob = await uploadZipToVercelBlob(file);
+    setZipUploadStatus(`Processing ${file.name}...`);
+    return apiJson(apiUrl("/process-upload"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSessionId, upload: blob }),
+    }, "ZIP processing failed.");
   }
-  return new Promise(async (resolve, reject) => {
-    let token;
-    try {
-      token = await currentAccessToken(false);
-    } catch (error) {
-      reject(error);
-      return;
-    }
 
-    const upload = new window.tus.Upload(file, {
-      endpoint: supabaseTusEndpoint(),
-      retryDelays: [0, 3000, 5000, 10000, 20000],
-      headers: {
-        authorization: `Bearer ${token}`,
-      },
-      uploadDataDuringCreation: true,
-      removeFingerprintOnSuccess: true,
-      chunkSize: 6 * 1024 * 1024,
-      metadata: {
-        bucketName: SUPABASE_BUCKET,
-        objectName: objectPath,
-        contentType: "application/zip",
-        cacheControl: "3600",
-      },
-      onError(error) {
-        const status = error?.originalResponse?.getStatus?.();
-        if (status === 401) {
-          reject(new Error("Your upload session expired. Please sign out and sign in again."));
-        } else if (status === 403) {
-          reject(new Error("Your account does not have permission to upload this ZIP."));
-        } else {
-          reject(new Error("The ZIP upload could not be completed."));
-        }
-      },
-      onProgress(bytesUploaded, bytesTotal) {
-        onProgress(Math.round((bytesUploaded / Math.max(1, bytesTotal)) * 100));
-      },
-      onSuccess: resolve,
-    });
+  const form = new FormData();
+  form.append("sessionId", activeSessionId);
+  form.append("file", file);
+  return apiJson(apiUrl("/upload-zip"), {
+    method: "POST",
+    body: form,
+  }, "ZIP processing failed.");
+}
 
-    upload.start();
+async function uploadZipToVercelBlob(file) {
+  if (!blobClientPromise) blobClientPromise = import(blobClientImportUrl());
+  const { upload } = await blobClientPromise;
+  const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
+    access: "private",
+    handleUploadUrl: apiUrl("/blob-upload"),
+    clientPayload: JSON.stringify({ sessionId: activeSessionId }),
   });
 }
 
-function supabaseTusEndpoint() {
-  const url = new URL(CONFIG.SUPABASE_URL);
-  const cloudMatch = url.hostname.match(/^([a-z0-9-]+)\.supabase\.co$/i);
-  if (cloudMatch) {
-    return `https://${cloudMatch[1]}.storage.supabase.co/storage/v1/upload/resumable`;
+function blobClientImportUrl() {
+  const url = new URL(BLOB_CLIENT_IMPORT_URL, window.location.href);
+  if (url.origin !== "https://esm.sh" || !url.pathname.startsWith("/@vercel/blob@")) {
+    throw new Error("Invalid Blob client import URL.");
   }
-  return `${url.origin}/storage/v1/upload/resumable`;
+  return url.href;
 }
 
 function setZipUploadStatus(message, success = false) {
@@ -2274,6 +1983,23 @@ function setZipUploadStatus(message, success = false) {
   status.hidden = !message;
   status.classList.toggle("success", success);
 }
+
+function cleanupBlots(blots, keepalive = false) {
+  const removable = (blots || []).filter((blot) => blot?.files);
+  if (!removable.length) return Promise.resolve();
+  return apiFetch(apiUrl("/cleanup"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: activeSessionId, blots: removable }),
+    keepalive,
+  }).catch((error) => {
+    console.warn("Temporary blot cleanup failed.", error);
+  });
+}
+
+window.addEventListener("pagehide", () => {
+  cleanupBlots(blotState.blots, true);
+});
 
 async function selectBlot(index) {
   blotState.activeBlotIndex = index;
@@ -2456,7 +2182,6 @@ async function loadCanvasImage(blotId, options = {}) {
   const controller = new AbortController();
   canvasImageController = controller;
   const requestId = ++canvasImageRequestId;
-  const url = buildCompositeUrl(blotId);
   const previousView = {
     zoom: canvasState.zoom,
     panX: canvasState.panX,
@@ -2498,11 +2223,7 @@ async function loadCanvasImage(blotId, options = {}) {
   };
   img.onerror = () => URL.revokeObjectURL(img.src);
   try {
-    const response = await authFetch(url, { signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(await apiErrorMessage(response, "Could not load blot image."));
-    }
-    const blob = await response.blob();
+    const blob = await renderCompositeBlob(blotId, "color", controller.signal);
     if (requestId !== canvasImageRequestId || blotId !== canvasState.currentBlotId) return;
     img.src = URL.createObjectURL(blob);
   } catch (error) {
@@ -2513,23 +2234,41 @@ async function loadCanvasImage(blotId, options = {}) {
   }
 }
 
-// Builds one canonical composite URL for the viewer and exported presentations.
-function buildCompositeUrl(blotId, defaultColorMode = "color") {
+function blotById(blotId) {
+  return blotState.blots.find((blot) => blot.id === blotId) || null;
+}
+
+// Builds one canonical composite payload for the viewer and exported presentations.
+function buildCompositePayload(blotId, defaultColorMode = "color") {
   const brightness700 = document.getElementById("brightness700")?.value ?? 1;
   const contrast700   = document.getElementById("contrast700")?.value   ?? 1;
   const brightness800 = document.getElementById("brightness800")?.value ?? 1;
   const contrast800   = document.getElementById("contrast800")?.value   ?? 1;
   const colorMode     = document.getElementById("colorMode")?.value     ?? defaultColorMode;
-
-  const params = new URLSearchParams({
+  const blot = blotById(blotId);
+  if (!blot) throw new Error("Blot is no longer loaded.");
+  return {
+    sessionId: activeSessionId,
+    blot,
     brightness700,
     contrast700,
     brightness800,
     contrast800,
     colorMode,
-  });
+  };
+}
 
-  return `${BACKEND_URL}/blots/${encodeURIComponent(blotId)}/composite?${params}`;
+async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
+  const response = await apiFetch(apiUrl("/render-composite"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildCompositePayload(blotId, defaultColorMode)),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Could not load blot image."));
+  }
+  return response.blob();
 }
 
 function renderCanvas() {
@@ -2743,11 +2482,11 @@ function renderBoxList(blotId) {
 
 function renderSavedScans(blotId) {
   const scans = blotState.scans[blotId] || [];
-  if (!scans.length) return `<p class="blot-empty-state" style="margin-top:12px;">No scans saved yet.</p>`;
+  if (!scans.length) return `<p class="blot-empty-state" style="margin-top:12px;">No session scans yet.</p>`;
 
   return `
     <div class="saved-scans">
-      <p class="eyebrow" style="margin: 12px 0 8px;">Saved scans</p>
+      <p class="eyebrow" style="margin: 12px 0 8px;">Session scans</p>
       ${scans.map((scan, index) => `
         <div class="saved-scan-item">
           <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
@@ -2787,6 +2526,7 @@ async function saveScan(blotId) {
   const backgroundAxis = document.getElementById("backgroundAxis")?.value ?? "leftright";
 
   const scan = {
+    id: window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     proteinName,
     channel,
     backgroundAxis,
@@ -2796,19 +2536,8 @@ async function saveScan(blotId) {
     })),
   };
 
-  try {
-    const data = await authJson(`${BACKEND_URL}/blots/${encodeURIComponent(blotId)}/scans`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(scan),
-    }, "Could not save scan.");
-
-    if (!blotState.scans[blotId]) blotState.scans[blotId] = [];
-    blotState.scans[blotId].push(data.scan);
-  } catch (error) {
-    alert(`Scan save failed: ${error.message}`);
-    return;
-  }
+  if (!blotState.scans[blotId]) blotState.scans[blotId] = [];
+  blotState.scans[blotId].push(scan);
 
   // Clear boxes for next scan
   canvasState.boxes = [];
@@ -2821,19 +2550,6 @@ async function saveScan(blotId) {
 
 async function deleteScan(blotId, scanIndex) {
   if (!blotState.scans[blotId]) return;
-  const scan = blotState.scans[blotId][scanIndex];
-
-  if (scan?.id) {
-    try {
-      await authJson(`${BACKEND_URL}/blots/${encodeURIComponent(blotId)}/scans/${encodeURIComponent(scan.id)}`, {
-        method: "DELETE",
-      }, "Could not delete scan.");
-    } catch (error) {
-      alert(`Scan delete failed: ${error.message}`);
-      return;
-    }
-  }
-
   blotState.scans[blotId].splice(scanIndex, 1);
   renderBoxList(blotId);
   refreshBlotSourceDropdowns();
@@ -2879,10 +2595,12 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
   renderBoxList(blotId);
 
   try {
-    const data = await authJson(`${BACKEND_URL}/blots/${encodeURIComponent(blotId)}/extract`, {
+    const data = await apiJson(apiUrl("/extract"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        sessionId: activeSessionId,
+        blot: blotById(blotId),
         boxes: boxes.map(box => ({ x: box.x, y: box.y, w: box.w, h: box.h })),
         channel,
         backgroundAxis,
@@ -2941,15 +2659,17 @@ function canvasToBase64(canvas) {
   return canvas.toDataURL("image/jpeg", 0.92);
 }
 
-async function urlToBase64(url) {
-  const response = await authFetch(url);
-  const blob = await response.blob();
+async function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
     reader.onerror = reject;
     reader.readAsDataURL(blob);
   });
+}
+
+async function compositeToBase64(blotId, defaultColorMode = "grayscale") {
+  return blobToBase64(await renderCompositeBlob(blotId, defaultColorMode));
 }
 
 async function generatePptx() {
@@ -2976,8 +2696,7 @@ async function generatePptx() {
       const usingBlot = blotSelect && !document.getElementById(`sampleBlot${i}`)?.hidden;
 
       if (usingBlot && blotSelect?.value) {
-        const url = buildCompositeUrl(blotSelect.value, "grayscale");
-        const b64 = await urlToBase64(url);
+        const b64 = await compositeToBase64(blotSelect.value, "grayscale");
         const analysis = state.sharedAnalyses[i];
         imageSlide.images.push({
           image: b64,
@@ -2990,8 +2709,7 @@ async function generatePptx() {
     const controlBlotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
     const controlUsingBlot = controlBlotSelect && !document.getElementById("controlBlot0")?.hidden;
     if (controlUsingBlot && controlBlotSelect?.value) {
-      const url = buildCompositeUrl(controlBlotSelect.value, "grayscale");
-      const b64 = await urlToBase64(url);
+      const b64 = await compositeToBase64(controlBlotSelect.value, "grayscale");
       const controlScanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
       const scan = blotState.scans[controlBlotSelect.value]?.[Number(controlScanSelect?.value)];
       imageSlide.images.push({
@@ -3043,7 +2761,7 @@ async function generatePptx() {
     }
 
     // ── Send to backend ───────────────────────────────────────────────────────
-    const response = await authFetch(`${BACKEND_URL}/generate-pptx`, {
+    const response = await apiFetch(apiUrl("/generate-pptx"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slides }),

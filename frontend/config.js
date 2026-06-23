@@ -1,8 +1,7 @@
 const CONFIG = {
     BACKEND_URL: "http://127.0.0.1:5001",
-    SUPABASE_URL: "https://zqybovzqcdpsejghqqxk.supabase.co",
-    SUPABASE_PUBLISHABLE_KEY: "sb_publishable_hSamnLUW2Na4wz7TJZ-kIQ_MsTM26VN",
-    SUPABASE_BUCKET: "western-blots",
+    USE_VERCEL_BLOB_UPLOADS: false,
+    BLOB_CLIENT_IMPORT_URL: "https://esm.sh/@vercel/blob@1.1.1/client",
     MAX_ZIP_UPLOAD_BYTES: 262144000,
-    INACTIVITY_TIMEOUT_MINUTES: 30
+    MAX_TABULAR_UPLOAD_BYTES: 26214400,
 };

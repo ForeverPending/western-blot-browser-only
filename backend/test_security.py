@@ -1,37 +1,28 @@
+import base64
 import io
 import os
+import sys
 import tempfile
 import unittest
-import uuid
 import zipfile
-from unittest.mock import patch
 
 import numpy as np
 import tifffile
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
-os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
-os.environ.setdefault("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_test")
-os.environ.setdefault("BLOT_STORAGE_BACKEND", "local")
-os.environ["BLOT_DATA_DIR"] = TEST_DATA.name
+os.environ["BLOT_TEMP_STORAGE"] = "local"
+os.environ["BLOT_TEMP_DIR"] = TEST_DATA.name
 os.environ["RATELIMIT_ENABLED"] = "false"
+sys.path.insert(0, os.path.dirname(__file__))
 
 import app as backend  # noqa: E402
 
 
-USER_A = str(uuid.uuid4())
-USER_B = str(uuid.uuid4())
+SESSION_ID = "test-browser-session"
 
 
-def fake_verify(token):
-    users = {"token-a": USER_A, "token-b": USER_B}
-    if token not in users:
-        raise backend.AuthenticationError()
-    return users[token]
-
-
-def make_test_zip(blot_name="Security test blot", created_line="#Fri May 15 16:38:05 PDT 2026"):
+def make_test_zip(blot_name="Session test blot", created_line="#Fri May 15 16:38:05 PDT 2026"):
     tif_buffer = io.BytesIO()
     tifffile.imwrite(tif_buffer, np.arange(64, dtype=np.uint16).reshape(8, 8))
     archive = io.BytesIO()
@@ -53,52 +44,53 @@ def make_licor_pyramid_tif():
     return image.getvalue(), full_resolution
 
 
-class MultiUserSecurityTests(unittest.TestCase):
+class StatelessSessionBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        backend.verify_supabase_token = fake_verify
         backend.app.config.update(TESTING=True)
         cls.client = backend.app.test_client()
 
-    def auth(self, token):
-        return {"Authorization": f"Bearer {token}"}
-
-    def test_authentication_and_owner_isolation(self):
-        self.assertEqual(self.client.get("/blots").status_code, 401)
-
-        upload = self.client.post(
+    def upload_blot(self):
+        response = self.client.post(
             "/upload-zip",
-            headers=self.auth("token-a"),
-            data={"file": (make_test_zip(), "scanner.zip")},
+            data={"sessionId": SESSION_ID, "file": (make_test_zip(), "scanner.zip")},
             content_type="multipart/form-data",
         )
-        self.assertEqual(upload.status_code, 200, upload.get_json())
-        uploaded_blot = upload.get_json()["blots"][0]
-        blot_id = uploaded_blot["id"]
-        self.assertEqual(uploaded_blot["createdAt"], "2026-05-15T23:38:05+00:00")
-        self.assertIn("hasJpg", uploaded_blot)
-        self.assertNotIn("has_jpg", uploaded_blot)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        return response.get_json()["blots"][0]
 
-        owner_list = self.client.get("/blots", headers=self.auth("token-a"))
-        other_list = self.client.get("/blots", headers=self.auth("token-b"))
-        self.assertEqual(len(owner_list.get_json()["blots"]), 1)
-        self.assertEqual(other_list.get_json()["blots"], [])
-        listed_blot = owner_list.get_json()["blots"][0]
-        self.assertIn("scanCount", listed_blot)
-        self.assertIn("createdAt", listed_blot)
-        self.assertEqual(listed_blot["createdAt"], "2026-05-15T23:38:05+00:00")
-        self.assertNotIn("scan_count", listed_blot)
+    def test_zip_upload_returns_session_file_descriptors(self):
+        blot = self.upload_blot()
+        self.assertEqual(blot["createdAt"], "2026-05-15T23:38:05+00:00")
+        self.assertIn("hasJpg", blot)
+        self.assertNotIn("has_jpg", blot)
+        self.assertIn("files", blot)
+        self.assertTrue(blot["files"]["700"]["path"].startswith(f"sessions/{SESSION_ID}/"))
+        self.assertTrue(blot["files"]["800"]["path"].startswith(f"sessions/{SESSION_ID}/"))
 
-        hidden = self.client.get(
-            f"/blots/{blot_id}/composite",
-            headers=self.auth("token-b"),
+    def test_renders_composite_and_extracts_signals_from_descriptor(self):
+        blot = self.upload_blot()
+
+        composite = self.client.post(
+            "/render-composite",
+            json={
+                "sessionId": SESSION_ID,
+                "blot": blot,
+                "brightness700": 1,
+                "contrast700": 1,
+                "brightness800": 1,
+                "contrast800": 1,
+                "colorMode": "color",
+            },
         )
-        self.assertEqual(hidden.status_code, 404)
+        self.assertEqual(composite.status_code, 200, composite.get_json())
+        self.assertEqual(composite.mimetype, "image/jpeg")
 
         invalid_box = self.client.post(
-            f"/blots/{blot_id}/extract",
-            headers=self.auth("token-a"),
+            "/extract",
             json={
+                "sessionId": SESSION_ID,
+                "blot": blot,
                 "channel": "700",
                 "backgroundAxis": "leftright",
                 "boxes": [{"x": "invalid", "y": 0, "w": 2, "h": 2}],
@@ -107,9 +99,10 @@ class MultiUserSecurityTests(unittest.TestCase):
         self.assertEqual(invalid_box.status_code, 400)
 
         extraction = self.client.post(
-            f"/blots/{blot_id}/extract",
-            headers=self.auth("token-a"),
+            "/extract",
             json={
+                "sessionId": SESSION_ID,
+                "blot": blot,
                 "channel": "700",
                 "backgroundAxis": "leftright",
                 "boxes": [{"x": 0, "y": 0, "w": 2, "h": 2}],
@@ -122,45 +115,49 @@ class MultiUserSecurityTests(unittest.TestCase):
         self.assertIn("adjustedSignal", signal)
         self.assertNotIn("raw_signal", signal)
 
-        scan = self.client.post(
-            f"/blots/{blot_id}/scans",
-            headers=self.auth("token-a"),
+    def test_session_id_must_match_temp_descriptors(self):
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/extract",
             json={
-                "proteinName": "IRE1",
+                "sessionId": "other-session",
+                "blot": blot,
                 "channel": "700",
                 "backgroundAxis": "leftright",
-                "lanes": [{"name": "Lane 1", "signal": 100.0}],
+                "boxes": [{"x": 0, "y": 0, "w": 2, "h": 2}],
             },
         )
-        self.assertEqual(scan.status_code, 201, scan.get_json())
-        self.assertEqual(scan.get_json()["scan"]["backgroundAxis"], "leftright")
-        hidden_scans = self.client.get(
-            f"/blots/{blot_id}/scans",
-            headers=self.auth("token-b"),
-        )
-        self.assertEqual(hidden_scans.status_code, 404)
+        self.assertEqual(response.status_code, 403)
 
-    def test_blots_are_sorted_by_metadata_creation_time(self):
-        late_upload = self.client.post(
-            "/upload-zip",
-            headers=self.auth("token-b"),
-            data={"file": (make_test_zip("Later blot", "#Fri May 15 16:38:05 PDT 2026"), "later.zip")},
-            content_type="multipart/form-data",
-        )
-        early_upload = self.client.post(
-            "/upload-zip",
-            headers=self.auth("token-b"),
-            data={"file": (make_test_zip("Earlier blot", "#Thu Jan 02 08:15:00 PST 2025"), "earlier.zip")},
-            content_type="multipart/form-data",
-        )
-        self.assertEqual(late_upload.status_code, 200, late_upload.get_json())
-        self.assertEqual(early_upload.status_code, 200, early_upload.get_json())
-        late_id = late_upload.get_json()["blots"][0]["id"]
-        early_id = early_upload.get_json()["blots"][0]["id"]
+    def test_temp_descriptors_must_use_expected_path_shape(self):
+        with self.assertRaises(backend.PublicError):
+            backend.validate_temp_path(f"sessions/{SESSION_ID}/blot-1/not-allowed.tif", SESSION_ID)
+        with self.assertRaises(backend.PublicError):
+            backend.validate_temp_path(f"uploads/{SESSION_ID}/nested/file.zip", SESSION_ID, allow_uploads=True)
 
-        listed = self.client.get("/blots", headers=self.auth("token-b")).get_json()["blots"]
-        uploaded_ids = [blot["id"] for blot in listed if blot["id"] in (early_id, late_id)]
-        self.assertEqual(uploaded_ids, [early_id, late_id])
+    def test_blob_urls_must_be_vercel_blob_urls_matching_descriptor_path(self):
+        path = f"sessions/{SESSION_ID}/blot-1/700.tif"
+        with self.assertRaises(backend.PublicError):
+            backend.vercel_blob_read({"url": f"https://example.test/{path}"}, path)
+        with self.assertRaises(backend.PublicError):
+            backend.vercel_blob_read(
+                {"url": "https://store.public.blob.vercel-storage.com/sessions/other/blot-1/700.tif"},
+                path,
+            )
+
+    def test_cleanup_removes_temp_files(self):
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/cleanup",
+            json={"sessionId": SESSION_ID, "blots": [blot]},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        missing = self.client.post(
+            "/render-composite",
+            json={"sessionId": SESSION_ID, "blot": blot},
+        )
+        self.assertEqual(missing.status_code, 404)
 
     def test_parses_blot_creation_time_with_timezone(self):
         self.assertEqual(
@@ -175,143 +172,20 @@ class MultiUserSecurityTests(unittest.TestCase):
         archive.seek(0)
         response = self.client.post(
             "/upload-zip",
-            headers=self.auth("token-a"),
-            data={"file": (archive, "unsafe.zip")},
+            data={"sessionId": SESSION_ID, "file": (archive, "unsafe.zip")},
             content_type="multipart/form-data",
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_blot_files_are_loaded_only_when_requested(self):
-        upload = self.client.post(
-            "/upload-zip",
-            headers=self.auth("token-a"),
-            data={"file": (make_test_zip(), "scanner.zip")},
-            content_type="multipart/form-data",
-        )
-        blot_id = upload.get_json()["blots"][0]["id"]
-        backend.blot_store.pop((USER_A, blot_id), None)
-
-        # Metadata checks should not read large image files from storage.
-        with backend.app.test_request_context():
-            backend.g.owner_id = USER_A
-            backend.g.access_token = "token-a"
-            metadata = backend.get_blot(blot_id, ())
-            self.assertNotIn("tif_700_bytes", metadata)
-            self.assertNotIn("tif_800_bytes", metadata)
-
-            loaded = backend.get_blot(blot_id, ("700",))
-            self.assertIn("tif_700_bytes", loaded)
-            self.assertNotIn("tif_800_bytes", loaded)
-
-    def test_owner_can_delete_blot_and_its_files(self):
-        upload = self.client.post(
-            "/upload-zip",
-            headers=self.auth("token-a"),
-            data={"file": (make_test_zip(), "delete-me.zip")},
-            content_type="multipart/form-data",
-        )
-        blot_id = upload.get_json()["blots"][0]["id"]
-        directory = os.path.join(
-            backend.BLOT_FILE_DIR,
-            backend.safe_id(USER_A),
-            backend.safe_id(blot_id),
-        )
-        self.assertTrue(os.path.isdir(directory))
-
-        saved_scan = self.client.post(
-            f"/blots/{blot_id}/scans",
-            headers=self.auth("token-a"),
-            json={
-                "proteinName": "Delete test",
-                "channel": "700",
-                "backgroundAxis": "leftright",
-                "lanes": [{"name": "Lane 1", "signal": 10.0}],
-            },
-        )
-        self.assertEqual(saved_scan.status_code, 201, saved_scan.get_json())
-
-        hidden = self.client.delete(
-            f"/blots/{blot_id}",
-            headers=self.auth("token-b"),
-        )
-        self.assertEqual(hidden.status_code, 404)
-        self.assertTrue(os.path.isdir(directory))
-
-        deleted = self.client.delete(
-            f"/blots/{blot_id}",
-            headers=self.auth("token-a"),
-        )
-        self.assertEqual(deleted.status_code, 200, deleted.get_json())
-        self.assertFalse(os.path.exists(directory))
-        self.assertNotIn((USER_A, blot_id), backend.blot_store)
-
-        owner_list = self.client.get("/blots", headers=self.auth("token-a"))
-        self.assertNotIn(blot_id, [blot["id"] for blot in owner_list.get_json()["blots"]])
-        with backend.db_connection() as conn:
-            scan_count = conn.execute(
-                "SELECT COUNT(*) FROM scans WHERE blot_id = ? AND owner_id = ?",
-                (blot_id, USER_A),
-            ).fetchone()[0]
-        self.assertEqual(scan_count, 0)
-
-    def test_legacy_storage_fallback_handles_supabase_missing_object_response(self):
-        calls = []
-
-        def fake_supabase_request(method, path, **_kwargs):
-            calls.append((method, path))
-            if f"/{USER_A}/blots/legacy-blot/preview.jpg" in path:
-                raise backend.SupabaseRequestError(
-                    400,
-                    '{"statusCode":"404","error":"not_found","message":"Object not found"}',
-                )
-            return b"legacy-preview"
-
-        with backend.app.test_request_context():
-            backend.g.owner_id = USER_A
-            backend.g.access_token = "token-a"
-            with patch.object(backend, "supabase_request", side_effect=fake_supabase_request):
-                result = backend.supabase_download_file("legacy-blot", "preview.jpg")
-
-        self.assertEqual(result, b"legacy-preview")
-        self.assertEqual(len(calls), 2)
-        self.assertIn("/blots/legacy-blot/preview.jpg", calls[1][1])
-
-    def test_accepts_licor_float16_pyramid_tif(self):
+    def test_licor_reduced_resolution_tif_is_accepted(self):
         tif_bytes, expected = make_licor_pyramid_tif()
+        result = backend.decode_validated_tif(tif_bytes, "LI-COR TIF")
+        np.testing.assert_array_equal(result, expected)
 
-        backend.validate_tif_pixels(tif_bytes, "700nm TIF")
-        decoded = backend.read_validated_tif(tif_bytes)
-
-        np.testing.assert_array_equal(decoded, expected)
-
-    def test_rejects_multiple_full_resolution_tif_pages(self):
-        image = io.BytesIO()
-        with tifffile.TiffWriter(image) as tif:
-            tif.write(np.ones((8, 8), dtype=np.uint16), subfiletype=0)
-            tif.write(np.ones((8, 8), dtype=np.uint16), subfiletype=0)
-
+    def test_pptx_export_rejects_svg_data_urls(self):
+        svg = base64.b64encode(b"<svg></svg>").decode("ascii")
         with self.assertRaises(backend.PublicError):
-            backend.validate_tif_pixels(image.getvalue(), "700nm TIF")
-
-    def test_sanitizes_licor_masked_and_saturated_pixels(self):
-        pixels = np.arange(64, dtype=np.float16).reshape(8, 8)
-        pixels[0, 0] = np.nan
-        pixels[0, 1] = np.inf
-        image = io.BytesIO()
-        tifffile.imwrite(image, pixels)
-
-        decoded = backend.read_validated_tif(image.getvalue())
-
-        self.assertEqual(decoded[0, 0], np.float16(0))
-        self.assertEqual(decoded[0, 1], np.finfo(np.float16).max)
-        self.assertTrue(np.isfinite(decoded).all())
-
-    def test_rejects_tif_without_finite_measurements(self):
-        image = io.BytesIO()
-        tifffile.imwrite(image, np.full((8, 8), np.nan, dtype=np.float16))
-
-        with self.assertRaises(backend.PublicError):
-            backend.validate_tif_pixels(image.getvalue(), "700nm TIF")
+            backend.validate_data_url_size(f"data:image/svg+xml;base64,{svg}")
 
 
 if __name__ == "__main__":
