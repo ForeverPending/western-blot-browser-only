@@ -31,12 +31,12 @@ def fake_verify(token):
     return users[token]
 
 
-def make_test_zip():
+def make_test_zip(blot_name="Security test blot", created_line="#Fri May 15 16:38:05 PDT 2026"):
     tif_buffer = io.BytesIO()
     tifffile.imwrite(tif_buffer, np.arange(64, dtype=np.uint16).reshape(8, 8))
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("Blot A/metadata.txt", "Remarks=Security test blot")
+        zf.writestr("Blot A/metadata.txt", f"Image metadata\n{created_line}\nRemarks={blot_name}")
         zf.writestr("Blot A/image_700.tif", tif_buffer.getvalue())
         zf.writestr("Blot A/image_800.tif", tif_buffer.getvalue())
     archive.seek(0)
@@ -75,6 +75,7 @@ class MultiUserSecurityTests(unittest.TestCase):
         self.assertEqual(upload.status_code, 200, upload.get_json())
         uploaded_blot = upload.get_json()["blots"][0]
         blot_id = uploaded_blot["id"]
+        self.assertEqual(uploaded_blot["createdAt"], "2026-05-15T23:38:05+00:00")
         self.assertIn("hasJpg", uploaded_blot)
         self.assertNotIn("has_jpg", uploaded_blot)
 
@@ -85,6 +86,7 @@ class MultiUserSecurityTests(unittest.TestCase):
         listed_blot = owner_list.get_json()["blots"][0]
         self.assertIn("scanCount", listed_blot)
         self.assertIn("createdAt", listed_blot)
+        self.assertEqual(listed_blot["createdAt"], "2026-05-15T23:38:05+00:00")
         self.assertNotIn("scan_count", listed_blot)
 
         hidden = self.client.get(
@@ -138,6 +140,34 @@ class MultiUserSecurityTests(unittest.TestCase):
         )
         self.assertEqual(hidden_scans.status_code, 404)
 
+    def test_blots_are_sorted_by_metadata_creation_time(self):
+        late_upload = self.client.post(
+            "/upload-zip",
+            headers=self.auth("token-b"),
+            data={"file": (make_test_zip("Later blot", "#Fri May 15 16:38:05 PDT 2026"), "later.zip")},
+            content_type="multipart/form-data",
+        )
+        early_upload = self.client.post(
+            "/upload-zip",
+            headers=self.auth("token-b"),
+            data={"file": (make_test_zip("Earlier blot", "#Thu Jan 02 08:15:00 PST 2025"), "earlier.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(late_upload.status_code, 200, late_upload.get_json())
+        self.assertEqual(early_upload.status_code, 200, early_upload.get_json())
+        late_id = late_upload.get_json()["blots"][0]["id"]
+        early_id = early_upload.get_json()["blots"][0]["id"]
+
+        listed = self.client.get("/blots", headers=self.auth("token-b")).get_json()["blots"]
+        uploaded_ids = [blot["id"] for blot in listed if blot["id"] in (early_id, late_id)]
+        self.assertEqual(uploaded_ids, [early_id, late_id])
+
+    def test_parses_blot_creation_time_with_timezone(self):
+        self.assertEqual(
+            backend.parse_blot_created_at("#Fri May 15 16:38:05 PDT 2026"),
+            "2026-05-15T23:38:05+00:00",
+        )
+
     def test_rejects_zip_traversal(self):
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w") as zf:
@@ -172,6 +202,57 @@ class MultiUserSecurityTests(unittest.TestCase):
             loaded = backend.get_blot(blot_id, ("700",))
             self.assertIn("tif_700_bytes", loaded)
             self.assertNotIn("tif_800_bytes", loaded)
+
+    def test_owner_can_delete_blot_and_its_files(self):
+        upload = self.client.post(
+            "/upload-zip",
+            headers=self.auth("token-a"),
+            data={"file": (make_test_zip(), "delete-me.zip")},
+            content_type="multipart/form-data",
+        )
+        blot_id = upload.get_json()["blots"][0]["id"]
+        directory = os.path.join(
+            backend.BLOT_FILE_DIR,
+            backend.safe_id(USER_A),
+            backend.safe_id(blot_id),
+        )
+        self.assertTrue(os.path.isdir(directory))
+
+        saved_scan = self.client.post(
+            f"/blots/{blot_id}/scans",
+            headers=self.auth("token-a"),
+            json={
+                "proteinName": "Delete test",
+                "channel": "700",
+                "backgroundAxis": "leftright",
+                "lanes": [{"name": "Lane 1", "signal": 10.0}],
+            },
+        )
+        self.assertEqual(saved_scan.status_code, 201, saved_scan.get_json())
+
+        hidden = self.client.delete(
+            f"/blots/{blot_id}",
+            headers=self.auth("token-b"),
+        )
+        self.assertEqual(hidden.status_code, 404)
+        self.assertTrue(os.path.isdir(directory))
+
+        deleted = self.client.delete(
+            f"/blots/{blot_id}",
+            headers=self.auth("token-a"),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        self.assertFalse(os.path.exists(directory))
+        self.assertNotIn((USER_A, blot_id), backend.blot_store)
+
+        owner_list = self.client.get("/blots", headers=self.auth("token-a"))
+        self.assertNotIn(blot_id, [blot["id"] for blot in owner_list.get_json()["blots"]])
+        with backend.db_connection() as conn:
+            scan_count = conn.execute(
+                "SELECT COUNT(*) FROM scans WHERE blot_id = ? AND owner_id = ?",
+                (blot_id, USER_A),
+            ).fetchone()[0]
+        self.assertEqual(scan_count, 0)
 
     def test_legacy_storage_fallback_handles_supabase_missing_object_response(self):
         calls = []

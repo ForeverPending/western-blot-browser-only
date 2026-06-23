@@ -1164,11 +1164,60 @@ td strong {
   overflow: hidden;
 }
 
+.blot-list-navigation {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 28px auto 28px;
+  gap: var(--space-1);
+}
+
+.blot-scroll-button {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition), color var(--transition), opacity var(--transition);
+}
+
+.blot-scroll-button:hover:not(:disabled) {
+  border-color: var(--primary-border);
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.blot-scroll-button:disabled {
+  cursor: default;
+  opacity: 0.28;
+}
+
 .blot-list {
   min-width: 0;
   display: flex;
   flex-direction: column;
+  position: relative;
+  max-height: 400px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  overscroll-behavior-block: contain;
+}
+
+.blot-list-row {
+  min-width: 0;
+  min-height: 40px;
+  flex: 0 0 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
   gap: var(--space-1);
+  padding-bottom: var(--space-1);
 }
 
 .blot-list-item {
@@ -1182,10 +1231,10 @@ td strong {
   font-size: 12px;
   font-weight: 550;
   line-height: 1.4;
-  overflow-wrap: anywhere;
   text-align: left;
-  white-space: normal;
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
   transition: border-color var(--transition), background var(--transition), color var(--transition);
 }
@@ -1200,6 +1249,29 @@ td strong {
   border-color: var(--primary-border);
   background: var(--primary-soft);
   color: var(--primary);
+}
+
+.blot-delete-button {
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0 var(--space-2);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition), color var(--transition);
+}
+
+.blot-delete-button:hover:not(:disabled) {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.blot-delete-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .blot-preview {
@@ -1274,7 +1346,8 @@ td strong {
 }
 
 .blot-control-group input[type="range"] {
-  width: 120px;
+  width: 240px;
+  max-width: 100%;
   min-height: unset;
   padding: 0;
   border: none;
@@ -1503,8 +1576,7 @@ td strong {
   }
 
   .blot-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    display: flex;
   }
 }
 

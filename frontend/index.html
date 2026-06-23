@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./styles.css?v=visual-4" />
+  <link rel="stylesheet" href="./styles.css?v=visual-9" />
   <script src="./config.js?v=auth-2"></script>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"
     integrity="sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT"
@@ -22,7 +22,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
     integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
     crossorigin="anonymous" defer></script>
-  <script src="./app.js?v=visual-4" defer></script>
+  <script src="./app.js?v=visual-9" defer></script>
 </head>
 
 <body>
@@ -54,7 +54,6 @@
           <h1>Fold Change Analyzer</h1>
         </div>
         <div class="topbar-actions">
-          <button class="ghost-button" id="loadExampleButton" type="button">Load example</button>
           <span class="user-identity" id="userIdentity"></span>
           <button class="ghost-button" id="signOutButton" type="button">Sign out</button>
         </div>
@@ -354,8 +353,18 @@
           <div class="blot-browser-layout">
             <div class="blot-list-wrap">
               <p class="eyebrow">Loaded blots</p>
-              <div id="blotList" class="blot-list">
-                <p class="blot-empty-state">No blots loaded yet.</p>
+              <div class="blot-list-navigation">
+                <button class="blot-scroll-button" id="blotScrollUp" type="button"
+                  aria-label="Scroll loaded blots up" aria-controls="blotList" disabled>
+                  &#9652;
+                </button>
+                <div id="blotList" class="blot-list">
+                  <p class="blot-empty-state">No blots loaded yet.</p>
+                </div>
+                <button class="blot-scroll-button" id="blotScrollDown" type="button"
+                  aria-label="Scroll loaded blots down" aria-controls="blotList" disabled>
+                  &#9662;
+                </button>
               </div>
             </div>
 

@@ -330,7 +330,6 @@ const els = {
   sampleCount: document.querySelector("#sampleCount"),
   pairCount: document.querySelector("#pairCount"),
   comparisonChartType: document.querySelector("#comparisonChartType"),
-  loadExampleButton: document.querySelector("#loadExampleButton"),
   sampleInputs: document.querySelector("#sampleInputs"),
   pairInputs: document.querySelector("#pairInputs"),
   sharedWorkflow: document.querySelector("#sharedWorkflow"),
@@ -385,7 +384,6 @@ els.analysisMode.addEventListener("change", switchMode);
 els.sampleCount.addEventListener("input", () => renderSharedSampleInputs(clampInteger(Number(els.sampleCount.value), 1, 12, 1)));
 els.pairCount.addEventListener("input", () => renderPairInputs(clampInteger(Number(els.pairCount.value), 2, 12, 2)));
 els.comparisonChartType.addEventListener("change", renderComparisonChart);
-els.loadExampleButton.addEventListener("click", loadExampleData);
 els.controlFile.addEventListener("change", (event) => loadSharedControlFile(event));
 els.controlSheet.addEventListener("change", () => selectDatasetSheet(state.sharedControl, sharedControlControls(), els.controlSheet.value));
 els.controlLaneColumn.addEventListener("change", refreshNormalizationLanes);
@@ -1714,93 +1712,6 @@ function downloadSharedCsv() {
   URL.revokeObjectURL(url);
 }
 
-function loadExampleData() {
-  if (state.mode === "comparison") {
-    loadComparisonExample();
-  } else {
-    loadSharedExample();
-  }
-}
-
-function loadSharedExample() {
-  els.sampleCount.value = "2";
-  renderSharedSampleInputs(2);
-  const sampleA = [
-    { Name: "A1", Signal: 18200 },
-    { Name: "A2", Signal: 22150 },
-    { Name: "A3", Signal: 15400 },
-    { Name: "A4", Signal: 30900 },
-  ];
-  const sampleB = [
-    { Name: "A1", Signal: 20200 },
-    { Name: "A2", Signal: 28400 },
-    { Name: "A3", Signal: 19800 },
-    { Name: "A4", Signal: 34500 },
-  ];
-  const control = [
-    { Name: "A1", Signal: 16100 },
-    { Name: "A2", Signal: 16850 },
-    { Name: "A3", Signal: 13900 },
-    { Name: "A4", Signal: 20250 },
-  ];
-
-  setExampleDataset(state.sharedSamples[0], sharedSampleControls[0], sampleA, "Example sample A");
-  setExampleDataset(state.sharedSamples[1], sharedSampleControls[1], sampleB, "Example sample B");
-  sharedSampleControls[0].protein.value = "pERK";
-  sharedSampleControls[1].protein.value = "pAKT";
-  setExampleDataset(state.sharedControl, sharedControlControls(), control, "Example loading control");
-  els.controlProtein.value = "GAPDH";
-  refreshNormalizationLanes();
-  runSharedAnalysis();
-}
-
-function loadComparisonExample() {
-  els.pairCount.value = "2";
-  renderPairInputs(2);
-  const sampleA = [
-    { Name: "Control", Signal: 18200 },
-    { Name: "Drug", Signal: 22150 },
-    { Name: "Washout", Signal: 15400 },
-  ];
-  const controlA = [
-    { Name: "Control", Signal: 16100 },
-    { Name: "Drug", Signal: 16850 },
-    { Name: "Washout", Signal: 13900 },
-  ];
-  const sampleB = [
-    { Name: "Control", Signal: 20200 },
-    { Name: "Drug", Signal: 28400 },
-    { Name: "Extra lane", Signal: 19800 },
-  ];
-  const controlB = [
-    { Name: "Control", Signal: 17500 },
-    { Name: "Drug", Signal: 18900 },
-    { Name: "Extra lane", Signal: 16200 },
-  ];
-
-  setExampleDataset(state.pairedSets[0].sample, pairControls[0].sample, sampleA, "Pair 1 sample");
-  setExampleDataset(state.pairedSets[0].control, pairControls[0].control, controlA, "Pair 1 control");
-  setExampleDataset(state.pairedSets[1].sample, pairControls[1].sample, sampleB, "Pair 2 sample");
-  setExampleDataset(state.pairedSets[1].control, pairControls[1].control, controlB, "Pair 2 control");
-  pairControls[0].sample.label.value = "Sample set 1";
-  pairControls[1].sample.label.value = "Sample set 2";
-  refreshNormalizationLanes();
-  runComparisonAnalysis();
-}
-
-function setExampleDataset(dataset, controls, rows, label) {
-  dataset.fileLabel = label;
-  dataset.workbook = {
-    sheetNames: ["Data"],
-    getRows() {
-      return rows;
-    },
-  };
-  controls.fileName.textContent = label;
-  populateSheetSelect(controls.sheet, dataset.workbook);
-  selectDatasetSheet(dataset, controls, "Data");
-}
-
 function createDefaultCustomGroups(count) {
   return [
     { name: "Odd lanes", indices: Array.from({ length: count }, (_, index) => index).filter((index) => index % 2 === 0) },
@@ -1934,6 +1845,9 @@ let canvasState = createCanvasState();
 let canvasReloadTimer = null;
 let canvasImageController = null;
 let canvasImageRequestId = 0;
+const blotListElement = document.querySelector("#blotList");
+const blotScrollUpButton = document.querySelector("#blotScrollUp");
+const blotScrollDownButton = document.querySelector("#blotScrollDown");
 
 initializeAuth();
 
@@ -1951,6 +1865,19 @@ document.querySelector("#blotList")?.addEventListener("click", (event) => {
   selectBlot(Number(button.dataset.blotIndex));
 });
 
+document.querySelector("#blotList")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-blot-delete]");
+  if (!button) return;
+  deleteBlot(Number(button.dataset.blotDelete), button);
+});
+
+blotScrollUpButton?.addEventListener("click", () => scrollBlotList(-1));
+blotScrollDownButton?.addEventListener("click", () => scrollBlotList(1));
+blotListElement?.addEventListener("scroll", updateBlotScrollButtons);
+if (window.ResizeObserver && blotListElement) {
+  new ResizeObserver(updateBlotScrollButtons).observe(blotListElement);
+}
+
 async function loadPersistedBlots() {
   const requestedUserId = activeUserId;
   try {
@@ -1960,6 +1887,7 @@ async function loadPersistedBlots() {
 
     blotState.blots = data.blots || [];
     blotState.scans = data.scans || {};
+    sortBlotsByCreatedAt();
     blotState.activeBlotIndex = activeBlotId
       ? blotState.blots.findIndex((blot) => blot.id === activeBlotId)
       : null;
@@ -1999,6 +1927,7 @@ function resetBlotWorkspace() {
 }
 
 function mergeBlots(blots) {
+  const activeBlotId = blotState.blots[blotState.activeBlotIndex]?.id;
   blots.forEach((blot) => {
     const existingIndex = blotState.blots.findIndex((candidate) => candidate.id === blot.id);
     if (existingIndex >= 0) {
@@ -2008,26 +1937,144 @@ function mergeBlots(blots) {
     }
     if (!blotState.scans[blot.id]) blotState.scans[blot.id] = [];
   });
+  sortBlotsByCreatedAt();
+  blotState.activeBlotIndex = activeBlotId
+    ? blotState.blots.findIndex((blot) => blot.id === activeBlotId)
+    : null;
+}
+
+function sortBlotsByCreatedAt() {
+  blotState.blots.sort((left, right) => {
+    const leftTime = Date.parse(left.createdAt || "");
+    const rightTime = Date.parse(right.createdAt || "");
+    const safeLeftTime = Number.isFinite(leftTime) ? leftTime : Number.POSITIVE_INFINITY;
+    const safeRightTime = Number.isFinite(rightTime) ? rightTime : Number.POSITIVE_INFINITY;
+    return safeLeftTime - safeRightTime || String(left.name || "").localeCompare(String(right.name || ""));
+  });
 }
 
 function renderBlotList() {
-  const container = document.querySelector("#blotList");
+  const container = blotListElement;
   if (!container) return;
 
   if (!blotState.blots.length) {
     container.innerHTML = `<p class="blot-empty-state">No blots loaded yet.</p>`;
+    requestAnimationFrame(updateBlotScrollButtons);
     return;
   }
 
   container.innerHTML = blotState.blots
     .map((blot, index) => `
-      <button class="blot-list-item ${index === blotState.activeBlotIndex ? "active" : ""}"
-        type="button"
-        data-blot-index="${index}">
-        ${escapeHtml(blot.name)}
-      </button>
+      <div class="blot-list-row">
+        <button class="blot-list-item ${index === blotState.activeBlotIndex ? "active" : ""}"
+          type="button"
+          data-blot-index="${index}">
+          ${escapeHtml(blot.name)}
+        </button>
+        <button class="blot-delete-button"
+          type="button"
+          data-blot-delete="${index}"
+          aria-label="Delete ${escapeHtml(blot.name)}"
+          title="Delete blot">
+          Delete
+        </button>
+      </div>
     `)
     .join("");
+  requestAnimationFrame(() => {
+    ensureActiveBlotVisible();
+    updateBlotScrollButtons();
+  });
+}
+
+function blotListRowHeight() {
+  return blotListElement?.querySelector(".blot-list-row")?.offsetHeight || 40;
+}
+
+function scrollBlotList(direction) {
+  if (!blotListElement) return;
+  blotListElement.scrollTo({
+    top: blotListElement.scrollTop + direction * blotListRowHeight(),
+    behavior: "smooth",
+  });
+}
+
+function updateBlotScrollButtons() {
+  if (!blotListElement || !blotScrollUpButton || !blotScrollDownButton) return;
+  const maxScrollTop = Math.max(0, blotListElement.scrollHeight - blotListElement.clientHeight);
+  blotScrollUpButton.disabled = blotListElement.scrollTop <= 1;
+  blotScrollDownButton.disabled = blotListElement.scrollTop >= maxScrollTop - 1;
+}
+
+function ensureActiveBlotVisible() {
+  if (!blotListElement || blotState.activeBlotIndex === null) return;
+  const activeButton = blotListElement.querySelector(`[data-blot-index="${blotState.activeBlotIndex}"]`);
+  const activeRow = activeButton?.closest(".blot-list-row");
+  if (!activeRow) return;
+
+  const rowTop = activeRow.offsetTop;
+  const rowBottom = rowTop + activeRow.offsetHeight;
+  const visibleTop = blotListElement.scrollTop;
+  const visibleBottom = visibleTop + blotListElement.clientHeight;
+  if (rowTop < visibleTop) {
+    blotListElement.scrollTo({ top: rowTop, behavior: "smooth" });
+  } else if (rowBottom > visibleBottom) {
+    blotListElement.scrollTo({ top: rowBottom - blotListElement.clientHeight, behavior: "smooth" });
+  }
+}
+
+async function deleteBlot(index, button) {
+  const blot = blotState.blots[index];
+  if (!blot || !window.confirm(`Delete “${blot.name}” and all of its saved scans? This cannot be undone.`)) return;
+
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await authJson(`${BACKEND_URL}/blots/${encodeURIComponent(blot.id)}`, {
+      method: "DELETE",
+    }, "Could not delete blot.");
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Delete";
+    alert(`Blot delete failed: ${error.message}`);
+    return;
+  }
+
+  const deletionIndex = blotState.blots.findIndex((candidate) => candidate.id === blot.id);
+  if (deletionIndex < 0) return;
+  const wasActive = blotState.blots[blotState.activeBlotIndex]?.id === blot.id;
+  const activeBlotId = wasActive ? null : blotState.blots[blotState.activeBlotIndex]?.id;
+  const affectedSources = Array.from(document.querySelectorAll("[data-blot-source-blot]"))
+    .filter((select) => select.value === blot.id)
+    .map((select) => ({
+      role: select.dataset.refreshScanRole,
+      index: Number(select.dataset.refreshScanIndex),
+    }));
+
+  blotState.blots.splice(deletionIndex, 1);
+  delete blotState.scans[blot.id];
+  blotState.activeBlotIndex = activeBlotId
+    ? blotState.blots.findIndex((candidate) => candidate.id === activeBlotId)
+    : null;
+
+  if (wasActive) {
+    cancelPendingCanvasImageLoad();
+    if (canvasState.imageObjectUrl) URL.revokeObjectURL(canvasState.imageObjectUrl);
+    if (canvasState.image) canvasState.image.src = "";
+    canvasState = createCanvasState();
+    const preview = document.querySelector("#blotPreview");
+    if (preview) preview.innerHTML = '<p class="blot-empty-state">Select a blot to preview</p>';
+  }
+
+  renderBlotList();
+  refreshBlotSourceDropdowns();
+  affectedSources.forEach(({ role, index: sourceIndex }) => refreshScanDropdown(role, sourceIndex));
+  refreshNormalizationLanes();
+  setZipUploadStatus(`${blot.name} deleted.`, true);
+
+  if (wasActive && blotState.blots.length) {
+    await selectBlot(Math.min(deletionIndex, blotState.blots.length - 1));
+  }
 }
 
 function switchSource(button, role, index, mode) {

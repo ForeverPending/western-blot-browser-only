@@ -2,12 +2,13 @@ import os
 import io
 import json
 import re
+import shutil
 import sqlite3
 import ssl
 import uuid
 import zipfile
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from hashlib import sha256
 from time import time
@@ -104,6 +105,33 @@ MAX_PPTX_SLIDES = 40
 MAX_PPTX_GRAPHS = 120
 MAX_PPTX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PPTX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
+BLOT_TIMEZONE_OFFSETS = {
+    "UTC": 0,
+    "GMT": 0,
+    "PST": -8 * 60,
+    "PDT": -7 * 60,
+    "MST": -7 * 60,
+    "MDT": -6 * 60,
+    "CST": -6 * 60,
+    "CDT": -5 * 60,
+    "EST": -5 * 60,
+    "EDT": -4 * 60,
+    "AKST": -9 * 60,
+    "AKDT": -8 * 60,
+    "HST": -10 * 60,
+    "AST": -4 * 60,
+    "ADT": -3 * 60,
+    "NST": -(3 * 60 + 30),
+    "NDT": -(2 * 60 + 30),
+    "CET": 1 * 60,
+    "CEST": 2 * 60,
+}
+BLOT_TIMESTAMP_PATTERN = re.compile(
+    r"^#(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(?P<day>\d{1,2})\s+(?P<clock>\d{2}:\d{2}:\d{2})\s+"
+    r"(?P<zone>[A-Za-z]{2,5}|[+-]\d{4})\s+(?P<year>\d{4})$"
+)
 BLOT_FILE_FIELDS = {
     "jpg": ("has_jpg", "jpg_bytes", "preview.jpg"),
     "700": ("has_700", "tif_700_bytes", "700.tif"),
@@ -368,6 +396,22 @@ def supabase_download_file(blot_id, filename):
         return supabase_request("GET", f"/storage/v1/object/authenticated/{bucket}/{legacy_path}")
 
 
+def supabase_delete_blot_files(blot_id, blot):
+    object_paths = [
+        supabase_storage_path(blot_id, filename)
+        for has_field, _bytes_field, filename in BLOT_FILE_FIELDS.values()
+        if blot.get(has_field)
+    ]
+    if not object_paths:
+        return
+    bucket = quote(SUPABASE_BUCKET, safe="")
+    supabase_request(
+        "DELETE",
+        f"/storage/v1/object/{bucket}",
+        body={"prefixes": object_paths},
+    )
+
+
 def is_missing_storage_object(error):
     if error.status == 404:
         return True
@@ -410,6 +454,32 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_blot_created_at(value):
+    match = BLOT_TIMESTAMP_PATTERN.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+
+    zone_name = match.group("zone").upper()
+    if re.fullmatch(r"[+-]\d{4}", zone_name):
+        sign = 1 if zone_name[0] == "+" else -1
+        offset_minutes = sign * (int(zone_name[1:3]) * 60 + int(zone_name[3:5]))
+    else:
+        offset_minutes = BLOT_TIMEZONE_OFFSETS.get(zone_name)
+    if offset_minutes is None or abs(offset_minutes) > 14 * 60:
+        return None
+
+    try:
+        parsed = datetime.strptime(
+            "{weekday} {month} {day} {clock} {year}".format(**match.groupdict()),
+            "%a %b %d %H:%M:%S %Y",
+        )
+    except ValueError:
+        return None
+
+    captured_at = parsed.replace(tzinfo=timezone(timedelta(minutes=offset_minutes)))
+    return captured_at.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def safe_id(value):
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
     return cleaned.strip("._") or uuid.uuid4().hex
@@ -435,6 +505,7 @@ def read_optional_file(directory, filename):
 
 
 def persist_blot(blot_id, blot):
+    created_at = blot.get("created_at") or now_iso()
     if USE_SUPABASE:
         supabase_upload_file(blot_id, "preview.jpg", blot.get("jpg_bytes"), "image/jpeg")
         supabase_upload_file(blot_id, "700.tif", blot.get("tif_700_bytes"), "image/tiff")
@@ -450,7 +521,7 @@ def persist_blot(blot_id, blot):
                 "has_jpg": bool(blot.get("jpg_bytes")),
                 "has_700": bool(blot.get("tif_700_bytes")),
                 "has_800": bool(blot.get("tif_800_bytes")),
-                "created_at": now_iso(),
+                "created_at": created_at,
             },
             headers={
                 "Prefer": "resolution=merge-duplicates",
@@ -476,7 +547,8 @@ def persist_blot(blot_id, blot):
                 folder = excluded.folder,
                 has_jpg = excluded.has_jpg,
                 has_700 = excluded.has_700,
-                has_800 = excluded.has_800
+                has_800 = excluded.has_800,
+                created_at = excluded.created_at
             """,
             (
                 blot_id,
@@ -486,7 +558,7 @@ def persist_blot(blot_id, blot):
                 1 if blot.get("jpg_bytes") else 0,
                 1 if blot.get("tif_700_bytes") else 0,
                 1 if blot.get("tif_800_bytes") else 0,
-                now_iso(),
+                created_at,
             ),
         )
 
@@ -698,6 +770,7 @@ def parse_zip(file_bytes):
             last_line = lines[-1] if lines else ""
             blot_name = last_line.split("=", 1)[1].strip() if last_line.startswith("Remarks=") else folder
             blot_name = blot_name[:MAX_NAME_LENGTH] or "Untitled blot"
+            created_at = parse_blot_created_at(lines[1] if len(lines) > 1 else None) or now_iso()
 
             # Generate a unique unpredictable ID
             blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
@@ -722,6 +795,7 @@ def parse_zip(file_bytes):
                 "has_jpg": jpg_bytes is not None,
                 "has_700": tif_700_bytes is not None,
                 "has_800": tif_800_bytes is not None,
+                "created_at": created_at,
                 "jpg_bytes":      jpg_bytes,
                 "tif_700_bytes":  tif_700_bytes,
                 "tif_800_bytes":  tif_800_bytes,
@@ -736,6 +810,7 @@ def parse_zip(file_bytes):
                 "has700": tif_700 is not None,
                 "has800": tif_800 is not None,
                 "scanCount": 0,
+                "createdAt": created_at,
             })
 
     return blots
@@ -871,7 +946,7 @@ def list_blots():
     if USE_SUPABASE:
         rows = supabase_request(
             "GET",
-            f"/rest/v1/blots?owner_id=eq.{quote(current_owner_id(), safe='')}&select=*&order=created_at.desc,name.asc",
+            f"/rest/v1/blots?owner_id=eq.{quote(current_owner_id(), safe='')}&select=*&order=created_at.asc,name.asc",
         )
         scans_by_blot = {}
         scan_rows = supabase_request(
@@ -896,7 +971,7 @@ def list_blots():
             LEFT JOIN scans ON scans.blot_id = blots.id
             WHERE blots.owner_id = ?
             GROUP BY blots.id
-            ORDER BY blots.created_at DESC, blots.name
+            ORDER BY blots.created_at ASC, blots.name
             """,
             (current_owner_id(),),
         ).fetchall()
@@ -904,6 +979,44 @@ def list_blots():
     blots = [blot_summary_from_row(row, row["scan_count"]) for row in rows]
     scans = {blot["id"]: get_scans_for_blot(blot["id"]) for blot in blots}
     return jsonify({"blots": blots, "scans": scans})
+
+
+@app.route("/blots/<blot_id>", methods=["DELETE"])
+@require_user
+@limiter.limit("30 per minute")
+def delete_blot(blot_id):
+    blot = get_blot(blot_id, ())
+    if not blot:
+        return jsonify({"error": "Blot not found"}), 404
+
+    owner_id = current_owner_id()
+    if USE_SUPABASE:
+        supabase_delete_blot_files(blot_id, blot)
+        rows = supabase_request(
+            "DELETE",
+            f"/rest/v1/blots?id=eq.{quote(blot_id, safe='')}&owner_id=eq.{quote(owner_id, safe='')}",
+            headers={"Prefer": "return=representation"},
+        )
+        if not rows:
+            return jsonify({"error": "Blot not found"}), 404
+    else:
+        directory = blot_dir(blot_id)
+        if os.path.isdir(directory):
+            shutil.rmtree(directory)
+        with db_connection() as conn:
+            conn.execute(
+                "DELETE FROM scans WHERE blot_id = ? AND owner_id = ?",
+                (blot_id, owner_id),
+            )
+            cursor = conn.execute(
+                "DELETE FROM blots WHERE id = ? AND owner_id = ?",
+                (blot_id, owner_id),
+            )
+            if cursor.rowcount == 0:
+                return jsonify({"error": "Blot not found"}), 404
+
+    blot_store.pop((owner_id, blot_id), None)
+    return jsonify({"status": "deleted"})
 
 
 @app.route("/blots/<blot_id>/scans")
