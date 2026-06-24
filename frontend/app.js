@@ -3,6 +3,7 @@ const SESSION_STORAGE_KEY = "western-blot:browser-session-id";
 const BLOB_CLIENT_IMPORT_URL = CONFIG.BLOB_CLIENT_IMPORT_URL || "https://esm.sh/@vercel/blob/client";
 const ALLOWED_TABULAR_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx"]);
 const ALLOWED_ZIP_MIME_TYPES = new Set(["", "application/zip", "application/x-zip-compressed", "application/octet-stream"]);
+const BLOB_UPLOAD_TIMEOUT_MS = 240000;
 let blobClientPromise = null;
 let runtimeConfigPromise = null;
 
@@ -2006,19 +2007,31 @@ async function uploadZipToVercelBlob(file) {
   const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const configuredAccess = uploadStatus.blobAccess || config.blobAccess || CONFIG.BLOB_ACCESS;
   const blobAccess = configuredAccess === "public" ? "public" : "private";
-  return upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
+  return withTimeout(upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
     access: blobAccess,
     handleUploadUrl: apiUrl("/blob-upload"),
     clientPayload: JSON.stringify({ sessionId: activeSessionId }),
-  });
+  }), BLOB_UPLOAD_TIMEOUT_MS, "Blob upload timed out before Vercel returned a stored file reference.");
 }
 
 async function blobUploadStatus() {
-  const status = await apiJson(apiUrl("/blob-upload"), {}, "Blob upload endpoint is not reachable.");
+  const status = await apiJson(apiUrl("/blob-upload"), { timeoutMs: 15000 }, "Blob upload endpoint is not reachable.");
   if (!status.hasBlobReadWriteToken) {
     throw new Error("BLOB_READ_WRITE_TOKEN is not configured for this deployment.");
   }
   return status;
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timeoutId = null;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
 }
 
 function blobClientImportUrl() {

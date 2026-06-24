@@ -7,6 +7,10 @@ const TOKEN_WINDOW_LIMIT = Number(process.env.BLOB_UPLOAD_TOKEN_RATE_LIMIT || 30
 const uploadTokenHits = globalThis.__westernBlotUploadTokenHits || new Map();
 globalThis.__westernBlotUploadTokenHits = uploadTokenHits;
 
+function logEvent(event, details = {}) {
+  console.log(JSON.stringify({ event, ...details }));
+}
+
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -82,6 +86,11 @@ function publicErrorMessage(error) {
 
 async function handleBlobUploadRequest(request) {
   if (request.method === "GET") {
+    logEvent("blob_upload_status", {
+      blobAccess: blobAccess(),
+      hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+      maxUploadBytes: MAX_UPLOAD_BYTES,
+    });
     return json({
       status: "ok",
       blobAccess: blobAccess(),
@@ -94,19 +103,23 @@ async function handleBlobUploadRequest(request) {
     return json({ error: "Method not allowed." }, 405);
   }
   if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    logEvent("blob_upload_missing_token");
     return json({ error: "BLOB_READ_WRITE_TOKEN is not configured for this deployment." }, 500);
   }
   if (!rateLimitUploadToken(request)) {
+    logEvent("blob_upload_rate_limited");
     return json({ error: "Too many upload token requests." }, 429);
   }
 
   const contentLength = Number(request.headers.get("content-length") || 0);
   if (contentLength > MAX_TOKEN_BODY_BYTES) {
+    logEvent("blob_upload_token_body_too_large", { contentLength });
     return json({ error: "Upload token request is too large." }, 413);
   }
 
   try {
     const body = await request.json();
+    logEvent("blob_upload_request", { type: body?.type || "unknown" });
     const response = await handleUpload({
       body,
       request,
@@ -120,21 +133,43 @@ async function handleBlobUploadRequest(request) {
 
         const sessionId = safeSessionId(payload.sessionId);
         if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
+          logEvent("blob_upload_invalid_path", { pathname, hasSessionId: Boolean(sessionId) });
           throw new Error("Invalid upload path.");
         }
 
+        logEvent("blob_upload_token_generated", {
+          access: blobAccess(),
+          pathname,
+          maximumSizeInBytes: MAX_UPLOAD_BYTES,
+        });
         return {
           allowedContentTypes: ["application/zip", "application/x-zip-compressed"],
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
           tokenPayload: JSON.stringify({ sessionId }),
         };
       },
-      onUploadCompleted() {},
+      onUploadCompleted({ blob, tokenPayload }) {
+        let sessionId = "";
+        try {
+          sessionId = JSON.parse(tokenPayload || "{}").sessionId || "";
+        } catch (_error) {
+          sessionId = "";
+        }
+        logEvent("blob_upload_completed", {
+          sessionId,
+          pathname: blob?.pathname,
+          size: blob?.size,
+        });
+      },
     });
 
+    logEvent("blob_upload_response", { type: response?.type || "unknown" });
     return json(response);
   } catch (error) {
     console.error("Blob upload setup failed.", error);
+    logEvent("blob_upload_error", {
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
     return json({ error: publicErrorMessage(error) }, 400);
   }
 }
