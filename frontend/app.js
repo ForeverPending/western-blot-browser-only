@@ -53,12 +53,35 @@ function initializeApp() {
 }
 
 async function apiFetch(url, options = {}) {
-  const headers = new Headers(options.headers || {});
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers || {});
   headers.set("X-Blot-Session", activeSessionId);
-  return fetch(url, {
-    ...options,
-    headers,
-  });
+  let timeoutId = null;
+  let abortController = null;
+
+  if (timeoutMs > 0) {
+    abortController = new AbortController();
+    if (fetchOptions.signal) {
+      if (fetchOptions.signal.aborted) abortController.abort();
+      fetchOptions.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+    }
+    timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+    fetchOptions.signal = abortController.signal;
+  }
+
+  try {
+    return await fetch(url, {
+      ...fetchOptions,
+      headers,
+    });
+  } catch (error) {
+    if (abortController?.signal.aborted && timeoutMs > 0) {
+      throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
 }
 
 async function apiErrorMessage(response, fallback) {
@@ -74,7 +97,12 @@ async function apiErrorMessage(response, fallback) {
 
 // Fetches JSON and converts every unsuccessful response into one consistent error.
 async function apiJson(url, options = {}, fallback = "Request failed.") {
-  const response = await apiFetch(url, options);
+  let response;
+  try {
+    response = await apiFetch(url, options);
+  } catch (error) {
+    throw new Error(error?.message || fallback);
+  }
   let data;
   try {
     data = await response.json();
@@ -1955,6 +1983,7 @@ async function processZipFile(file) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: activeSessionId, upload: blob }),
+      timeoutMs: 270000,
     }, "ZIP processing failed.");
   }
 

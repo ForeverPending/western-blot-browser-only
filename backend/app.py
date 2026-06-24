@@ -3,6 +3,7 @@ import io
 import json
 import re
 import tempfile
+import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -543,16 +544,69 @@ def process_storage_upload():
     data = request.get_json(silent=True) or {}
     session_id = request_session_id(data)
     upload_descriptor = data.get("upload") or data.get("blob") or {}
+    started = time.monotonic()
+    upload_path = upload_descriptor.get("pathname") or upload_descriptor.get("path")
+    print(
+        json.dumps({
+            "event": "process_upload_start",
+            "sessionId": session_id,
+            "path": upload_path,
+        }),
+        flush=True,
+    )
     try:
         file_bytes = read_temp_file(upload_descriptor, session_id, allow_uploads=True, max_bytes=MAX_ZIP_BYTES)
+        print(
+            json.dumps({
+                "event": "process_upload_blob_read",
+                "sessionId": session_id,
+                "bytes": len(file_bytes),
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }),
+            flush=True,
+        )
         if not is_valid_zip(file_bytes):
             raise PublicError("Stored object is not a valid ZIP file.")
         blots = parse_zip(file_bytes, session_id)
+        print(
+            json.dumps({
+                "event": "process_upload_zip_parsed",
+                "sessionId": session_id,
+                "blotCount": len(blots),
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }),
+            flush=True,
+        )
         delete_temp_files([upload_descriptor], session_id, allow_uploads=True)
+        print(
+            json.dumps({
+                "event": "process_upload_done",
+                "sessionId": session_id,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }),
+            flush=True,
+        )
         return jsonify({"blots": blots})
     except PublicError as error:
+        print(
+            json.dumps({
+                "event": "process_upload_public_error",
+                "sessionId": session_id,
+                "error": str(error),
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }),
+            flush=True,
+        )
         return error_response(error, "ZIP import failed.")
     except Exception as error:
+        print(
+            json.dumps({
+                "event": "process_upload_unexpected_error",
+                "sessionId": session_id,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }),
+            flush=True,
+        )
         app.logger.exception("Stored ZIP processing failed")
         return error_response(error, "ZIP import failed.")
 
@@ -580,7 +634,7 @@ def parse_zip(file_bytes, session_id):
             folder = parts[0] if len(parts) > 1 else "__root__"
             folders.setdefault(folder, []).append(name)
 
-        for folder, files in folders.items():
+        for folder_index, (folder, files) in enumerate(folders.items(), start=1):
             txt_file = next((f for f in files if f.lower().endswith(".txt")), None)
             jpg_file = next((f for f in files if f.lower().endswith(".jpg") or f.lower().endswith(".jpeg")), None)
             tif_700  = next((f for f in files if "700" in f and f.lower().endswith(".tif")), None)
@@ -588,6 +642,18 @@ def parse_zip(file_bytes, session_id):
 
             if not txt_file:
                 continue
+
+            print(
+                json.dumps({
+                    "event": "process_upload_parse_folder",
+                    "sessionId": session_id,
+                    "folderIndex": folder_index,
+                    "has700": tif_700 is not None,
+                    "has800": tif_800 is not None,
+                    "hasJpg": jpg_file is not None,
+                }),
+                flush=True,
+            )
 
             # Enforce per-file limits before loading archive members into memory.
             enforce_zip_member_size(zf, tif_700, MAX_TIF_BYTES, "A 700nm TIF exceeds the configured size limit.")
