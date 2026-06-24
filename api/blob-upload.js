@@ -80,7 +80,7 @@ function publicErrorMessage(error) {
   return "Upload setup failed.";
 }
 
-export default async function handler(request) {
+async function handleBlobUploadRequest(request) {
   if (request.method === "GET") {
     return json({
       status: "ok",
@@ -137,4 +137,12 @@ export default async function handler(request) {
     console.error("Blob upload setup failed.", error);
     return json({ error: publicErrorMessage(error) }, 400);
   }
+}
+
+export function GET(request) {
+  return handleBlobUploadRequest(request);
+}
+
+export function POST(request) {
+  return handleBlobUploadRequest(request);
 }
