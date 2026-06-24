@@ -1,19 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/process-upload.py": {
-      "maxDuration": 300
-    },
-    "api/upload-zip.py": {
-      "maxDuration": 300
-    },
-    "api/render-composite.py": {
-      "maxDuration": 120
-    },
-    "api/generate-pptx.py": {
-      "maxDuration": 120
-    }
-  },
   "headers": [
     {
       "source": "/(.*)",
