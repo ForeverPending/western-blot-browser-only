@@ -10,7 +10,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import numpy as np
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -24,6 +24,19 @@ from pptx.enum.text import PP_ALIGN
 import base64
 
 app = Flask(__name__)
+
+FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+FRONTEND_FILES = {"index.html", "styles.css", "config.js", "app.js"}
+FRONTEND_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' https://cdn.sheetjs.com https://esm.sh; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' blob: data:; "
+    "connect-src 'self' https://blob.vercel-storage.com https://*.blob.vercel-storage.com "
+    "http://127.0.0.1:* http://localhost:*; "
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
 
 
 @app.errorhandler(Exception)
@@ -44,6 +57,30 @@ def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     return response
+
+
+def frontend_file_response(filename="index.html"):
+    filename = filename.strip("/")
+    if filename not in FRONTEND_FILES:
+        return jsonify({"error": "Not found."}), 404
+    response = send_from_directory(FRONTEND_DIR, filename)
+    response.headers["Content-Security-Policy"] = FRONTEND_CSP
+    return response
+
+
+@app.route("/", methods=["GET"])
+def frontend_index():
+    return frontend_file_response("index.html")
+
+
+@app.route("/frontend/<path:filename>", methods=["GET"])
+def frontend_prefixed_file(filename):
+    return frontend_file_response(filename)
+
+
+@app.route("/<path:filename>", methods=["GET"])
+def frontend_asset_file(filename):
+    return frontend_file_response(filename)
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 LOCAL_ORIGINS = [
