@@ -29,15 +29,13 @@ Set these environment variables:
 
 - `BLOT_TEMP_STORAGE=vercel-blob`
 - `BLOB_READ_WRITE_TOKEN=<your Vercel Blob token>`
+- `BLOB_ACCESS=public` if your Blob store is public, or omit it for a private
+  Blob store
 - `ALLOWED_ORIGINS=<your production origin>`
 - `MAX_ZIP_UPLOAD_BYTES=262144000`
 
-For production, set `frontend/config.js` to use same-origin API routes:
-
-```js
-BACKEND_URL: "/api",
-USE_VERCEL_BLOB_UPLOADS: true,
-```
+`frontend/config.js` automatically uses same-origin API routes and Vercel Blob
+uploads outside localhost.
 
 The browser uploads large ZIPs directly to Vercel Blob, Flask processes them,
 stores only temporary blot image objects, and the frontend calls cleanup when

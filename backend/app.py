@@ -187,6 +187,7 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
     "western-blot-browser-only",
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
+BLOB_ACCESS = "public" if os.environ.get("BLOB_ACCESS") == "public" else "private"
 BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
 BLOB_API_VERSION = "10"
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
@@ -365,7 +366,7 @@ def vercel_blob_put(path, file_bytes, content_type):
         f"{BLOB_API_BASE_URL}/?pathname={encoded_path}",
         body=file_bytes,
         headers={
-            "access": "private",
+            "access": BLOB_ACCESS,
             "x-content-type": content_type,
             "x-cache-control-max-age": "60",
             "x-allow-overwrite": "0",
@@ -491,6 +492,12 @@ init_storage()
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/client-config")
+@app.route("/api/client-config")
+def client_config():
+    return jsonify({"blobAccess": BLOB_ACCESS})
 
 # ─── ZIP upload & parsing ─────────────────────────────────────────────────────
 

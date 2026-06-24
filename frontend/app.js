@@ -4,6 +4,7 @@ const BLOB_CLIENT_IMPORT_URL = CONFIG.BLOB_CLIENT_IMPORT_URL || "https://esm.sh/
 const ALLOWED_TABULAR_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx"]);
 const ALLOWED_ZIP_MIME_TYPES = new Set(["", "application/zip", "application/x-zip-compressed", "application/octet-stream"]);
 let blobClientPromise = null;
+let runtimeConfigPromise = null;
 
 function browserSessionId() {
   let sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
@@ -82,6 +83,15 @@ async function apiJson(url, options = {}, fallback = "Request failed.") {
   }
   if (!response.ok || data?.error) throw new Error(data?.error || fallback);
   return data;
+}
+
+async function runtimeConfig() {
+  if (!runtimeConfigPromise) {
+    runtimeConfigPromise = CONFIG.USE_VERCEL_BLOB_UPLOADS
+      ? apiJson(apiUrl("/client-config"), {}, "Could not load deployment config.")
+      : Promise.resolve({});
+  }
+  return runtimeConfigPromise;
 }
 
 const els = {
@@ -1959,10 +1969,12 @@ async function processZipFile(file) {
 
 async function uploadZipToVercelBlob(file) {
   if (!blobClientPromise) blobClientPromise = import(blobClientImportUrl());
-  const { upload } = await blobClientPromise;
+  const [{ upload }, config] = await Promise.all([blobClientPromise, runtimeConfig()]);
   const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const configuredAccess = config.blobAccess || CONFIG.BLOB_ACCESS;
+  const blobAccess = configuredAccess === "public" ? "public" : "private";
   return upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
-    access: "private",
+    access: blobAccess,
     handleUploadUrl: apiUrl("/blob-upload"),
     clientPayload: JSON.stringify({ sessionId: activeSessionId }),
   });
