@@ -1969,15 +1969,27 @@ async function processZipFile(file) {
 
 async function uploadZipToVercelBlob(file) {
   if (!blobClientPromise) blobClientPromise = import(blobClientImportUrl());
-  const [{ upload }, config] = await Promise.all([blobClientPromise, runtimeConfig()]);
+  const [{ upload }, config, uploadStatus] = await Promise.all([
+    blobClientPromise,
+    runtimeConfig(),
+    blobUploadStatus(),
+  ]);
   const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const configuredAccess = config.blobAccess || CONFIG.BLOB_ACCESS;
+  const configuredAccess = uploadStatus.blobAccess || config.blobAccess || CONFIG.BLOB_ACCESS;
   const blobAccess = configuredAccess === "public" ? "public" : "private";
   return upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
     access: blobAccess,
     handleUploadUrl: apiUrl("/blob-upload"),
     clientPayload: JSON.stringify({ sessionId: activeSessionId }),
   });
+}
+
+async function blobUploadStatus() {
+  const status = await apiJson(apiUrl("/blob-upload"), {}, "Blob upload endpoint is not reachable.");
+  if (!status.hasBlobReadWriteToken) {
+    throw new Error("BLOB_READ_WRITE_TOKEN is not configured for this deployment.");
+  }
+  return status;
 }
 
 function blobClientImportUrl() {

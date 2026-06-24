@@ -65,9 +65,36 @@ function isValidUploadPath(pathname, sessionId) {
     && parts[2].toLowerCase().endsWith(".zip");
 }
 
+function blobAccess() {
+  return process.env.BLOB_ACCESS === "public" ? "public" : "private";
+}
+
+function publicErrorMessage(error) {
+  const message = error instanceof Error ? error.message : "";
+  if (message.includes("BLOB_READ_WRITE_TOKEN")) {
+    return "BLOB_READ_WRITE_TOKEN is not configured for this deployment.";
+  }
+  if (message.includes("access must be")) {
+    return message;
+  }
+  return "Upload setup failed.";
+}
+
 export default async function handler(request) {
+  if (request.method === "GET") {
+    return json({
+      status: "ok",
+      blobAccess: blobAccess(),
+      hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+      maxUploadBytes: MAX_UPLOAD_BYTES,
+    });
+  }
+
   if (request.method !== "POST") {
     return json({ error: "Method not allowed." }, 405);
+  }
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return json({ error: "BLOB_READ_WRITE_TOKEN is not configured for this deployment." }, 500);
   }
   if (!rateLimitUploadToken(request)) {
     return json({ error: "Too many upload token requests." }, 429);
@@ -108,6 +135,6 @@ export default async function handler(request) {
     return json(response);
   } catch (error) {
     console.error("Blob upload setup failed.", error);
-    return json({ error: "Upload setup failed." }, 400);
+    return json({ error: publicErrorMessage(error) }, 400);
   }
 }
