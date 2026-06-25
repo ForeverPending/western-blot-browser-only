@@ -1,10 +1,8 @@
 const BACKEND_URL = (CONFIG.BACKEND_URL || "").replace(/\/$/, "");
 const SESSION_STORAGE_KEY = "western-blot:browser-session-id";
-const BLOB_CLIENT_IMPORT_URL = CONFIG.BLOB_CLIENT_IMPORT_URL || "https://esm.sh/@vercel/blob/client";
 const ALLOWED_TABULAR_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx"]);
 const ALLOWED_ZIP_MIME_TYPES = new Set(["", "application/zip", "application/x-zip-compressed", "application/octet-stream"]);
 const BLOB_UPLOAD_TIMEOUT_MS = 240000;
-let blobClientPromise = null;
 let runtimeConfigPromise = null;
 
 function browserSessionId() {
@@ -45,13 +43,7 @@ const state = {
   pairedSets: [],
   pairedAnalyses: [],
   comparisonCustomGroups: [],
-  chartTitle: "",
 };
-
-function initializeApp() {
-  const workspace = document.querySelector("#appWorkspace");
-  if (workspace) workspace.hidden = false;
-}
 
 async function apiFetch(url, options = {}) {
   const { timeoutMs = 0, ...fetchOptions } = options;
@@ -938,7 +930,6 @@ function activeAnalysis() {
 function renderActiveSharedAnalysis() {
   const analysis = activeAnalysis();
   if (!analysis) return;
-  state.chartTitle = analysis.title;
   els.chartTitle.textContent = analysis.title;
   drawBarChart(els.foldChart, analysis.results, analysis.title);
   renderResultTable(analysis.results);
@@ -1658,8 +1649,6 @@ const blotListElement = document.querySelector("#blotList");
 const blotScrollUpButton = document.querySelector("#blotScrollUp");
 const blotScrollDownButton = document.querySelector("#blotScrollDown");
 
-initializeApp();
-
 document.querySelector("#zipFileInput")?.addEventListener("change", async (event) => {
   const files = Array.from(event.target.files);
   for (const file of files) {
@@ -1685,37 +1674,6 @@ blotScrollDownButton?.addEventListener("click", () => scrollBlotList(1));
 blotListElement?.addEventListener("scroll", updateBlotScrollButtons);
 if (window.ResizeObserver && blotListElement) {
   new ResizeObserver(updateBlotScrollButtons).observe(blotListElement);
-}
-
-async function loadPersistedBlots() {
-  renderBlotList();
-  refreshBlotSourceDropdowns();
-}
-
-function resetBlotWorkspace() {
-  cancelPendingCanvasImageLoad();
-  if (canvasState.imageObjectUrl) URL.revokeObjectURL(canvasState.imageObjectUrl);
-  if (canvasState.image) canvasState.image.src = "";
-  canvasState = createCanvasState();
-
-  blotState.blots = [];
-  blotState.scans = {};
-  blotState.activeBlotIndex = null;
-
-  const preview = document.querySelector("#blotPreview");
-  if (preview) {
-    preview.innerHTML = '<p class="blot-empty-state">Select a blot to preview</p>';
-  }
-  const zipInput = document.querySelector("#zipFileInput");
-  if (zipInput) zipInput.value = "";
-  setZipUploadStatus("");
-
-  document.querySelectorAll("[data-blot-source-scan]").forEach((select) => {
-    select.innerHTML = '<option value="">-- Select scan --</option>';
-  });
-  renderBlotList();
-  refreshBlotSourceDropdowns();
-  refreshNormalizationLanes();
 }
 
 function mergeBlots(blots) {
@@ -2162,14 +2120,6 @@ async function blobUploadStatus() {
     throw new Error("BLOB_READ_WRITE_TOKEN is not configured for this deployment.");
   }
   return status;
-}
-
-function blobClientImportUrl() {
-  const url = new URL(BLOB_CLIENT_IMPORT_URL, window.location.href);
-  if (url.origin !== "https://esm.sh" || !url.pathname.startsWith("/@vercel/blob@")) {
-    throw new Error("Invalid Blob client import URL.");
-  }
-  return url.href;
 }
 
 function setZipUploadStatus(message, success = false) {
