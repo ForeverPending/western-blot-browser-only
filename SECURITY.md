@@ -52,6 +52,8 @@
 
 - Set `ALLOWED_ORIGINS` to exact production and intentionally supported preview
   origins. CORS is not an authorization layer.
+- Set `BLOB_UPLOAD_CALLBACK_ORIGIN` when Blob upload callbacks should be pinned
+  to one canonical deployment host instead of the matching allowed origin.
 - Set `BLOT_TEMP_STORAGE=vercel-blob` and keep `BLOB_READ_WRITE_TOKEN` only in
   backend/Vercel environment variables.
 - Do not put Blob tokens, backend secrets, or private object URLs in

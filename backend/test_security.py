@@ -69,6 +69,19 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertTrue(blot["files"]["700"]["path"].startswith(f"sessions/{SESSION_ID}/"))
         self.assertTrue(blot["files"]["800"]["path"].startswith(f"sessions/{SESSION_ID}/"))
 
+    def test_frontend_csp_only_allows_localhost_connects_for_local_hosts(self):
+        production = self.client.get("/", headers={"Host": "analysis.example"})
+        production_csp = production.headers["Content-Security-Policy"]
+        production.close()
+        self.assertNotIn("http://localhost:*", production_csp)
+        self.assertNotIn("http://127.0.0.1:*", production_csp)
+
+        local = self.client.get("/", headers={"Host": "localhost:5001"})
+        local_csp = local.headers["Content-Security-Policy"]
+        local.close()
+        self.assertIn("http://localhost:*", local_csp)
+        self.assertIn("http://127.0.0.1:*", local_csp)
+
     def test_renders_composite_and_extracts_signals_from_descriptor(self):
         blot = self.upload_blot()
 

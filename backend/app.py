@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import hashlib
 import tempfile
 import time
 import uuid
@@ -28,16 +29,17 @@ app = Flask(__name__)
 
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
 FRONTEND_FILES = {"index.html", "styles.css", "config.js", "app.js"}
-FRONTEND_CSP = (
-    "default-src 'self'; "
-    "script-src 'self' https://cdn.sheetjs.com; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "font-src 'self' https://fonts.gstatic.com; "
-    "img-src 'self' blob: data:; "
-    "connect-src 'self' https://vercel.com https://blob.vercel-storage.com https://*.blob.vercel-storage.com "
-    "https://*.public.blob.vercel-storage.com https://*.private.blob.vercel-storage.com "
-    "http://127.0.0.1:* http://localhost:*; "
-    "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+FRONTEND_CONNECT_SOURCES = (
+    "'self'",
+    "https://vercel.com",
+    "https://blob.vercel-storage.com",
+    "https://*.blob.vercel-storage.com",
+    "https://*.public.blob.vercel-storage.com",
+    "https://*.private.blob.vercel-storage.com",
+)
+LOCAL_FRONTEND_CONNECT_SOURCES = (
+    "http://127.0.0.1:*",
+    "http://localhost:*",
 )
 
 
@@ -66,8 +68,28 @@ def frontend_file_response(filename="index.html"):
     if filename not in FRONTEND_FILES:
         return jsonify({"error": "Not found."}), 404
     response = send_from_directory(FRONTEND_DIR, filename)
-    response.headers["Content-Security-Policy"] = FRONTEND_CSP
+    response.headers["Content-Security-Policy"] = frontend_csp()
     return response
+
+
+def frontend_csp():
+    connect_sources = list(FRONTEND_CONNECT_SOURCES)
+    if is_local_request_host():
+        connect_sources.extend(LOCAL_FRONTEND_CONNECT_SOURCES)
+    return (
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.sheetjs.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' blob: data:; "
+        f"connect-src {' '.join(connect_sources)}; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    )
+
+
+def is_local_request_host():
+    hostname = (urlparse(f"//{request.host}").hostname or "").lower()
+    return hostname in ("localhost", "127.0.0.1", "::1")
 
 
 @app.route("/", methods=["GET"])
@@ -236,6 +258,22 @@ def parse_blot_created_at(value):
 def safe_id(value):
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
     return cleaned.strip("._") or uuid.uuid4().hex
+
+
+def log_token(value):
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def log_temp_path(path):
+    parts = str(path or "").split("/")
+    if len(parts) >= 4 and parts[0] == "sessions":
+        return f"sessions/{log_token(parts[1])}/{log_token(parts[2])}/{parts[3]}"
+    if len(parts) >= 3 and parts[0] == "uploads":
+        return f"uploads/{log_token(parts[1])}/{log_token(parts[2])}"
+    return ""
 
 
 def request_session_id(data=None):
@@ -465,7 +503,7 @@ def vercel_blob_put(path, file_bytes, content_type):
                     "event": "vercel_blob_access_fallback",
                     "fromAccess": "public",
                     "toAccess": "private",
-                    "path": path,
+                    "path": log_temp_path(path),
                 }),
                 flush=True,
             )
@@ -648,8 +686,8 @@ def process_storage_upload():
     print(
         json.dumps({
             "event": "process_upload_start",
-            "sessionId": session_id,
-            "path": upload_path,
+            "sessionHash": log_token(session_id),
+            "path": log_temp_path(upload_path),
         }),
         flush=True,
     )
@@ -658,7 +696,7 @@ def process_storage_upload():
         print(
             json.dumps({
                 "event": "process_upload_blob_read",
-                "sessionId": session_id,
+                "sessionHash": log_token(session_id),
                 "bytes": len(file_bytes),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }),
@@ -670,7 +708,7 @@ def process_storage_upload():
         print(
             json.dumps({
                 "event": "process_upload_zip_parsed",
-                "sessionId": session_id,
+                "sessionHash": log_token(session_id),
                 "blotCount": len(blots),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }),
@@ -680,7 +718,7 @@ def process_storage_upload():
         print(
             json.dumps({
                 "event": "process_upload_done",
-                "sessionId": session_id,
+                "sessionHash": log_token(session_id),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }),
             flush=True,
@@ -690,7 +728,7 @@ def process_storage_upload():
         print(
             json.dumps({
                 "event": "process_upload_public_error",
-                "sessionId": session_id,
+                "sessionHash": log_token(session_id),
                 "error": str(error),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }),
@@ -701,7 +739,7 @@ def process_storage_upload():
         print(
             json.dumps({
                 "event": "process_upload_unexpected_error",
-                "sessionId": session_id,
+                "sessionHash": log_token(session_id),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }),
             flush=True,
@@ -745,7 +783,7 @@ def parse_zip(file_bytes, session_id):
             print(
                 json.dumps({
                     "event": "process_upload_parse_folder",
-                    "sessionId": session_id,
+                    "sessionHash": log_token(session_id),
                     "folderIndex": folder_index,
                     "has700": tif_700 is not None,
                     "has800": tif_800 is not None,

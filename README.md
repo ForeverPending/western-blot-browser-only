@@ -33,6 +33,8 @@ Set these environment variables:
   Blob store
 - `ALLOWED_ORIGINS=<your production origin>`
 - `MAX_ZIP_UPLOAD_BYTES=262144000`
+- Optional: `BLOB_UPLOAD_CALLBACK_ORIGIN=<your production origin>` if Blob
+  callbacks should always use one canonical host
 
 `frontend/config.js` automatically uses same-origin API routes and Vercel Blob
 uploads outside localhost.

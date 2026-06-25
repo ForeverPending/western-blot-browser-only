@@ -86,12 +86,58 @@ function publicErrorMessage(error) {
   return "Upload setup failed.";
 }
 
+function normalizeOrigin(value) {
+  if (!value) return "";
+  try {
+    const text = String(value).trim().replace(/\/+$/, "");
+    const url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) return "";
+    return url.origin;
+  } catch (_error) {
+    return "";
+  }
+}
+
+function configuredCallbackOrigins() {
+  const origins = [
+    process.env.BLOB_UPLOAD_CALLBACK_ORIGIN,
+    process.env.PUBLIC_APP_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    process.env.VERCEL_URL,
+    ...(process.env.ALLOWED_ORIGINS || "").split(","),
+  ].map(normalizeOrigin).filter(Boolean);
+  return [...new Set(origins)];
+}
+
+function isLocalOrigin(origin) {
+  try {
+    const hostname = new URL(origin).hostname;
+    return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(hostname);
+  } catch (_error) {
+    return false;
+  }
+}
+
 function callbackUrl(request) {
-  return new URL("/api/blob-upload", request.url).href;
+  const requestOrigin = normalizeOrigin(new URL(request.url).origin);
+  const configuredOrigins = configuredCallbackOrigins();
+  const callbackOrigin = configuredOrigins.includes(requestOrigin)
+    ? requestOrigin
+    : configuredOrigins[0];
+  if (!callbackOrigin && !isLocalOrigin(requestOrigin)) {
+    throw new Error("BLOB_UPLOAD_CALLBACK_ORIGIN or ALLOWED_ORIGINS must be configured for Blob uploads.");
+  }
+  return new URL("/api/blob-upload", callbackOrigin || requestOrigin).href;
 }
 
 function webhookPublicKey() {
   return process.env.BLOB_WEBHOOK_PUBLIC_KEY || process.env.blob_webhook_public_key;
+}
+
+function logUploadPath(pathname) {
+  const parts = String(pathname || "").split("/");
+  if (parts.length === 3 && parts[0] === "uploads") return "uploads/<session>/<upload>.zip";
+  return "";
 }
 
 async function handleBlobUploadRequest(request) {
@@ -147,7 +193,7 @@ async function handleBlobUploadRequest(request) {
 
           const sessionId = safeSessionId(payload.sessionId);
           if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
-            logEvent("blob_upload_invalid_presigned_path", { pathname, hasSessionId: Boolean(sessionId) });
+            logEvent("blob_upload_invalid_presigned_path", { pathname: logUploadPath(pathname), hasSessionId: Boolean(sessionId) });
             throw new Error("Invalid upload path.");
           }
 
@@ -155,7 +201,7 @@ async function handleBlobUploadRequest(request) {
             access: blobAccess(),
             callbackUrl: callbackUrl(request),
             multipart: Boolean(multipart),
-            pathname,
+            pathname: logUploadPath(pathname),
             maximumSizeInBytes: MAX_UPLOAD_BYTES,
           });
 
@@ -188,8 +234,8 @@ async function handleBlobUploadRequest(request) {
             sessionId = "";
           }
           logEvent("blob_upload_presigned_completed", {
-            sessionId,
-            pathname: blob?.pathname,
+            hasSessionId: Boolean(sessionId),
+            pathname: logUploadPath(blob?.pathname),
             size: blob?.size,
           });
         },
@@ -212,7 +258,7 @@ async function handleBlobUploadRequest(request) {
 
         const sessionId = safeSessionId(payload.sessionId);
         if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
-          logEvent("blob_upload_invalid_path", { pathname, hasSessionId: Boolean(sessionId) });
+          logEvent("blob_upload_invalid_path", { pathname: logUploadPath(pathname), hasSessionId: Boolean(sessionId) });
           throw new Error("Invalid upload path.");
         }
 
@@ -220,7 +266,7 @@ async function handleBlobUploadRequest(request) {
           access: blobAccess(),
           callbackUrl: callbackUrl(request),
           multipart: Boolean(multipart),
-          pathname,
+          pathname: logUploadPath(pathname),
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
         });
         return {
@@ -238,8 +284,8 @@ async function handleBlobUploadRequest(request) {
           sessionId = "";
         }
         logEvent("blob_upload_completed", {
-          sessionId,
-          pathname: blob?.pathname,
+          hasSessionId: Boolean(sessionId),
+          pathname: logUploadPath(blob?.pathname),
           size: blob?.size,
         });
       },
