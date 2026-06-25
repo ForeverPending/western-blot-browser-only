@@ -149,7 +149,7 @@ async function handleBlobUploadRequest(request) {
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
         });
         return {
-          allowedContentTypes: ["application/zip", "application/x-zip-compressed"],
+          allowedContentTypes: ["application/zip", "application/x-zip-compressed", "application/octet-stream"],
           callbackUrl: callbackUrl(request),
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
           tokenPayload: JSON.stringify({ sessionId }),
