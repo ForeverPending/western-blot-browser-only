@@ -84,6 +84,10 @@ function publicErrorMessage(error) {
   return "Upload setup failed.";
 }
 
+function callbackUrl(request) {
+  return new URL("/api/blob-upload", request.url).href;
+}
+
 async function handleBlobUploadRequest(request) {
   if (request.method === "GET") {
     logEvent("blob_upload_status", {
@@ -123,7 +127,7 @@ async function handleBlobUploadRequest(request) {
     const response = await handleUpload({
       body,
       request,
-      onBeforeGenerateToken(pathname, clientPayload) {
+      onBeforeGenerateToken(pathname, clientPayload, multipart) {
         let payload = {};
         try {
           payload = clientPayload ? JSON.parse(clientPayload) : {};
@@ -139,11 +143,14 @@ async function handleBlobUploadRequest(request) {
 
         logEvent("blob_upload_token_generated", {
           access: blobAccess(),
+          callbackUrl: callbackUrl(request),
+          multipart: Boolean(multipart),
           pathname,
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
         });
         return {
           allowedContentTypes: ["application/zip", "application/x-zip-compressed"],
+          callbackUrl: callbackUrl(request),
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
           tokenPayload: JSON.stringify({ sessionId }),
         };

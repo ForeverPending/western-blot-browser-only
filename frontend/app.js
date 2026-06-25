@@ -2007,11 +2007,29 @@ async function uploadZipToVercelBlob(file) {
   const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const configuredAccess = uploadStatus.blobAccess || config.blobAccess || CONFIG.BLOB_ACCESS;
   const blobAccess = configuredAccess === "public" ? "public" : "private";
-  return withTimeout(upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
-    access: blobAccess,
-    handleUploadUrl: apiUrl("/blob-upload"),
-    clientPayload: JSON.stringify({ sessionId: activeSessionId }),
-  }), BLOB_UPLOAD_TIMEOUT_MS, "Blob upload timed out before Vercel returned a stored file reference.");
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), BLOB_UPLOAD_TIMEOUT_MS);
+
+  try {
+    return await upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
+      access: blobAccess,
+      abortSignal: controller.signal,
+      clientPayload: JSON.stringify({ sessionId: activeSessionId }),
+      handleUploadUrl: apiUrl("/blob-upload"),
+      multipart: true,
+      onUploadProgress({ percentage }) {
+        const percent = Math.max(0, Math.min(100, Math.floor(Number(percentage) || 0)));
+        setZipUploadStatus(`Uploading ${file.name}... ${percent}%`);
+      },
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Blob upload timed out before Vercel returned a stored file reference.");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 async function blobUploadStatus() {
@@ -2020,18 +2038,6 @@ async function blobUploadStatus() {
     throw new Error("BLOB_READ_WRITE_TOKEN is not configured for this deployment.");
   }
   return status;
-}
-
-async function withTimeout(promise, timeoutMs, message) {
-  let timeoutId = null;
-  const timeout = new Promise((_, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timeoutId !== null) window.clearTimeout(timeoutId);
-  }
 }
 
 function blobClientImportUrl() {
