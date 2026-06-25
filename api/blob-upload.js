@@ -127,7 +127,7 @@ async function handleBlobUploadRequest(request) {
     const response = await handleUpload({
       body,
       request,
-      onBeforeGenerateToken(pathname, clientPayload, multipart) {
+      async onBeforeGenerateToken(pathname, clientPayload, multipart) {
         let payload = {};
         try {
           payload = clientPayload ? JSON.parse(clientPayload) : {};
