@@ -34,7 +34,7 @@ FRONTEND_CSP = (
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com; "
     "img-src 'self' blob: data:; "
-    "connect-src 'self' https://blob.vercel-storage.com https://*.blob.vercel-storage.com "
+    "connect-src 'self' https://vercel.com https://blob.vercel-storage.com https://*.blob.vercel-storage.com "
     "https://*.public.blob.vercel-storage.com https://*.private.blob.vercel-storage.com "
     "http://127.0.0.1:* http://localhost:*; "
     "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
