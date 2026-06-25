@@ -190,6 +190,7 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
 BLOB_ACCESS = "public" if os.environ.get("BLOB_ACCESS") == "public" else "private"
+RUNTIME_BLOB_ACCESS = BLOB_ACCESS
 BLOB_API_BASE_URL = "https://vercel.com/api/blob"
 BLOB_API_VERSION = "12"
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
@@ -400,7 +401,10 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
             }),
             flush=True,
         )
-        raise PublicError("Temporary Blob storage request failed.", 502) from error
+        public_error = PublicError("Temporary Blob storage request failed.", 502)
+        public_error.blob_status = error.code
+        public_error.blob_response = error_body
+        raise public_error from error
     except (URLError, TimeoutError) as error:
         parsed = urlparse(url)
         print(
@@ -413,7 +417,9 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
             }),
             flush=True,
         )
-        raise PublicError("Temporary Blob storage request failed.", 502) from error
+        public_error = PublicError("Temporary Blob storage request failed.", 502)
+        public_error.blob_response = str(error)
+        raise public_error from error
     if not response_body:
         return None
     if "application/json" in content_type:
@@ -421,7 +427,15 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
     return response_body
 
 
-def vercel_blob_put(path, file_bytes, content_type):
+def is_private_store_access_error(error):
+    response = getattr(error, "blob_response", "")
+    return (
+        getattr(error, "blob_status", None) == 400
+        and "Cannot use public access on a private store" in response
+    )
+
+
+def vercel_blob_put_with_access(path, file_bytes, content_type, access):
     encoded_path = quote(path, safe="/")
     return vercel_blob_request(
         "PUT",
@@ -433,10 +447,30 @@ def vercel_blob_put(path, file_bytes, content_type):
             "x-content-length": str(len(file_bytes)),
             "x-content-type": content_type,
             "x-cache-control-max-age": "60",
-            "x-vercel-blob-access": BLOB_ACCESS,
+            "x-vercel-blob-access": access,
         },
         api_request=True,
     )
+
+
+def vercel_blob_put(path, file_bytes, content_type):
+    global RUNTIME_BLOB_ACCESS
+    try:
+        return vercel_blob_put_with_access(path, file_bytes, content_type, RUNTIME_BLOB_ACCESS)
+    except PublicError as error:
+        if RUNTIME_BLOB_ACCESS == "public" and is_private_store_access_error(error):
+            RUNTIME_BLOB_ACCESS = "private"
+            print(
+                json.dumps({
+                    "event": "vercel_blob_access_fallback",
+                    "fromAccess": "public",
+                    "toAccess": "private",
+                    "path": path,
+                }),
+                flush=True,
+            )
+            return vercel_blob_put_with_access(path, file_bytes, content_type, RUNTIME_BLOB_ACCESS)
+        raise
 
 
 def vercel_blob_read(descriptor, path, max_bytes=None):

@@ -186,6 +186,48 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(request.headers["X-content-length"], "3")
         self.assertEqual(result["pathname"], path)
 
+    def test_vercel_blob_put_retries_private_when_store_rejects_public_access(self):
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b'{"pathname":"sessions/test-browser-session/blot-1/800.tif","url":"https://abc.private.blob.vercel-storage.com/sessions/test-browser-session/blot-1/800.tif"}'
+
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            if len(requests) == 1:
+                body = b'{"error":{"code":"bad_request","message":"Cannot use public access on a private store. The store is configured with private access."}}'
+                raise backend.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(body))
+            return FakeResponse()
+
+        path = f"sessions/{SESSION_ID}/blot-1/800.tif"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BLOB_READ_WRITE_TOKEN": "vercel_blob_rw_teststore_secret",
+                "BLOB_STORE_ID": "",
+            },
+            clear=False,
+        ), mock.patch("app.urlopen", side_effect=fake_urlopen), mock.patch.object(
+            backend, "BLOB_ACCESS", "public"
+        ), mock.patch.object(
+            backend, "RUNTIME_BLOB_ACCESS", "public"
+        ):
+            result = backend.vercel_blob_put(path, b"abc", "image/tiff")
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].headers["X-vercel-blob-access"], "public")
+        self.assertEqual(requests[1].headers["X-vercel-blob-access"], "private")
+        self.assertEqual(result["pathname"], path)
+
     def test_cleanup_removes_temp_files(self):
         blot = self.upload_blot()
         response = self.client.post(
