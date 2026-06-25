@@ -2045,10 +2045,12 @@ async function manualPresignedUpload(pathname, file, options) {
   }
 
   const uploadUrl = buildPresignedBlobUrl(pathname, payload);
+  const storeId = parseBlobStoreIdFromDelegationToken(payload.delegationToken);
   const response = await uploadFileWithProgress(uploadUrl, file, {
     access: options.access,
     contentType,
     signal: options.signal,
+    storeId,
   });
 
   return {
@@ -2069,6 +2071,34 @@ function buildPresignedBlobUrl(pathname, payload) {
   url.searchParams.set("vercel-blob-delegation", payload.delegationToken);
   url.searchParams.set("vercel-blob-signature", payload.signature);
   return url.href;
+}
+
+function parseBlobStoreIdFromDelegationToken(delegationToken) {
+  const parts = String(delegationToken || "").split(".");
+  if (parts.length < 2) {
+    throw new Error("Blob upload delegation token is invalid.");
+  }
+
+  let decoded;
+  try {
+    decoded = JSON.parse(base64UrlDecode(parts[1]));
+  } catch (_error) {
+    throw new Error("Blob upload delegation token could not be decoded.");
+  }
+
+  const storeId = String(decoded.storeId || "");
+  if (!storeId) {
+    throw new Error("Blob upload delegation token is missing the Blob store id.");
+  }
+  return storeId.startsWith("store_") ? storeId.slice("store_".length) : storeId;
+}
+
+function base64UrlDecode(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), "=");
+  const binary = window.atob(padded);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 function uploadFileWithProgress(url, file, options) {
@@ -2119,6 +2149,9 @@ function uploadFileWithProgress(url, file, options) {
     xhr.setRequestHeader("x-content-length", String(file.size));
     xhr.setRequestHeader("x-content-type", options.contentType);
     xhr.setRequestHeader("x-vercel-blob-access", options.access);
+    xhr.setRequestHeader("x-vercel-blob-store-id", options.storeId);
+    xhr.setRequestHeader("x-api-blob-request-id", `${options.storeId}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
+    xhr.setRequestHeader("x-api-blob-request-attempt", "0");
     xhr.send(file);
   });
 }
