@@ -190,8 +190,8 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
 BLOB_ACCESS = "public" if os.environ.get("BLOB_ACCESS") == "public" else "private"
-BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
-BLOB_API_VERSION = "10"
+BLOB_API_BASE_URL = "https://vercel.com/api/blob"
+BLOB_API_VERSION = "12"
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
 def init_storage():
@@ -316,9 +316,35 @@ def vercel_blob_token():
     return token
 
 
+def normalize_vercel_blob_store_id(store_id):
+    store_id = str(store_id or "").strip()
+    return store_id[6:] if store_id.startswith("store_") else store_id
+
+
+def vercel_blob_store_id():
+    store_id = os.environ.get("BLOB_STORE_ID") or os.environ.get("blob_store_id")
+    if store_id:
+        return normalize_vercel_blob_store_id(store_id)
+
+    token = vercel_blob_token()
+    parts = token.split("_")
+    if len(parts) >= 4 and parts[3]:
+        return normalize_vercel_blob_store_id(parts[3])
+    raise RuntimeError("BLOB_STORE_ID could not be inferred from BLOB_READ_WRITE_TOKEN.")
+
+
 def is_allowed_vercel_blob_host(hostname):
     host = (hostname or "").lower().rstrip(".")
     return host == "blob.vercel-storage.com" or host.endswith(".blob.vercel-storage.com")
+
+
+def validate_vercel_blob_api_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "vercel.com":
+        raise PublicError("Invalid Blob API request.")
+    if parsed.path != "/api/blob" and not parsed.path.startswith("/api/blob/"):
+        raise PublicError("Invalid Blob API request.")
+    return url
 
 
 def validate_vercel_blob_url(url, expected_path=None):
@@ -334,11 +360,18 @@ def validate_vercel_blob_url(url, expected_path=None):
     return url
 
 
-def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None):
-    validate_vercel_blob_url(url)
+def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None, api_request=False):
+    if api_request:
+        validate_vercel_blob_api_url(url)
+    else:
+        validate_vercel_blob_url(url)
+    store_id = vercel_blob_store_id()
     request_headers = {
         "authorization": f"Bearer {vercel_blob_token()}",
+        "x-api-blob-request-id": f"{store_id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:12]}",
+        "x-api-blob-request-attempt": "0",
         "x-api-version": BLOB_API_VERSION,
+        "x-vercel-blob-store-id": store_id,
     }
     if headers:
         request_headers.update(headers)
@@ -352,7 +385,34 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
                 if len(response_body) > max_response_bytes:
                     raise PublicError("Temporary file exceeds the configured size limit.", 413)
             content_type = response.headers.get("Content-Type", "")
-    except (HTTPError, URLError, TimeoutError) as error:
+    except HTTPError as error:
+        error_body = error.read(1024).decode("utf-8", "replace")
+        parsed = urlparse(url)
+        print(
+            json.dumps({
+                "event": "vercel_blob_request_error",
+                "method": method,
+                "status": error.code,
+                "reason": error.reason,
+                "urlHost": parsed.hostname,
+                "urlPath": parsed.path,
+                "response": error_body[:500],
+            }),
+            flush=True,
+        )
+        raise PublicError("Temporary Blob storage request failed.", 502) from error
+    except (URLError, TimeoutError) as error:
+        parsed = urlparse(url)
+        print(
+            json.dumps({
+                "event": "vercel_blob_request_error",
+                "method": method,
+                "urlHost": parsed.hostname,
+                "urlPath": parsed.path,
+                "error": str(error),
+            }),
+            flush=True,
+        )
         raise PublicError("Temporary Blob storage request failed.", 502) from error
     if not response_body:
         return None
@@ -368,11 +428,14 @@ def vercel_blob_put(path, file_bytes, content_type):
         f"{BLOB_API_BASE_URL}/?pathname={encoded_path}",
         body=file_bytes,
         headers={
-            "access": BLOB_ACCESS,
+            "x-add-random-suffix": "0",
+            "x-allow-overwrite": "0",
+            "x-content-length": str(len(file_bytes)),
             "x-content-type": content_type,
             "x-cache-control-max-age": "60",
-            "x-allow-overwrite": "0",
+            "x-vercel-blob-access": BLOB_ACCESS,
         },
+        api_request=True,
     )
 
 
@@ -399,6 +462,7 @@ def vercel_blob_delete(descriptor_paths):
         f"{BLOB_API_BASE_URL}/delete",
         body=body,
         headers={"Content-Type": "application/json"},
+        api_request=True,
     )
 
 

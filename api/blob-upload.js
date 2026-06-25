@@ -132,7 +132,7 @@ async function handleBlobUploadRequest(request) {
   try {
     const body = await request.json();
     logEvent("blob_upload_request", { type: body?.type || "unknown" });
-    if (body?.type === "blob.generate-presigned-url") {
+    if (body?.type === "blob.generate-presigned-url" || body?.type === "blob.upload-completed") {
       const response = await handleUploadPresigned({
         body,
         request,

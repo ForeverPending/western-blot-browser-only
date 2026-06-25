@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 import numpy as np
 import tifffile
@@ -144,6 +145,46 @@ class StatelessSessionBackendTests(unittest.TestCase):
                 {"url": "https://store.public.blob.vercel-storage.com/sessions/other/blot-1/700.tif"},
                 path,
             )
+
+    def test_vercel_blob_put_uses_current_api_headers(self):
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b'{"pathname":"sessions/test-browser-session/blot-1/700.tif","url":"https://abc.public.blob.vercel-storage.com/sessions/test-browser-session/blot-1/700.tif"}'
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        path = f"sessions/{SESSION_ID}/blot-1/700.tif"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BLOB_READ_WRITE_TOKEN": "vercel_blob_rw_teststore_secret",
+                "BLOB_STORE_ID": "",
+            },
+            clear=False,
+        ), mock.patch("app.urlopen", side_effect=fake_urlopen):
+            result = backend.vercel_blob_put(path, b"abc", "image/tiff")
+
+        request = captured["request"]
+        self.assertEqual(request.full_url, f"https://vercel.com/api/blob/?pathname={path}")
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(request.headers["X-api-version"], "12")
+        self.assertEqual(request.headers["X-vercel-blob-access"], backend.BLOB_ACCESS)
+        self.assertEqual(request.headers["X-vercel-blob-store-id"], "teststore")
+        self.assertEqual(request.headers["X-content-length"], "3")
+        self.assertEqual(result["pathname"], path)
 
     def test_cleanup_removes_temp_files(self):
         blot = self.upload_blot()
