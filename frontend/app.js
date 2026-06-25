@@ -1998,9 +1998,7 @@ async function processZipFile(file) {
 }
 
 async function uploadZipToVercelBlob(file) {
-  if (!blobClientPromise) blobClientPromise = import(blobClientImportUrl());
-  const [{ uploadPresigned }, config, uploadStatus] = await Promise.all([
-    blobClientPromise,
+  const [config, uploadStatus] = await Promise.all([
     runtimeConfig(),
     blobUploadStatus(),
   ]);
@@ -2011,16 +2009,9 @@ async function uploadZipToVercelBlob(file) {
   const timeoutId = window.setTimeout(() => controller.abort(), BLOB_UPLOAD_TIMEOUT_MS);
 
   try {
-    return await uploadPresigned(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
+    return await manualPresignedUpload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
       access: blobAccess,
-      abortSignal: controller.signal,
-      clientPayload: JSON.stringify({ sessionId: activeSessionId }),
-      handleUploadUrl: apiUrl("/blob-upload"),
-      multipart: true,
-      onUploadProgress({ percentage }) {
-        const percent = Math.max(0, Math.min(100, Math.floor(Number(percentage) || 0)));
-        setZipUploadStatus(`Uploading ${file.name}... ${percent}%`);
-      },
+      signal: controller.signal,
     });
   } catch (error) {
     if (controller.signal.aborted) {
@@ -2030,6 +2021,106 @@ async function uploadZipToVercelBlob(file) {
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+async function manualPresignedUpload(pathname, file, options) {
+  const contentType = file.type || "application/octet-stream";
+  const presign = await apiJson(apiUrl("/blob-upload"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type: "blob.generate-presigned-url",
+      payload: {
+        pathname,
+        clientPayload: JSON.stringify({ sessionId: activeSessionId }),
+        multipart: false,
+      },
+    }),
+    timeoutMs: 15000,
+  }, "Could not prepare Blob upload.");
+
+  const payload = presign.presignedUrlPayload;
+  if (!payload?.delegationToken || !payload?.signature || !payload?.params) {
+    throw new Error("Blob upload endpoint returned an invalid presigned URL payload.");
+  }
+
+  const uploadUrl = buildPresignedBlobUrl(pathname, payload);
+  const response = await uploadFileWithProgress(uploadUrl, file, {
+    access: options.access,
+    contentType,
+    signal: options.signal,
+  });
+
+  return {
+    url: response.url,
+    downloadUrl: response.downloadUrl,
+    pathname: response.pathname || pathname,
+    contentType: response.contentType || contentType,
+    contentDisposition: response.contentDisposition || "",
+  };
+}
+
+function buildPresignedBlobUrl(pathname, payload) {
+  const url = new URL("https://vercel.com/api/blob/");
+  url.searchParams.set("pathname", pathname);
+  Object.entries(payload.params || {}).forEach(([key, value]) => {
+    url.searchParams.set(key, value);
+  });
+  url.searchParams.set("vercel-blob-delegation", payload.delegationToken);
+  url.searchParams.set("vercel-blob-signature", payload.signature);
+  return url.href;
+}
+
+function uploadFileWithProgress(url, file, options) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+
+    function finish(error, value) {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", abortUpload);
+      if (error) reject(error);
+      else resolve(value);
+    }
+
+    function abortUpload() {
+      xhr.abort();
+      finish(new Error("Blob upload was cancelled."));
+    }
+
+    xhr.upload.onprogress = event => {
+      if (!event.lengthComputable) return;
+      const percent = Math.max(0, Math.min(100, Math.floor((event.loaded / event.total) * 100)));
+      setZipUploadStatus(`Uploading ${file.name}... ${percent}%`);
+    };
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        finish(new Error(`Blob upload failed with status ${xhr.status}.`));
+        return;
+      }
+      try {
+        finish(null, JSON.parse(xhr.responseText || "{}"));
+      } catch (_error) {
+        finish(new Error("Blob upload returned an invalid response."));
+      }
+    };
+    xhr.onerror = () => finish(new Error("Blob upload network request failed."));
+    xhr.onabort = () => finish(new Error("Blob upload was cancelled."));
+
+    if (options.signal?.aborted) {
+      abortUpload();
+      return;
+    }
+    options.signal?.addEventListener("abort", abortUpload, { once: true });
+
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("x-api-version", "12");
+    xhr.setRequestHeader("x-content-length", String(file.size));
+    xhr.setRequestHeader("x-content-type", options.contentType);
+    xhr.setRequestHeader("x-vercel-blob-access", options.access);
+    xhr.send(file);
+  });
 }
 
 async function blobUploadStatus() {
