@@ -2081,7 +2081,7 @@ function parseBlobStoreIdFromDelegationToken(delegationToken) {
 
   let decoded;
   try {
-    decoded = JSON.parse(base64UrlDecode(parts[1]));
+    decoded = JSON.parse(base64UrlDecode(parts[0]));
   } catch (_error) {
     throw new Error("Blob upload delegation token could not be decoded.");
   }
