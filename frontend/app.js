@@ -1999,7 +1999,7 @@ async function processZipFile(file) {
 
 async function uploadZipToVercelBlob(file) {
   if (!blobClientPromise) blobClientPromise = import(blobClientImportUrl());
-  const [{ upload }, config, uploadStatus] = await Promise.all([
+  const [{ uploadPresigned }, config, uploadStatus] = await Promise.all([
     blobClientPromise,
     runtimeConfig(),
     blobUploadStatus(),
@@ -2011,7 +2011,7 @@ async function uploadZipToVercelBlob(file) {
   const timeoutId = window.setTimeout(() => controller.abort(), BLOB_UPLOAD_TIMEOUT_MS);
 
   try {
-    return await upload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
+    return await uploadPresigned(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
       access: blobAccess,
       abortSignal: controller.signal,
       clientPayload: JSON.stringify({ sessionId: activeSessionId }),

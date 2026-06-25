@@ -1,9 +1,11 @@
-import { handleUpload } from "@vercel/blob/client";
+import { issueSignedToken } from "@vercel/blob";
+import { handleUpload, handleUploadPresigned } from "@vercel/blob/client";
 
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_ZIP_BYTES || process.env.MAX_ZIP_UPLOAD_BYTES || 250 * 1024 * 1024);
 const MAX_TOKEN_BODY_BYTES = 64 * 1024;
 const TOKEN_WINDOW_MS = 60 * 1000;
 const TOKEN_WINDOW_LIMIT = Number(process.env.BLOB_UPLOAD_TOKEN_RATE_LIMIT || 30);
+const ALLOWED_UPLOAD_CONTENT_TYPES = ["application/zip", "application/x-zip-compressed", "application/octet-stream"];
 const uploadTokenHits = globalThis.__westernBlotUploadTokenHits || new Map();
 globalThis.__westernBlotUploadTokenHits = uploadTokenHits;
 
@@ -88,17 +90,23 @@ function callbackUrl(request) {
   return new URL("/api/blob-upload", request.url).href;
 }
 
+function webhookPublicKey() {
+  return process.env.BLOB_WEBHOOK_PUBLIC_KEY || process.env.blob_webhook_public_key;
+}
+
 async function handleBlobUploadRequest(request) {
   if (request.method === "GET") {
     logEvent("blob_upload_status", {
       blobAccess: blobAccess(),
       hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+      hasBlobWebhookPublicKey: Boolean(webhookPublicKey()),
       maxUploadBytes: MAX_UPLOAD_BYTES,
     });
     return json({
       status: "ok",
       blobAccess: blobAccess(),
       hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+      hasBlobWebhookPublicKey: Boolean(webhookPublicKey()),
       maxUploadBytes: MAX_UPLOAD_BYTES,
     });
   }
@@ -124,6 +132,73 @@ async function handleBlobUploadRequest(request) {
   try {
     const body = await request.json();
     logEvent("blob_upload_request", { type: body?.type || "unknown" });
+    if (body?.type === "blob.generate-presigned-url") {
+      const response = await handleUploadPresigned({
+        body,
+        request,
+        webhookPublicKey: webhookPublicKey(),
+        async getSignedToken(pathname, clientPayload, multipart) {
+          let payload = {};
+          try {
+            payload = clientPayload ? JSON.parse(clientPayload) : {};
+          } catch (_error) {
+            throw new Error("Invalid upload payload.");
+          }
+
+          const sessionId = safeSessionId(payload.sessionId);
+          if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
+            logEvent("blob_upload_invalid_presigned_path", { pathname, hasSessionId: Boolean(sessionId) });
+            throw new Error("Invalid upload path.");
+          }
+
+          logEvent("blob_upload_presigned_generated", {
+            access: blobAccess(),
+            callbackUrl: callbackUrl(request),
+            multipart: Boolean(multipart),
+            pathname,
+            maximumSizeInBytes: MAX_UPLOAD_BYTES,
+          });
+
+          const token = await issueSignedToken({
+            token: process.env.BLOB_READ_WRITE_TOKEN,
+            pathname,
+            operations: ["put"],
+            validUntil: Date.now() + 15 * 60 * 1000,
+            allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
+            maximumSizeInBytes: MAX_UPLOAD_BYTES,
+          });
+
+          return {
+            token,
+            urlOptions: {
+              addRandomSuffix: false,
+              allowOverwrite: false,
+              allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
+              callbackUrl: callbackUrl(request),
+              maximumSizeInBytes: MAX_UPLOAD_BYTES,
+              tokenPayload: JSON.stringify({ sessionId }),
+            },
+          };
+        },
+        async onUploadCompleted({ blob, tokenPayload }) {
+          let sessionId = "";
+          try {
+            sessionId = JSON.parse(tokenPayload || "{}").sessionId || "";
+          } catch (_error) {
+            sessionId = "";
+          }
+          logEvent("blob_upload_presigned_completed", {
+            sessionId,
+            pathname: blob?.pathname,
+            size: blob?.size,
+          });
+        },
+      });
+
+      logEvent("blob_upload_presigned_response", { type: response?.type || "unknown" });
+      return json(response);
+    }
+
     const response = await handleUpload({
       body,
       request,
@@ -149,7 +224,7 @@ async function handleBlobUploadRequest(request) {
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
         });
         return {
-          allowedContentTypes: ["application/zip", "application/x-zip-compressed", "application/octet-stream"],
+          allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
           callbackUrl: callbackUrl(request),
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
           tokenPayload: JSON.stringify({ sessionId }),
