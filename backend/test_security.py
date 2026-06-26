@@ -23,14 +23,25 @@ import app as backend  # noqa: E402
 SESSION_ID = "test-browser-session"
 
 
-def make_test_zip(blot_name="Session test blot", created_line="#Fri May 15 16:38:05 PDT 2026"):
+def make_test_zip(blot_name="Session test blot", created_line="#Fri May 15 16:38:05 PDT 2026", metadata=None):
     tif_buffer = io.BytesIO()
     tifffile.imwrite(tif_buffer, np.arange(64, dtype=np.uint16).reshape(8, 8))
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("Blot A/metadata.txt", f"Image metadata\n{created_line}\nRemarks={blot_name}")
+        zf.writestr("Blot A/metadata.txt", metadata or f"Image metadata\n{created_line}\nRemarks={blot_name}")
         zf.writestr("Blot A/image_700.tif", tif_buffer.getvalue())
         zf.writestr("Blot A/image_800.tif", tif_buffer.getvalue())
+    archive.seek(0)
+    return archive
+
+
+def make_single_channel_zip(folder="Blot 700", tif_name="image_800.tif"):
+    tif_buffer = io.BytesIO()
+    tifffile.imwrite(tif_buffer, np.arange(64, dtype=np.uint16).reshape(8, 8))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{folder}/metadata.txt", "Image metadata\n#Fri May 15 16:38:05 PDT 2026\nRemarks=Single channel")
+        zf.writestr(f"{folder}/{tif_name}", tif_buffer.getvalue())
     archive.seek(0)
     return archive
 
@@ -68,6 +79,23 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertIn("files", blot)
         self.assertTrue(blot["files"]["700"]["path"].startswith(f"sessions/{SESSION_ID}/"))
         self.assertTrue(blot["files"]["800"]["path"].startswith(f"sessions/{SESSION_ID}/"))
+
+    def test_zip_metadata_is_parsed_by_field_not_line_position(self):
+        response = self.client.post(
+            "/upload-zip",
+            data={
+                "sessionId": SESSION_ID,
+                "file": (
+                    make_test_zip(metadata="Remarks=Reordered metadata\nImage metadata\n#Fri May 15 16:38:05 PDT 2026"),
+                    "scanner.zip",
+                ),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        blot = response.get_json()["blots"][0]
+        self.assertEqual(blot["name"], "Reordered metadata")
+        self.assertEqual(blot["createdAt"], "2026-05-15T23:38:05+00:00")
 
     def test_frontend_csp_only_allows_localhost_connects_for_local_hosts(self):
         production = self.client.get("/", headers={"Host": "analysis.example"})
@@ -241,6 +269,44 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(requests[1].headers["X-vercel-blob-access"], "private")
         self.assertEqual(result["pathname"], path)
 
+    def test_vercel_blob_read_retries_transient_errors(self):
+        class FakeResponse:
+            headers = {"Content-Type": "application/octet-stream"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b"ok"
+
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            if len(requests) == 1:
+                raise backend.HTTPError(request.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"retry"))
+            return FakeResponse()
+
+        path = f"sessions/{SESSION_ID}/blot-1/700.tif"
+        descriptor = {
+            "url": f"https://abc.private.blob.vercel-storage.com/{path}",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BLOB_READ_WRITE_TOKEN": "vercel_blob_rw_teststore_secret",
+                "BLOB_STORE_ID": "",
+            },
+            clear=False,
+        ), mock.patch("app.urlopen", side_effect=fake_urlopen), mock.patch("app.time.sleep"):
+            result = backend.vercel_blob_read(descriptor, path)
+
+        self.assertEqual(result, b"ok")
+        self.assertEqual(len(requests), 2)
+
     def test_cleanup_removes_temp_files(self):
         blot = self.upload_blot()
         response = self.client.post(
@@ -260,6 +326,35 @@ class StatelessSessionBackendTests(unittest.TestCase):
             backend.parse_blot_created_at("#Fri May 15 16:38:05 PDT 2026"),
             "2026-05-15T23:38:05+00:00",
         )
+
+    def test_zip_channel_detection_uses_tif_filename_not_folder_name(self):
+        response = self.client.post(
+            "/upload-zip",
+            data={"sessionId": SESSION_ID, "file": (make_single_channel_zip(), "scanner.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        blot = response.get_json()["blots"][0]
+        self.assertFalse(blot["has700"])
+        self.assertTrue(blot["has800"])
+        self.assertNotIn("700", blot["files"])
+        self.assertIn("800", blot["files"])
+
+    def test_signal_extraction_clips_partial_boxes_without_sliding_roi(self):
+        arr = np.arange(30, dtype=np.float32).reshape(1, 30)
+        signal = backend.extract_box_signal(
+            arr,
+            {"x": -10, "y": 0, "w": 20, "h": 1},
+            "topbottom",
+        )
+        self.assertEqual(signal["rawSignal"], 45.0)
+        self.assertEqual(signal["x"], 0)
+        self.assertEqual(signal["w"], 10)
+
+    def test_signal_extraction_rejects_fully_outside_boxes(self):
+        arr = np.arange(9, dtype=np.float32).reshape(3, 3)
+        with self.assertRaises(backend.PublicError):
+            backend.extract_box_signal(arr, {"x": 5, "y": 0, "w": 2, "h": 2}, "leftright")
 
     def test_rejects_zip_traversal(self):
         archive = io.BytesIO()
@@ -282,6 +377,18 @@ class StatelessSessionBackendTests(unittest.TestCase):
         svg = base64.b64encode(b"<svg></svg>").decode("ascii")
         with self.assertRaises(backend.PublicError):
             backend.validate_data_url_size(f"data:image/svg+xml;base64,{svg}")
+
+    def test_pptx_export_rejects_invalid_png_data_urls(self):
+        with self.assertRaises(backend.PublicError):
+            backend.validate_data_url_size("data:image/png;base64,AAAA")
+
+    def test_pptx_export_rejects_unknown_slide_types(self):
+        with self.assertRaises(backend.PublicError):
+            backend.validate_pptx_payload([{"type": "image", "images": [], "graphs": []}])
+
+    def test_pptx_export_rejects_mixed_slide_contracts(self):
+        with self.assertRaises(backend.PublicError):
+            backend.validate_pptx_payload([{"type": "graphs", "images": [{"image": ""}], "graphs": []}])
 
 
 if __name__ == "__main__":

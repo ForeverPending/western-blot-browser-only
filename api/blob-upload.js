@@ -1,13 +1,30 @@
 import { issueSignedToken } from "@vercel/blob";
 import { handleUpload, handleUploadPresigned } from "@vercel/blob/client";
 
-const MAX_UPLOAD_BYTES = Number(process.env.MAX_ZIP_BYTES || process.env.MAX_ZIP_UPLOAD_BYTES || 250 * 1024 * 1024);
+const MAX_UPLOAD_ENV_KEYS = ["MAX_ZIP_BYTES", "MAX_ZIP_UPLOAD_BYTES"];
+const TOKEN_RATE_LIMIT_ENV_KEYS = ["BLOB_UPLOAD_TOKEN_RATE_LIMIT"];
+const DEFAULT_MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+const DEFAULT_TOKEN_WINDOW_LIMIT = 30;
 const MAX_TOKEN_BODY_BYTES = 64 * 1024;
 const TOKEN_WINDOW_MS = 60 * 1000;
-const TOKEN_WINDOW_LIMIT = Number(process.env.BLOB_UPLOAD_TOKEN_RATE_LIMIT || 30);
+const MAX_RATE_LIMIT_CLIENTS = 1000;
+const UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000;
+const MAX_UPLOAD_BYTES = positiveIntegerEnv(MAX_UPLOAD_ENV_KEYS, DEFAULT_MAX_UPLOAD_BYTES);
+const TOKEN_WINDOW_LIMIT = positiveIntegerEnv(TOKEN_RATE_LIMIT_ENV_KEYS, DEFAULT_TOKEN_WINDOW_LIMIT);
 const ALLOWED_UPLOAD_CONTENT_TYPES = ["application/zip", "application/x-zip-compressed", "application/octet-stream"];
 const uploadTokenHits = globalThis.__westernBlotUploadTokenHits || new Map();
 globalThis.__westernBlotUploadTokenHits = uploadTokenHits;
+
+function positiveIntegerEnv(names, fallback) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isInteger(value) && value > 0) return value;
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return fallback;
+}
 
 function logEvent(event, details = {}) {
   console.log(JSON.stringify({ event, ...details }));
@@ -25,10 +42,27 @@ function json(body, status = 200) {
 }
 
 function safeSessionId(value) {
-  return String(value || "")
+  if (typeof value !== "string") return "";
+  return value
     .replace(/[^A-Za-z0-9._-]+/g, "_")
     .replace(/^[._]+|[._]+$/g, "")
     .slice(0, 80);
+}
+
+function parseClientPayload(clientPayload) {
+  try {
+    return clientPayload ? JSON.parse(clientPayload) : {};
+  } catch (_error) {
+    throw new Error("Invalid upload payload.");
+  }
+}
+
+function sessionIdFromTokenPayload(tokenPayload) {
+  try {
+    return safeSessionId(JSON.parse(tokenPayload || "{}").sessionId);
+  } catch (_error) {
+    return "";
+  }
 }
 
 function requestIp(request) {
@@ -37,19 +71,29 @@ function requestIp(request) {
     .trim() || request.headers.get("x-real-ip") || "unknown";
 }
 
+function pruneUploadTokenHits(cutoff) {
+  for (const [entryKey, timestamps] of uploadTokenHits.entries()) {
+    const recent = timestamps
+      .filter((timestamp) => timestamp > cutoff)
+      .slice(-(TOKEN_WINDOW_LIMIT + 1));
+    if (recent.length) uploadTokenHits.set(entryKey, recent);
+    else uploadTokenHits.delete(entryKey);
+  }
+}
+
 function rateLimitUploadToken(request) {
   const now = Date.now();
   const cutoff = now - TOKEN_WINDOW_MS;
   const key = requestIp(request);
-  const hits = (uploadTokenHits.get(key) || []).filter((timestamp) => timestamp > cutoff);
-  hits.push(now);
-  uploadTokenHits.set(key, hits);
 
-  if (uploadTokenHits.size > 1000) {
-    for (const [entryKey, timestamps] of uploadTokenHits.entries()) {
-      if (!timestamps.some((timestamp) => timestamp > cutoff)) uploadTokenHits.delete(entryKey);
-    }
+  pruneUploadTokenHits(cutoff);
+  if (!uploadTokenHits.has(key) && uploadTokenHits.size >= MAX_RATE_LIMIT_CLIENTS) {
+    return false;
   }
+
+  const hits = uploadTokenHits.get(key) || [];
+  hits.push(now);
+  uploadTokenHits.set(key, hits.slice(-(TOKEN_WINDOW_LIMIT + 1)));
 
   return hits.length <= TOKEN_WINDOW_LIMIT;
 }
@@ -142,24 +186,47 @@ function logUploadPath(pathname) {
 
 async function handleBlobUploadRequest(request) {
   if (request.method === "GET") {
-    logEvent("blob_upload_status", {
-      blobAccess: blobAccess(),
-      hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
-      hasBlobWebhookPublicKey: Boolean(webhookPublicKey()),
-      maxUploadBytes: MAX_UPLOAD_BYTES,
-    });
-    return json({
-      status: "ok",
-      blobAccess: blobAccess(),
-      hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
-      hasBlobWebhookPublicKey: Boolean(webhookPublicKey()),
-      maxUploadBytes: MAX_UPLOAD_BYTES,
-    });
+    return blobUploadStatusResponse();
   }
 
-  if (request.method !== "POST") {
-    return json({ error: "Method not allowed." }, 405);
+  const rejection = validateBlobUploadRequest(request);
+  if (rejection) return rejection;
+
+  try {
+    const body = await request.json();
+    logEvent("blob_upload_request", { type: body?.type || "unknown" });
+    if (body?.type === "blob.generate-presigned-url" || body?.type === "blob.upload-completed") {
+      return handlePresignedBlobEvent(request, body);
+    }
+    return handleClientBlobEvent(request, body);
+  } catch (error) {
+    console.error("Blob upload setup failed.", error);
+    logEvent("blob_upload_error", {
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+    return json({ error: publicErrorMessage(error) }, 400);
   }
+}
+
+function blobUploadStatusResponse() {
+  const body = {
+    status: "ok",
+    blobAccess: blobAccess(),
+    hasBlobReadWriteToken: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+    hasBlobWebhookPublicKey: Boolean(webhookPublicKey()),
+    maxUploadBytes: MAX_UPLOAD_BYTES,
+  };
+  logEvent("blob_upload_status", {
+    blobAccess: body.blobAccess,
+    hasBlobReadWriteToken: body.hasBlobReadWriteToken,
+    hasBlobWebhookPublicKey: body.hasBlobWebhookPublicKey,
+    maxUploadBytes: body.maxUploadBytes,
+  });
+  return json(body);
+}
+
+function validateBlobUploadRequest(request) {
+  if (request.method !== "POST") return json({ error: "Method not allowed." }, 405);
   if (!process.env.BLOB_READ_WRITE_TOKEN) {
     logEvent("blob_upload_missing_token");
     return json({ error: "BLOB_READ_WRITE_TOKEN is not configured for this deployment." }, 500);
@@ -168,138 +235,121 @@ async function handleBlobUploadRequest(request) {
     logEvent("blob_upload_rate_limited");
     return json({ error: "Too many upload token requests." }, 429);
   }
+  return validateTokenBodyLength(request);
+}
 
-  const contentLength = Number(request.headers.get("content-length") || 0);
+function validateTokenBodyLength(request) {
+  const contentLengthHeader = request.headers.get("content-length");
+  if (contentLengthHeader === null) return null;
+
+  const contentLength = Number(contentLengthHeader);
+  if (!Number.isFinite(contentLength) || contentLength < 0) {
+    logEvent("blob_upload_invalid_content_length", { contentLength: contentLengthHeader });
+    return json({ error: "Invalid Content-Length header." }, 400);
+  }
   if (contentLength > MAX_TOKEN_BODY_BYTES) {
     logEvent("blob_upload_token_body_too_large", { contentLength });
     return json({ error: "Upload token request is too large." }, 413);
   }
+  return null;
+}
 
-  try {
-    const body = await request.json();
-    logEvent("blob_upload_request", { type: body?.type || "unknown" });
-    if (body?.type === "blob.generate-presigned-url" || body?.type === "blob.upload-completed") {
-      const response = await handleUploadPresigned({
-        body,
-        request,
-        webhookPublicKey: webhookPublicKey(),
-        async getSignedToken(pathname, clientPayload, multipart) {
-          let payload = {};
-          try {
-            payload = clientPayload ? JSON.parse(clientPayload) : {};
-          } catch (_error) {
-            throw new Error("Invalid upload payload.");
-          }
-
-          const sessionId = safeSessionId(payload.sessionId);
-          if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
-            logEvent("blob_upload_invalid_presigned_path", { pathname: logUploadPath(pathname), hasSessionId: Boolean(sessionId) });
-            throw new Error("Invalid upload path.");
-          }
-
-          logEvent("blob_upload_presigned_generated", {
-            access: blobAccess(),
-            callbackUrl: callbackUrl(request),
-            multipart: Boolean(multipart),
-            pathname: logUploadPath(pathname),
-            maximumSizeInBytes: MAX_UPLOAD_BYTES,
-          });
-
-          const token = await issueSignedToken({
-            token: process.env.BLOB_READ_WRITE_TOKEN,
-            pathname,
-            operations: ["put"],
-            validUntil: Date.now() + 15 * 60 * 1000,
-            allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
-            maximumSizeInBytes: MAX_UPLOAD_BYTES,
-          });
-
-          return {
-            token,
-            urlOptions: {
-              addRandomSuffix: false,
-              allowOverwrite: false,
-              allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
-              callbackUrl: callbackUrl(request),
-              maximumSizeInBytes: MAX_UPLOAD_BYTES,
-              tokenPayload: JSON.stringify({ sessionId }),
-            },
-          };
-        },
-        async onUploadCompleted({ blob, tokenPayload }) {
-          let sessionId = "";
-          try {
-            sessionId = JSON.parse(tokenPayload || "{}").sessionId || "";
-          } catch (_error) {
-            sessionId = "";
-          }
-          logEvent("blob_upload_presigned_completed", {
-            hasSessionId: Boolean(sessionId),
-            pathname: logUploadPath(blob?.pathname),
-            size: blob?.size,
-          });
-        },
+async function handlePresignedBlobEvent(request, body) {
+  const response = await handleUploadPresigned({
+    body,
+    request,
+    webhookPublicKey: webhookPublicKey(),
+    async getSignedToken(pathname, clientPayload, multipart) {
+      return signedTokenResponse(request, pathname, clientPayload, multipart, {
+        invalidPathEvent: "blob_upload_invalid_presigned_path",
+        generatedEvent: "blob_upload_presigned_generated",
+        includeToken: true,
       });
+    },
+    async onUploadCompleted({ blob, tokenPayload }) {
+      logUploadCompleted("blob_upload_presigned_completed", blob, tokenPayload);
+    },
+  });
 
-      logEvent("blob_upload_presigned_response", { type: response?.type || "unknown" });
-      return json(response);
-    }
+  logEvent("blob_upload_presigned_response", { type: response?.type || "unknown" });
+  return json(response);
+}
 
-    const response = await handleUpload({
-      body,
-      request,
-      async onBeforeGenerateToken(pathname, clientPayload, multipart) {
-        let payload = {};
-        try {
-          payload = clientPayload ? JSON.parse(clientPayload) : {};
-        } catch (_error) {
-          throw new Error("Invalid upload payload.");
-        }
+async function handleClientBlobEvent(request, body) {
+  const response = await handleUpload({
+    body,
+    request,
+    async onBeforeGenerateToken(pathname, clientPayload, multipart) {
+      return signedTokenResponse(request, pathname, clientPayload, multipart, {
+        invalidPathEvent: "blob_upload_invalid_path",
+        generatedEvent: "blob_upload_token_generated",
+        includeToken: false,
+      });
+    },
+    onUploadCompleted({ blob, tokenPayload }) {
+      logUploadCompleted("blob_upload_completed", blob, tokenPayload);
+    },
+  });
 
-        const sessionId = safeSessionId(payload.sessionId);
-        if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
-          logEvent("blob_upload_invalid_path", { pathname: logUploadPath(pathname), hasSessionId: Boolean(sessionId) });
-          throw new Error("Invalid upload path.");
-        }
+  logEvent("blob_upload_response", { type: response?.type || "unknown" });
+  return json(response);
+}
 
-        logEvent("blob_upload_token_generated", {
-          access: blobAccess(),
-          callbackUrl: callbackUrl(request),
-          multipart: Boolean(multipart),
-          pathname: logUploadPath(pathname),
-          maximumSizeInBytes: MAX_UPLOAD_BYTES,
-        });
-        return {
-          allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
-          callbackUrl: callbackUrl(request),
-          maximumSizeInBytes: MAX_UPLOAD_BYTES,
-          tokenPayload: JSON.stringify({ sessionId }),
-        };
-      },
-      onUploadCompleted({ blob, tokenPayload }) {
-        let sessionId = "";
-        try {
-          sessionId = JSON.parse(tokenPayload || "{}").sessionId || "";
-        } catch (_error) {
-          sessionId = "";
-        }
-        logEvent("blob_upload_completed", {
-          hasSessionId: Boolean(sessionId),
-          pathname: logUploadPath(blob?.pathname),
-          size: blob?.size,
-        });
-      },
-    });
+async function signedTokenResponse(request, pathname, clientPayload, multipart, events) {
+  const sessionId = uploadSessionId(pathname, clientPayload, events.invalidPathEvent);
+  const uploadOptions = signedUploadOptions(request, sessionId);
+  logEvent(events.generatedEvent, {
+    access: blobAccess(),
+    callbackUrl: uploadOptions.callbackUrl,
+    multipart: Boolean(multipart),
+    pathname: logUploadPath(pathname),
+    maximumSizeInBytes: MAX_UPLOAD_BYTES,
+  });
 
-    logEvent("blob_upload_response", { type: response?.type || "unknown" });
-    return json(response);
-  } catch (error) {
-    console.error("Blob upload setup failed.", error);
-    logEvent("blob_upload_error", {
-      message: error instanceof Error ? error.message : "Unknown error",
-    });
-    return json({ error: publicErrorMessage(error) }, 400);
+  if (!events.includeToken) return uploadOptions;
+  return {
+    token: await issueSignedToken({
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+      pathname,
+      operations: ["put"],
+      validUntil: Date.now() + UPLOAD_TOKEN_TTL_MS,
+      allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
+      maximumSizeInBytes: MAX_UPLOAD_BYTES,
+    }),
+    urlOptions: {
+      addRandomSuffix: false,
+      allowOverwrite: false,
+      ...uploadOptions,
+    },
+  };
+}
+
+function uploadSessionId(pathname, clientPayload, invalidPathEvent) {
+  const payload = parseClientPayload(clientPayload);
+  const sessionId = safeSessionId(payload.sessionId);
+  if (!sessionId || !isValidUploadPath(pathname, sessionId)) {
+    logEvent(invalidPathEvent, { pathname: logUploadPath(pathname), hasSessionId: Boolean(sessionId) });
+    throw new Error("Invalid upload path.");
   }
+  return sessionId;
+}
+
+function signedUploadOptions(request, sessionId) {
+  return {
+    allowedContentTypes: ALLOWED_UPLOAD_CONTENT_TYPES,
+    callbackUrl: callbackUrl(request),
+    maximumSizeInBytes: MAX_UPLOAD_BYTES,
+    tokenPayload: JSON.stringify({ sessionId }),
+  };
+}
+
+function logUploadCompleted(event, blob, tokenPayload) {
+  const sessionId = sessionIdFromTokenPayload(tokenPayload);
+  logEvent(event, {
+    hasSessionId: Boolean(sessionId),
+    pathname: logUploadPath(blob?.pathname),
+    size: blob?.size,
+  });
 }
 
 export function GET(request) {

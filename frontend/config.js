@@ -1,4 +1,4 @@
-const IS_LOCAL_FRONTEND = ["localhost", "127.0.0.1", "[::1]", ""].includes(window.location.hostname);
+const IS_LOCAL_FRONTEND = ["localhost", "127.0.0.1", "::1", "[::1]", ""].includes(window.location.hostname);
 
 const CONFIG = {
     BACKEND_URL: IS_LOCAL_FRONTEND ? "http://127.0.0.1:5001" : "/api",

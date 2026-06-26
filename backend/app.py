@@ -3,6 +3,7 @@ import io
 import json
 import re
 import hashlib
+import random
 import tempfile
 import time
 import uuid
@@ -165,6 +166,15 @@ MAX_PPTX_SLIDES = 40
 MAX_PPTX_GRAPHS = 120
 MAX_PPTX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PPTX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
+PPTX_IMAGE_SLIDE_TYPE = "images"
+PPTX_GRAPH_SLIDE_TYPE = "graphs"
+PPTX_SLIDE_TYPES = {PPTX_IMAGE_SLIDE_TYPE, PPTX_GRAPH_SLIDE_TYPE}
+PPTX_GRAPHS_PER_SLIDE = 4
+PPTX_MIMETYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+PPTX_DOWNLOAD_NAME = "western-blot-analysis.pptx"
+JPEG_MIMETYPE = "image/jpeg"
+TIFF_MIMETYPE = "image/tiff"
+PPTX_DATA_URL_PATTERN = re.compile(r"^data:image/(jpeg|jpg|png);base64,", re.IGNORECASE)
 BLOT_TIMEZONE_OFFSETS = {
     "UTC": 0,
     "GMT": 0,
@@ -399,7 +409,27 @@ def validate_vercel_blob_url(url, expected_path=None):
     return url
 
 
-def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None, api_request=False):
+def vercel_blob_retry_delay(base_delay, attempt):
+    return base_delay * (2 ** attempt) + random.uniform(0, base_delay)
+
+
+def log_vercel_blob_retry(method, url, attempt, retries, reason):
+    parsed = urlparse(url)
+    print(
+        json.dumps({
+            "event": "vercel_blob_request_retry",
+            "method": method,
+            "attempt": attempt + 1,
+            "maxAttempts": retries + 1,
+            "urlHost": parsed.hostname,
+            "urlPath": parsed.path,
+            "reason": reason,
+        }),
+        flush=True,
+    )
+
+
+def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None, api_request=False, retries=0, retry_delay=0.5):
     if api_request:
         validate_vercel_blob_api_url(url)
     else:
@@ -414,55 +444,71 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
     }
     if headers:
         request_headers.update(headers)
-    request = Request(url, data=body, headers=request_headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            if max_response_bytes is None:
-                response_body = response.read()
-            else:
-                response_body = response.read(max_response_bytes + 1)
-                if len(response_body) > max_response_bytes:
-                    raise PublicError("Temporary file exceeds the configured size limit.", 413)
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as error:
-        error_body = error.read(1024).decode("utf-8", "replace")
-        parsed = urlparse(url)
-        print(
-            json.dumps({
-                "event": "vercel_blob_request_error",
-                "method": method,
-                "status": error.code,
-                "reason": error.reason,
-                "urlHost": parsed.hostname,
-                "urlPath": parsed.path,
-                "response": error_body[:500],
-            }),
-            flush=True,
-        )
-        public_error = PublicError("Temporary Blob storage request failed.", 502)
-        public_error.blob_status = error.code
-        public_error.blob_response = error_body
-        raise public_error from error
-    except (URLError, TimeoutError) as error:
-        parsed = urlparse(url)
-        print(
-            json.dumps({
-                "event": "vercel_blob_request_error",
-                "method": method,
-                "urlHost": parsed.hostname,
-                "urlPath": parsed.path,
-                "error": str(error),
-            }),
-            flush=True,
-        )
-        public_error = PublicError("Temporary Blob storage request failed.", 502)
-        public_error.blob_response = str(error)
-        raise public_error from error
-    if not response_body:
-        return None
-    if "application/json" in content_type:
-        return json.loads(response_body.decode("utf-8"))
-    return response_body
+    retry_statuses = {429, 500, 502, 503, 504}
+
+    for attempt in range(retries + 1):
+        request = Request(url, data=body, headers=request_headers, method=method)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                if max_response_bytes is None:
+                    response_body = response.read()
+                else:
+                    response_body = response.read(max_response_bytes + 1)
+                    if len(response_body) > max_response_bytes:
+                        raise PublicError("Temporary file exceeds the configured size limit.", 413)
+                content_type = response.headers.get("Content-Type", "")
+        except HTTPError as error:
+            error_body = ""
+            try:
+                error_body = error.read(1024).decode("utf-8", "replace")
+            finally:
+                error.close()
+            parsed = urlparse(url)
+            print(
+                json.dumps({
+                    "event": "vercel_blob_request_error",
+                    "method": method,
+                    "status": error.code,
+                    "reason": error.reason,
+                    "urlHost": parsed.hostname,
+                    "urlPath": parsed.path,
+                    "response": error_body[:500],
+                }),
+                flush=True,
+            )
+            public_error = PublicError("Temporary Blob storage request failed.", 502)
+            public_error.blob_status = error.code
+            public_error.blob_response = error_body
+            if attempt < retries and error.code in retry_statuses:
+                log_vercel_blob_retry(method, url, attempt, retries, str(error.code))
+                time.sleep(vercel_blob_retry_delay(retry_delay, attempt))
+                continue
+            raise public_error from error
+        except (URLError, TimeoutError) as error:
+            parsed = urlparse(url)
+            print(
+                json.dumps({
+                    "event": "vercel_blob_request_error",
+                    "method": method,
+                    "urlHost": parsed.hostname,
+                    "urlPath": parsed.path,
+                    "error": str(error),
+                }),
+                flush=True,
+            )
+            public_error = PublicError("Temporary Blob storage request failed.", 502)
+            public_error.blob_response = str(error)
+            if attempt < retries:
+                log_vercel_blob_retry(method, url, attempt, retries, str(error))
+                time.sleep(vercel_blob_retry_delay(retry_delay, attempt))
+                continue
+            raise public_error from error
+        if not response_body:
+            return None
+        if "application/json" in content_type:
+            return json.loads(response_body.decode("utf-8"))
+        return response_body
+    raise PublicError("Temporary Blob storage request failed.", 502)
 
 
 def is_private_store_access_error(error):
@@ -514,7 +560,7 @@ def vercel_blob_put(path, file_bytes, content_type):
 def vercel_blob_read(descriptor, path, max_bytes=None):
     url = descriptor.get("downloadUrl") or descriptor.get("url")
     validate_vercel_blob_url(url, path)
-    return vercel_blob_request("GET", url, max_response_bytes=max_bytes)
+    return vercel_blob_request("GET", url, max_response_bytes=max_bytes, retries=2)
 
 
 def vercel_blob_delete(descriptor_paths):
@@ -527,7 +573,7 @@ def vercel_blob_delete(descriptor_paths):
         except PublicError:
             continue
     if not urls:
-        return
+        return 0
     body = json.dumps({"urls": urls}).encode("utf-8")
     vercel_blob_request(
         "POST",
@@ -535,7 +581,9 @@ def vercel_blob_delete(descriptor_paths):
         body=body,
         headers={"Content-Type": "application/json"},
         api_request=True,
+        retries=2,
     )
+    return len(urls)
 
 
 def store_temp_file(session_id, blot_id, filename, file_bytes, content_type):
@@ -577,21 +625,55 @@ def read_temp_file(descriptor, session_id=None, allow_uploads=False, max_bytes=N
 
 def delete_temp_files(descriptors, session_id=None, allow_uploads=False):
     checked_descriptors = []
+    invalid_count = 0
     for descriptor in descriptors:
         try:
             path = descriptor_path(descriptor, session_id, allow_uploads=allow_uploads)
             checked_descriptors.append((descriptor, path))
         except PublicError:
+            invalid_count += 1
             continue
     if not checked_descriptors:
+        if invalid_count:
+            app.logger.info(
+                "Temporary cleanup skipped %d invalid descriptor(s); no valid descriptors remained.",
+                invalid_count,
+            )
         return
     if USE_VERCEL_BLOB:
-        vercel_blob_delete(checked_descriptors)
+        deleted_count = vercel_blob_delete(checked_descriptors)
+        app.logger.info(
+            "Temporary cleanup requested=%d valid=%d deleted=%d invalid=%d backend=vercel-blob",
+            len(descriptors),
+            len(checked_descriptors),
+            deleted_count,
+            invalid_count,
+        )
         return
+    deleted_count = 0
+    missing_count = 0
     for _descriptor, path in checked_descriptors:
         full_path = local_temp_file_path(path)
         if os.path.exists(full_path):
             os.remove(full_path)
+            deleted_count += 1
+        else:
+            missing_count += 1
+    app.logger.info(
+        "Temporary cleanup requested=%d valid=%d deleted=%d missing=%d invalid=%d backend=local",
+        len(descriptors),
+        len(checked_descriptors),
+        deleted_count,
+        missing_count,
+        invalid_count,
+    )
+
+
+def delete_temp_files_safely(descriptors, session_id=None, allow_uploads=False, context="Temporary cleanup"):
+    try:
+        delete_temp_files(descriptors, session_id, allow_uploads=allow_uploads)
+    except Exception:
+        app.logger.exception("%s failed", context)
 
 
 def collect_blot_file_descriptors(blots):
@@ -714,7 +796,6 @@ def process_storage_upload():
             }),
             flush=True,
         )
-        delete_temp_files([upload_descriptor], session_id, allow_uploads=True)
         print(
             json.dumps({
                 "event": "process_upload_done",
@@ -746,6 +827,14 @@ def process_storage_upload():
         )
         app.logger.exception("Stored ZIP processing failed")
         return error_response(error, "ZIP import failed.")
+    finally:
+        if upload_descriptor:
+            delete_temp_files_safely(
+                [upload_descriptor],
+                session_id,
+                allow_uploads=True,
+                context="Stored ZIP upload cleanup",
+            )
 
 
 def is_valid_zip(file_bytes):
@@ -758,81 +847,167 @@ def enforce_zip_member_size(zf, filename, limit, message):
         raise PublicError(message, 413)
 
 
+def find_channel_tif(files, channel):
+    pattern = re.compile(rf"(^|[^0-9]){re.escape(channel)}([^0-9]|$)")
+    matches = [
+        filename
+        for filename in files
+        if os.path.basename(filename).lower().endswith((".tif", ".tiff"))
+        and pattern.search(os.path.basename(filename))
+    ]
+    if len(matches) > 1:
+        raise PublicError(f"Multiple {channel}nm TIF files were found in one blot folder.")
+    return matches[0] if matches else None
+
+
+def parse_blot_metadata(txt_content, folder):
+    lines = txt_content.splitlines()
+    remarks = next(
+        (
+            line.split("=", 1)[1].strip()
+            for line in lines
+            if line.strip().startswith("Remarks=")
+        ),
+        "",
+    )
+    blot_name = (remarks or folder)[:MAX_NAME_LENGTH] or "Untitled blot"
+    created_at = next(
+        (parsed for parsed in (parse_blot_created_at(line) for line in lines) if parsed),
+        None,
+    ) or now_iso()
+    return blot_name, created_at
+
+
+def zip_folders(zf):
+    folders = {}
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue
+        parts = name.split("/")
+        folder = parts[0] if len(parts) > 1 else "__root__"
+        folders.setdefault(folder, []).append(name)
+    return {folder: sorted(files) for folder, files in folders.items()}
+
+
+def blot_folder_members(files):
+    txt_file = next((f for f in files if f.lower().endswith(".txt")), None)
+    if not txt_file:
+        return None
+
+    members = {
+        "txt": txt_file,
+        "jpg": next((f for f in files if f.lower().endswith(".jpg") or f.lower().endswith(".jpeg")), None),
+        "700": find_channel_tif(files, "700"),
+        "800": find_channel_tif(files, "800"),
+    }
+    if members["700"] and members["800"] and members["700"] == members["800"]:
+        raise PublicError("A single TIF file cannot be used for both 700nm and 800nm channels.")
+    return members
+
+
+def log_blot_folder_parse(session_id, folder_index, members):
+    print(
+        json.dumps({
+            "event": "process_upload_parse_folder",
+            "sessionHash": log_token(session_id),
+            "folderIndex": folder_index,
+            "has700": members["700"] is not None,
+            "has800": members["800"] is not None,
+            "hasJpg": members["jpg"] is not None,
+        }),
+        flush=True,
+    )
+
+
+def enforce_blot_member_sizes(zf, members):
+    enforce_zip_member_size(zf, members["700"], MAX_TIF_BYTES, "A 700nm TIF exceeds the configured size limit.")
+    enforce_zip_member_size(zf, members["800"], MAX_TIF_BYTES, "An 800nm TIF exceeds the configured size limit.")
+    enforce_zip_member_size(zf, members["txt"], MAX_TEXT_BYTES, "Blot metadata text is too large.")
+    enforce_zip_member_size(zf, members["jpg"], MAX_JPEG_BYTES, "Blot preview image is too large.")
+
+
+def read_blot_member_bytes(zf, members):
+    jpg_bytes = zf.read(members["jpg"]) if members["jpg"] else None
+    tif_700_bytes = zf.read(members["700"]) if members["700"] else None
+    tif_800_bytes = zf.read(members["800"]) if members["800"] else None
+    validate_tif_pixels(tif_700_bytes, "700nm TIF")
+    validate_tif_pixels(tif_800_bytes, "800nm TIF")
+    return {
+        "jpg": jpg_bytes,
+        "700": tif_700_bytes,
+        "800": tif_800_bytes,
+    }
+
+
+def store_blot_files(session_id, blot_id, file_bytes):
+    files = {}
+    try:
+        jpg = store_temp_file(session_id, blot_id, "preview.jpg", file_bytes["jpg"], JPEG_MIMETYPE)
+        if jpg:
+            files["jpg"] = jpg
+        tif_700 = store_temp_file(session_id, blot_id, "700.tif", file_bytes["700"], TIFF_MIMETYPE)
+        if tif_700:
+            files["700"] = tif_700
+        tif_800 = store_temp_file(session_id, blot_id, "800.tif", file_bytes["800"], TIFF_MIMETYPE)
+        if tif_800:
+            files["800"] = tif_800
+        return files
+    except Exception:
+        delete_temp_files_safely(
+            list(files.values()),
+            session_id,
+            context="Partial blot file rollback cleanup",
+        )
+        raise
+
+
+def blot_record(blot_id, blot_name, created_at, members, files):
+    return {
+        "id": blot_id,
+        "name": blot_name,
+        "hasJpg": members["jpg"] is not None,
+        "has700": members["700"] is not None,
+        "has800": members["800"] is not None,
+        "scanCount": 0,
+        "createdAt": created_at,
+        "files": files,
+    }
+
+
+def parse_zip_folder(zf, folder, folder_index, files, session_id):
+    members = blot_folder_members(files)
+    if not members:
+        return None
+
+    log_blot_folder_parse(session_id, folder_index, members)
+    enforce_blot_member_sizes(zf, members)
+
+    txt_content = zf.read(members["txt"]).decode("utf-8", errors="ignore")
+    blot_name, created_at = parse_blot_metadata(txt_content, folder)
+    blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
+    stored_files = store_blot_files(session_id, blot_id, read_blot_member_bytes(zf, members))
+    return blot_record(blot_id, blot_name, created_at, members, stored_files)
+
+
 def parse_zip(file_bytes, session_id):
     blots = []
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-        validate_zip_archive(zf)
-        # Group files by folder
-        folders = {}
-        for name in zf.namelist():
-            if name.endswith("/"):
-                continue
-            parts = name.split("/")
-            folder = parts[0] if len(parts) > 1 else "__root__"
-            folders.setdefault(folder, []).append(name)
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            validate_zip_archive(zf)
+            folders = zip_folders(zf)
+            for folder_index, folder in enumerate(sorted(folders), start=1):
+                blot = parse_zip_folder(zf, folder, folder_index, folders[folder], session_id)
+                if blot:
+                    blots.append(blot)
 
-        for folder_index, (folder, files) in enumerate(folders.items(), start=1):
-            txt_file = next((f for f in files if f.lower().endswith(".txt")), None)
-            jpg_file = next((f for f in files if f.lower().endswith(".jpg") or f.lower().endswith(".jpeg")), None)
-            tif_700  = next((f for f in files if "700" in f and f.lower().endswith(".tif")), None)
-            tif_800  = next((f for f in files if "800" in f and f.lower().endswith(".tif")), None)
-
-            if not txt_file:
-                continue
-
-            print(
-                json.dumps({
-                    "event": "process_upload_parse_folder",
-                    "sessionHash": log_token(session_id),
-                    "folderIndex": folder_index,
-                    "has700": tif_700 is not None,
-                    "has800": tif_800 is not None,
-                    "hasJpg": jpg_file is not None,
-                }),
-                flush=True,
-            )
-
-            # Enforce per-file limits before loading archive members into memory.
-            enforce_zip_member_size(zf, tif_700, MAX_TIF_BYTES, "A 700nm TIF exceeds the configured size limit.")
-            enforce_zip_member_size(zf, tif_800, MAX_TIF_BYTES, "An 800nm TIF exceeds the configured size limit.")
-            enforce_zip_member_size(zf, txt_file, MAX_TEXT_BYTES, "Blot metadata text is too large.")
-            enforce_zip_member_size(zf, jpg_file, MAX_JPEG_BYTES, "Blot preview image is too large.")
-
-            # Parse blot name from last line of txt file
-            txt_content = zf.read(txt_file).decode("utf-8", errors="ignore")
-            lines = txt_content.strip().splitlines()
-            last_line = lines[-1] if lines else ""
-            blot_name = last_line.split("=", 1)[1].strip() if last_line.startswith("Remarks=") else folder
-            blot_name = blot_name[:MAX_NAME_LENGTH] or "Untitled blot"
-            created_at = parse_blot_created_at(lines[1] if len(lines) > 1 else None) or now_iso()
-
-            # Generate a unique unpredictable ID
-            blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
-
-            jpg_bytes = zf.read(jpg_file) if jpg_file else None
-            tif_700_bytes = zf.read(tif_700) if tif_700 else None
-            tif_800_bytes = zf.read(tif_800) if tif_800 else None
-            validate_tif_pixels(tif_700_bytes, "700nm TIF")
-            validate_tif_pixels(tif_800_bytes, "800nm TIF")
-
-            files = {
-                "jpg": store_temp_file(session_id, blot_id, "preview.jpg", jpg_bytes, "image/jpeg"),
-                "700": store_temp_file(session_id, blot_id, "700.tif", tif_700_bytes, "image/tiff"),
-                "800": store_temp_file(session_id, blot_id, "800.tif", tif_800_bytes, "image/tiff"),
-            }
-            files = {key: value for key, value in files.items() if value}
-            blots.append({
-                "id": blot_id,
-                "name": blot_name,
-                "hasJpg": jpg_file is not None,
-                "has700": tif_700 is not None,
-                "has800": tif_800 is not None,
-                "scanCount": 0,
-                "createdAt": created_at,
-                "files": files,
-            })
-
-    return blots
+        return blots
+    except Exception:
+        delete_temp_files_safely(
+            collect_blot_file_descriptors(blots),
+            session_id,
+            context="Parsed blot rollback cleanup",
+        )
+        raise
 
 
 class PublicError(Exception):
@@ -993,7 +1168,7 @@ def render_composite():
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=92)
         buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg")
+        return send_file(buf, mimetype=JPEG_MIMETYPE)
     except PublicError as error:
         return error_response(error, "Could not render blot image.")
     except Exception as error:
@@ -1093,14 +1268,18 @@ def read_validated_tif(tif_bytes):
 
 
 def extract_box_signal(arr, box, background_axis):
-    x = max(0, int(round(box["x"])))
-    y = max(0, int(round(box["y"])))
+    raw_x = int(round(box["x"]))
+    raw_y = int(round(box["y"]))
     w = max(1, int(round(box["w"])))
     h = max(1, int(round(box["h"])))
 
     img_h, img_w = arr.shape
-    x2 = min(x + w, img_w)
-    y2 = min(y + h, img_h)
+    x = max(0, raw_x)
+    y = max(0, raw_y)
+    x2 = min(raw_x + w, img_w)
+    y2 = min(raw_y + h, img_h)
+    if x2 <= x or y2 <= y:
+        raise PublicError("A selected box is outside the image bounds.")
 
     roi        = arr[y:y2, x:x2]
     raw_signal = float(np.sum(roi))
@@ -1141,7 +1320,7 @@ def extract_box_signal(arr, box, background_axis):
         "rawSignal": round(raw_signal, 2),
         "backgroundSignal": round(background_signal, 2),
         "adjustedSignal": round(adjusted_signal, 2),
-        "x": x, "y": y, "w": w, "h": h,
+        "x": x, "y": y, "w": x2 - x, "h": y2 - y,
     }
 
 
@@ -1181,51 +1360,59 @@ def cleanup_temp_files():
 @limiter.limit("10 per minute")
 def generate_pptx():
     try:
-        data        = request.get_json(silent=True) or {}
+        data = request.get_json(silent=True) or {}
         slides_data = data.get("slides", [])
         validate_pptx_payload(slides_data)
 
-        prs              = Presentation()
-        prs.slide_width  = Inches(10)
-        prs.slide_height = Inches(7.5)
-        blank_layout     = prs.slide_layouts[6]
-
-        # Separate image slides from graph slides
-        image_slide_data = next((s for s in slides_data if s.get("type") == "images"), None)
-        graph_slides     = [s for s in slides_data if s.get("type") == "graphs"]
-
-        # Build image slide first
-        if image_slide_data:
-            slide = prs.slides.add_slide(blank_layout)
-            build_image_slide(slide, image_slide_data, prs)
-
-        # Build graph slides, 4 per slide
-        for slide_data in graph_slides:
-            graphs   = slide_data.get("graphs", [])
-            title    = slide_data.get("title", "")
-            per_page = 4
-
-            for page_start in range(0, max(1, len(graphs)), per_page):
-                page_graphs = graphs[page_start:page_start + per_page]
-                slide       = prs.slides.add_slide(blank_layout)
-                build_graph_slide(slide, {
-                    "title":  title if page_start == 0 else f"{title} (cont.)",
-                    "graphs": page_graphs,
-                }, prs)
-
-        buf = io.BytesIO()
-        prs.save(buf)
-        buf.seek(0)
-        return send_file(
-            buf,
-            mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            as_attachment=True,
-            download_name="western-blot-analysis.pptx"
-        )
+        prs = create_pptx_presentation()
+        add_pptx_export_slides(prs, slides_data)
+        return send_pptx(prs)
 
     except Exception as error:
         app.logger.exception("PowerPoint generation failed")
         return error_response(error, "PowerPoint generation failed.")
+
+
+def create_pptx_presentation():
+    prs = Presentation()
+    prs.slide_width = Inches(10)
+    prs.slide_height = Inches(7.5)
+    return prs
+
+
+def add_pptx_export_slides(prs, slides_data):
+    blank_layout = prs.slide_layouts[6]
+    image_slide_data = next((s for s in slides_data if s.get("type") == PPTX_IMAGE_SLIDE_TYPE), None)
+    graph_slides = [s for s in slides_data if s.get("type") == PPTX_GRAPH_SLIDE_TYPE]
+
+    if image_slide_data:
+        build_image_slide(prs.slides.add_slide(blank_layout), image_slide_data, prs)
+
+    for slide_data in graph_slides:
+        for page_data in graph_slide_pages(slide_data):
+            build_graph_slide(prs.slides.add_slide(blank_layout), page_data, prs)
+
+
+def graph_slide_pages(slide_data):
+    graphs = slide_data.get("graphs", [])
+    title = slide_data.get("title", "")
+    for page_start in range(0, max(1, len(graphs)), PPTX_GRAPHS_PER_SLIDE):
+        yield {
+            "title": title if page_start == 0 else f"{title} (cont.)",
+            "graphs": graphs[page_start:page_start + PPTX_GRAPHS_PER_SLIDE],
+        }
+
+
+def send_pptx(prs):
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype=PPTX_MIMETYPE,
+        as_attachment=True,
+        download_name=PPTX_DOWNLOAD_NAME
+    )
 
 
 def validate_pptx_payload(slides_data):
@@ -1236,48 +1423,86 @@ def validate_pptx_payload(slides_data):
 
     graph_count = 0
     image_count = 0
+    image_slide_count = 0
     total_image_bytes = 0
     for slide in slides_data:
-        if not isinstance(slide, dict):
-            raise PublicError("Each slide must be an object.")
-        images = slide.get("images", [])
-        graphs = slide.get("graphs", [])
-        if not isinstance(images, list) or not isinstance(graphs, list):
-            raise PublicError("PowerPoint images and graphs must be lists.")
+        slide_type, images, graphs = pptx_slide_parts(slide)
+        image_slide_count = validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count)
         image_count += len(images)
         if image_count > MAX_PPTX_SLIDES:
             raise PublicError("Too many blot images in PowerPoint export.")
         graph_count += len(graphs)
-        for item in images:
-            if not isinstance(item, dict):
-                raise PublicError("Invalid blot image entry.")
-            total_image_bytes += validate_data_url_size(item.get("image", ""))
-            if len(str(item.get("label", ""))) > MAX_NAME_LENGTH:
-                raise PublicError("A PowerPoint image label is too long.")
-        for graph in graphs:
-            total_image_bytes += validate_data_url_size(graph)
+        total_image_bytes += validate_pptx_images(images)
+        total_image_bytes += validate_pptx_graphs(graphs)
     if graph_count > MAX_PPTX_GRAPHS:
         raise PublicError(f"Too many graphs. Maximum is {MAX_PPTX_GRAPHS}.")
     if total_image_bytes > MAX_PPTX_TOTAL_IMAGE_BYTES:
         raise PublicError("PowerPoint image data exceeds the total size limit.", 413)
 
 
+def pptx_slide_parts(slide):
+    if not isinstance(slide, dict):
+        raise PublicError("Each slide must be an object.")
+    slide_type = slide.get("type")
+    if slide_type not in PPTX_SLIDE_TYPES:
+        raise PublicError("PowerPoint slide type must be either images or graphs.")
+    images = slide.get("images", [])
+    graphs = slide.get("graphs", [])
+    if not isinstance(images, list) or not isinstance(graphs, list):
+        raise PublicError("PowerPoint images and graphs must be lists.")
+    return slide_type, images, graphs
+
+
+def validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count):
+    if slide_type == PPTX_IMAGE_SLIDE_TYPE:
+        image_slide_count += 1
+        if image_slide_count > 1:
+            raise PublicError("PowerPoint export supports one blot image slide.")
+        if graphs:
+            raise PublicError("PowerPoint image slides cannot include graph data.")
+    if slide_type == PPTX_GRAPH_SLIDE_TYPE and images:
+        raise PublicError("PowerPoint graph slides cannot include blot image data.")
+    return image_slide_count
+
+
+def validate_pptx_images(images):
+    total_image_bytes = 0
+    for item in images:
+        if not isinstance(item, dict):
+            raise PublicError("Invalid blot image entry.")
+        total_image_bytes += validate_data_url_size(item.get("image", ""))
+        if len(str(item.get("label", ""))) > MAX_NAME_LENGTH:
+            raise PublicError("A PowerPoint image label is too long.")
+    return total_image_bytes
+
+
+def validate_pptx_graphs(graphs):
+    return sum(validate_data_url_size(graph) for graph in graphs)
+
+
 def validate_data_url_size(value):
     if not isinstance(value, str):
         raise PublicError("Invalid image data.")
-    if not re.match(r"^data:image/(jpeg|jpg|png);base64,", value, re.IGNORECASE):
+    if not PPTX_DATA_URL_PATTERN.match(value):
         raise PublicError("Export images must be JPEG or PNG base64 data URLs.")
     encoded = value.split(",", 1)[-1]
     approx_bytes = (len(encoded) * 3) // 4
     if approx_bytes > MAX_PPTX_IMAGE_BYTES:
         raise PublicError("An exported image is too large for PowerPoint.")
-    return approx_bytes
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+        Image.open(io.BytesIO(image_bytes)).verify()
+    except Exception as error:
+        raise PublicError("Export image data is not a valid JPEG or PNG image.") from error
+    if len(image_bytes) > MAX_PPTX_IMAGE_BYTES:
+        raise PublicError("An exported image is too large for PowerPoint.")
+    return len(image_bytes)
 
 
-def add_image_from_base64(slide, b64_string, left, top, width, height):
-    img_bytes  = base64.b64decode(b64_string.split(",")[-1], validate=True)
-    img_stream = io.BytesIO(img_bytes)
-    slide.shapes.add_picture(img_stream, left, top, width, height)
+def add_image_from_data_url(slide, data_url, left, top, width, height):
+    image_bytes = base64.b64decode(data_url.split(",")[-1], validate=True)
+    image_stream = io.BytesIO(image_bytes)
+    slide.shapes.add_picture(image_stream, left, top, width, height)
 
 
 def add_label(slide, text, left, top, width, height, font_size=14, bold=False, align=PP_ALIGN.CENTER):
@@ -1308,24 +1533,24 @@ def build_image_slide(slide, slide_data, prs):
               margin, Inches(0.1), slide_w - margin * 2, Inches(0.35),
               font_size=18, bold=True)
 
-    n               = len(images)
-    total_label     = label_h * n
-    total_spacing   = spacing * (n - 1)
+    image_count     = len(images)
+    total_label     = label_h * image_count
+    total_spacing   = spacing * (image_count - 1)
     available_h     = slide_h - Inches(0.6) - total_label - total_spacing - margin
     full_img_w      = slide_w - margin * 2
     img_w           = full_img_w * 2 / 3
-    img_h           = available_h / n
+    img_h           = available_h / image_count
     left_x          = margin + (full_img_w - img_w) / 2
 
     current_y = Inches(0.6)
     for item in images:
-        b64   = item.get("image")
+        image_data_url = item.get("image")
         label = item.get("label", "")
-        if b64:
+        if image_data_url:
             try:
-                add_image_from_base64(slide, b64, left_x, current_y, img_w, img_h)
-            except Exception:
-                pass
+                add_image_from_data_url(slide, image_data_url, left_x, current_y, img_w, img_h)
+            except Exception as error:
+                raise PublicError("A PowerPoint blot image could not be inserted.") from error
         current_y += img_h
         add_label(slide, label, left_x, current_y, img_w, label_h,
                   font_size=12, bold=True, align=PP_ALIGN.CENTER)
@@ -1352,18 +1577,18 @@ def build_graph_slide(slide, slide_data, prs):
     img_w   = (slide_w - margin * 2 - padding * (cols - 1)) / cols
     img_h   = (slide_h - Inches(0.55) - margin - padding * (rows - 1)) / rows
 
-    for i, b64 in enumerate(graphs):
+    for i, graph_data_url in enumerate(graphs):
         if i >= cols * rows:
             break
         col = i % cols
         row = i // cols
         x   = margin + col * (img_w + padding)
         y   = Inches(0.55) + row * (img_h + padding)
-        if b64:
+        if graph_data_url:
             try:
-                add_image_from_base64(slide, b64, x, y, img_w, img_h)
-            except Exception:
-                pass
+                add_image_from_data_url(slide, graph_data_url, x, y, img_w, img_h)
+            except Exception as error:
+                raise PublicError("A PowerPoint graph image could not be inserted.") from error
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
