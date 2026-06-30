@@ -16,6 +16,8 @@ const CHART_JPEG_QUALITY = 0.95;
 const PPTX_JPEG_QUALITY = 0.92;
 const PPTX_IMAGE_SLIDE_TYPE = "images";
 const PPTX_GRAPH_SLIDE_TYPE = "graphs";
+const MAX_CANVAS_BOXES = 200;
+const MAX_WORKBOOK_EXPORT_ROWS = 50000;
 const SIGNAL_NUMBER_PATTERN = /^[+-]?(?:(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
 let runtimeConfigPromise = null;
 
@@ -57,6 +59,13 @@ const state = {
   pairedSets: [],
   pairedAnalyses: [],
   comparisonCustomGroups: [],
+};
+
+const blotState = {
+  blots: [],
+  activeBlotIndex: null,
+  scans: {},  // key: blotId, value: array of {proteinName, channel, backgroundAxis, lanes: [{name, signal}]}
+  scanById: {},
 };
 
 function delay(ms) {
@@ -174,11 +183,18 @@ const els = {
   comparisonResults: document.querySelector("#comparisonResults"),
   controlFile: document.querySelector("#controlFile"),
   controlFileName: document.querySelector("#controlFileName"),
+  controlProteinRow: document.querySelector("#controlProteinRow"),
   controlProtein: document.querySelector("#controlProtein"),
+  controlMappingGrid: document.querySelector("#controlMappingGrid"),
   controlSheet: document.querySelector("#controlSheet"),
   controlLaneColumn: document.querySelector("#controlLaneColumn"),
   controlSignalColumn: document.querySelector("#controlSignalColumn"),
+  normalizationLaneWrap: document.querySelector("#normalizationLaneWrap"),
   normalizationLane: document.querySelector("#normalizationLane"),
+  analysisReadiness: document.querySelector("#analysisReadiness"),
+  groupControlsPanel: document.querySelector("#groupControlsPanel"),
+  groupModeWrap: document.querySelector("#groupModeWrap"),
+  groupSizeWrap: document.querySelector("#groupSizeWrap"),
   groupMode: document.querySelector("#groupMode"),
   groupSize: document.querySelector("#groupSize"),
   groupToggleWrap: document.querySelector("#groupToggleWrap"),
@@ -189,6 +205,7 @@ const els = {
   chartTitle: document.querySelector("#chartTitle"),
   downloadChartButton: document.querySelector("#downloadChartButton"),
   downloadCsvButton: document.querySelector("#downloadCsvButton"),
+  downloadWorkbookButton: document.querySelector("#downloadWorkbookButton"),
   foldChart: document.querySelector("#foldChart"),
   resultTableBody: document.querySelector("#resultTableBody"),
   labelPanel: document.querySelector("#labelPanel"),
@@ -205,6 +222,7 @@ const els = {
   comparisonChartTitle: document.querySelector("#comparisonChartTitle"),
   comparisonChart: document.querySelector("#comparisonChart"),
   downloadComparisonChartButton: document.querySelector("#downloadComparisonChartButton"),
+  downloadComparisonWorkbookButton: document.querySelector("#downloadComparisonWorkbookButton"),
   comparisonGroupPanel: document.querySelector("#comparisonGroupPanel"),
   comparisonCustomGroupingPanel: document.querySelector("#comparisonCustomGroupingPanel"),
   comparisonCustomGroups: document.querySelector("#comparisonCustomGroups"),
@@ -217,18 +235,51 @@ let sharedSampleControls = [];
 let pairControls = [];
 
 els.analysisMode.addEventListener("change", switchMode);
-els.sampleCount.addEventListener("input", () => renderSharedSampleInputs(clampInteger(Number(els.sampleCount.value), 1, 12, 1)));
-els.pairCount.addEventListener("input", () => renderPairInputs(clampInteger(Number(els.pairCount.value), 2, 12, 2)));
-els.comparisonChartType.addEventListener("change", renderComparisonChart);
+els.sampleCount.addEventListener("input", () => {
+  invalidateAnalyses();
+  renderSharedSampleInputs(clampInteger(Number(els.sampleCount.value), 1, 12, 1));
+});
+els.pairCount.addEventListener("input", () => {
+  invalidateAnalyses();
+  renderPairInputs(clampInteger(Number(els.pairCount.value), 2, 12, 2));
+});
+els.comparisonChartType.addEventListener("change", () => {
+  renderComparisonChart();
+  renderWorkflowState();
+});
 els.controlFile.addEventListener("change", (event) => loadSharedControlFile(event));
-els.controlSheet.addEventListener("change", () => selectDatasetSheet(state.sharedControl, sharedControlControls(), els.controlSheet.value));
-els.controlLaneColumn.addEventListener("change", refreshNormalizationLanes);
+els.controlSheet.addEventListener("change", () => {
+  if (selectDatasetSheet(state.sharedControl, sharedControlControls(), els.controlSheet.value)) {
+    invalidateAnalyses();
+    refreshNormalizationLanes();
+  }
+});
+els.controlLaneColumn.addEventListener("change", () => {
+  invalidateAnalyses();
+  refreshNormalizationLanes();
+});
+els.controlSignalColumn.addEventListener("change", () => {
+  invalidateAnalyses();
+  refreshNormalizationLanes();
+});
 els.analyzeButton.addEventListener("click", runAnalysis);
+els.normalizationLane.addEventListener("change", () => {
+  invalidateAnalyses();
+  renderWorkflowState();
+});
 els.downloadChartButton.addEventListener("click", () => downloadCanvasJpeg(els.foldChart, currentSharedChartFilename()));
 els.downloadCsvButton.addEventListener("click", downloadSharedCsv);
+els.downloadWorkbookButton.addEventListener("click", downloadSharedWorkbook);
 els.downloadComparisonChartButton.addEventListener("click", () => downloadCanvasJpeg(els.comparisonChart, "common-lane-comparison.jpg"));
-els.enableGroupedGraphs.addEventListener("change", renderCurrentGrouping);
-els.groupMode.addEventListener("change", renderCurrentGrouping);
+els.downloadComparisonWorkbookButton.addEventListener("click", downloadComparisonWorkbook);
+els.enableGroupedGraphs.addEventListener("change", () => {
+  renderCurrentGrouping();
+  renderWorkflowState();
+});
+els.groupMode.addEventListener("change", () => {
+  renderCurrentGrouping();
+  renderWorkflowState();
+});
 els.groupSize.addEventListener("input", renderCurrentGrouping);
 els.labelEditor.addEventListener("input", updateSharedLaneLabel);
 els.sampleTabs.addEventListener("click", selectSampleTab);
@@ -248,6 +299,7 @@ document.querySelector("#generatePptxButton")?.addEventListener("click", generat
 renderSharedSampleInputs(1);
 renderPairInputs(2);
 drawEmptyChart(els.foldChart);
+renderWorkflowState();
 
 function createDatasetState() {
   return {
@@ -258,11 +310,14 @@ function createDatasetState() {
   };
 }
 
-function createAnalysisState(name, title, results) {
+function createAnalysisState(name, title, results, metadata = {}) {
   return {
     name,
     title,
     results,
+    normalizationLane: metadata.normalizationLane || "",
+    loadingControlAdjusted: metadata.loadingControlAdjusted !== false,
+    sources: Array.isArray(metadata.sources) ? metadata.sources : [],
     customGroups: createDefaultCustomGroups(results, analysisRowKey),
   };
 }
@@ -280,13 +335,12 @@ function switchMode() {
   state.mode = els.analysisMode.value;
   const isComparison = state.mode === "comparison";
   els.sharedWorkflow.hidden = isComparison;
-  els.sharedResults.hidden = isComparison;
   els.sharedCountWrap.hidden = isComparison;
   els.comparisonWorkflow.hidden = !isComparison;
-  els.comparisonResults.hidden = !isComparison;
   els.pairCountWrap.hidden = !isComparison;
   els.comparisonChartWrap.hidden = !isComparison;
   refreshNormalizationLanes();
+  renderWorkflowState();
   if (isComparison) renderComparisonChart();
 }
 
@@ -310,10 +364,19 @@ function renderSharedSampleInputs(count) {
   sharedSampleControls.forEach((controls, index) => {
     controls.file.addEventListener("change", (event) => loadSharedSampleFile(event, index));
     controls.sheet.addEventListener("change", () => {
-      selectDatasetSheet(state.sharedSamples[index], controls, controls.sheet.value);
+      if (selectDatasetSheet(state.sharedSamples[index], controls, controls.sheet.value)) {
+        invalidateAnalyses();
+        refreshNormalizationLanes();
+      }
+    });
+    controls.lane.addEventListener("change", () => {
+      invalidateAnalyses();
       refreshNormalizationLanes();
     });
-    controls.lane.addEventListener("change", refreshNormalizationLanes);
+    controls.signal.addEventListener("change", () => {
+      invalidateAnalyses();
+      refreshNormalizationLanes();
+    });
     hydrateDatasetControls(state.sharedSamples[index], controls);
   });
 
@@ -345,13 +408,13 @@ function sampleCardHtml(index) {
           <input data-shared-sample-file="${index}" type="file" accept=".xlsx,.xls,.csv,.tsv" />
           <span data-shared-sample-file-name="${index}">${escapeHtml(state.sharedSamples[index]?.fileLabel || "Choose Excel or CSV file")}</span>
         </label>
-        <div class="field-row">
+        <div class="field-row" data-dataset-details="sample-${index}"${datasetDetailsHiddenAttr(state.sharedSamples[index])}>
           <label>
             Protein name
             <input data-shared-sample-protein="${index}" type="text" placeholder="e.g. pERK" value="${escapeHtml(state.sharedSamples[index]?.proteinName || "")}" />
           </label>
         </div>
-        <div class="mapping-grid">
+        <div class="mapping-grid" data-dataset-details="sample-${index}"${datasetDetailsHiddenAttr(state.sharedSamples[index])}>
           <label>
             Sheet
             <select data-shared-sample-sheet="${index}"></select>
@@ -368,22 +431,7 @@ function sampleCardHtml(index) {
       </div>
 
       <div id="sampleBlot${index}" class="source-panel" hidden>
-        <div class="field-row">
-          <label>
-            Blot
-            <select data-blot-source-blot="sample-${index}" data-refresh-scan-role="sample" data-refresh-scan-index="${index}">
-              <option value="">-- Select blot --</option>
-            </select>
-          </label>
-        </div>
-        <div class="field-row">
-          <label>
-            Protein scan
-            <select data-blot-source-scan="sample-${index}">
-              <option value="">-- Select scan --</option>
-            </select>
-          </label>
-        </div>
+        ${blotSourceControlsHtml(`sample-${index}`, "sample", index)}
       </div>
     </div>
   `;
@@ -421,11 +469,33 @@ function renderPairInputs(count) {
     controls.sample.file.addEventListener("change", (event) => loadPairFile(event, index, "sample"));
     controls.control.file.addEventListener("change", (event) => loadPairFile(event, index, "control"));
     controls.sample.sheet.addEventListener("change", () => {
-      selectDatasetSheet(state.pairedSets[index].sample, controls.sample, controls.sample.sheet.value);
+      if (selectDatasetSheet(state.pairedSets[index].sample, controls.sample, controls.sample.sheet.value)) {
+        invalidateAnalyses();
+        refreshNormalizationLanes();
+      }
+    });
+    controls.control.sheet.addEventListener("change", () => {
+      if (selectDatasetSheet(state.pairedSets[index].control, controls.control, controls.control.sheet.value)) {
+        invalidateAnalyses();
+        refreshNormalizationLanes();
+      }
+    });
+    controls.sample.lane.addEventListener("change", () => {
+      invalidateAnalyses();
       refreshNormalizationLanes();
     });
-    controls.control.sheet.addEventListener("change", () => selectDatasetSheet(state.pairedSets[index].control, controls.control, controls.control.sheet.value));
-    controls.sample.lane.addEventListener("change", refreshNormalizationLanes);
+    controls.sample.signal.addEventListener("change", () => {
+      invalidateAnalyses();
+      refreshNormalizationLanes();
+    });
+    controls.control.lane.addEventListener("change", () => {
+      invalidateAnalyses();
+      refreshNormalizationLanes();
+    });
+    controls.control.signal.addEventListener("change", () => {
+      invalidateAnalyses();
+      refreshNormalizationLanes();
+    });
     hydrateDatasetControls(state.pairedSets[index].sample, controls.sample);
     hydrateDatasetControls(state.pairedSets[index].control, controls.control);
   });
@@ -465,7 +535,7 @@ function pairCardHtml(index) {
               <input data-pair-sample-file="${index}" type="file" accept=".xlsx,.xls,.csv,.tsv" />
               <span data-pair-sample-file-name="${index}">${escapeHtml(state.pairedSets[index]?.sample?.fileLabel || "Choose sample file")}</span>
             </label>
-            <div class="mapping-grid">
+            <div class="mapping-grid" data-dataset-details="pair-sample-${index}"${datasetDetailsHiddenAttr(state.pairedSets[index]?.sample)}>
               <label>Sheet<select data-pair-sample-sheet="${index}"></select></label>
               <label>Lane column<select data-pair-sample-lane="${index}"></select></label>
               <label>Signal column<select data-pair-sample-signal="${index}"></select></label>
@@ -473,22 +543,7 @@ function pairCardHtml(index) {
           </div>
 
           <div id="pairSampleBlot${index}" class="source-panel" hidden>
-            <div class="field-row">
-              <label>
-                Blot
-                <select data-blot-source-blot="pair-sample-${index}" data-refresh-scan-role="pair-sample" data-refresh-scan-index="${index}">
-                  <option value="">-- Select blot --</option>
-                </select>
-              </label>
-            </div>
-            <div class="field-row">
-              <label>
-                Protein scan
-                <select data-blot-source-scan="pair-sample-${index}">
-                  <option value="">-- Select scan --</option>
-                </select>
-              </label>
-            </div>
+            ${blotSourceControlsHtml(`pair-sample-${index}`, "pair-sample", index)}
           </div>
         </div>
         <div>
@@ -512,7 +567,7 @@ function pairCardHtml(index) {
               <input data-pair-control-file="${index}" type="file" accept=".xlsx,.xls,.csv,.tsv" />
               <span data-pair-control-file-name="${index}">${escapeHtml(state.pairedSets[index]?.control?.fileLabel || "Choose control file")}</span>
             </label>
-            <div class="mapping-grid">
+            <div class="mapping-grid" data-dataset-details="pair-control-${index}"${datasetDetailsHiddenAttr(state.pairedSets[index]?.control)}>
               <label>Sheet<select data-pair-control-sheet="${index}"></select></label>
               <label>Lane column<select data-pair-control-lane="${index}"></select></label>
               <label>Signal column<select data-pair-control-signal="${index}"></select></label>
@@ -520,22 +575,7 @@ function pairCardHtml(index) {
           </div>
 
           <div id="pairControlBlot${index}" class="source-panel" hidden>
-            <div class="field-row">
-              <label>
-                Blot
-                <select data-blot-source-blot="pair-control-${index}" data-refresh-scan-role="pair-control" data-refresh-scan-index="${index}">
-                  <option value="">-- Select blot --</option>
-                </select>
-              </label>
-            </div>
-            <div class="field-row">
-              <label>
-                Protein scan
-                <select data-blot-source-scan="pair-control-${index}">
-                  <option value="">-- Select scan --</option>
-                </select>
-              </label>
-            </div>
+            ${blotSourceControlsHtml(`pair-control-${index}`, "pair-control", index)}
           </div>
         </div>
       </div>
@@ -545,17 +585,25 @@ function pairCardHtml(index) {
 
 async function loadSharedSampleFile(event, index) {
   if (await loadDatasetFile(event, state.sharedSamples[index], sharedSampleControls[index])) {
+    invalidateAnalyses();
     refreshNormalizationLanes();
+    renderWorkflowState();
   }
 }
 
 async function loadSharedControlFile(event) {
-  await loadDatasetFile(event, state.sharedControl, sharedControlControls());
+  if (await loadDatasetFile(event, state.sharedControl, sharedControlControls())) {
+    invalidateAnalyses();
+    refreshNormalizationLanes();
+    renderWorkflowState();
+  }
 }
 
 async function loadPairFile(event, index, role) {
   if (await loadDatasetFile(event, state.pairedSets[index][role], pairControls[index][role])) {
+    invalidateAnalyses();
     refreshNormalizationLanes();
+    renderWorkflowState();
   }
 }
 
@@ -584,7 +632,10 @@ async function loadDatasetFile(event, dataset, controls) {
     populateColumnSelects(controls, dataset.headers);
     return true;
   } catch (error) {
-    showSharedError(`Could not read file. ${error.message}`);
+    clearDataset(dataset, controls);
+    invalidateAnalyses();
+    renderWorkflowState();
+    setWorkflowMessage(`Could not read file. ${error.message}`, "error");
     event.target.value = "";
     return false;
   }
@@ -697,10 +748,10 @@ function populateSheetSelect(select, workbook) {
 }
 
 function selectDatasetSheet(dataset, controls, sheetName) {
-  if (!dataset.workbook) return;
+  if (!dataset.workbook) return false;
   if (!dataset.workbook.sheetNames.includes(sheetName)) {
-    showSharedError("The selected sheet is no longer available in this workbook.");
-    return;
+    setWorkflowMessage("The selected sheet is no longer available in this workbook.", "error");
+    return false;
   }
   try {
     const rows = dataset.workbook.getRows(sheetName).filter((row) =>
@@ -712,8 +763,11 @@ function selectDatasetSheet(dataset, controls, sheetName) {
     dataset.rows = rows;
     dataset.headers = headers;
     populateColumnSelects(controls, dataset.headers);
+    return true;
   } catch (error) {
-    showSharedError(`Could not read sheet. ${error.message}`);
+    renderWorkflowState();
+    setWorkflowMessage(`Could not read sheet. ${error.message}`, "error");
+    return false;
   }
 }
 
@@ -722,6 +776,20 @@ function hydrateDatasetControls(dataset, controls) {
   populateSheetSelect(controls.sheet, dataset.workbook);
   controls.sheet.value = dataset.sheetName || dataset.workbook.sheetNames[0];
   populateColumnSelects(controls, dataset.headers);
+}
+
+function clearDataset(dataset, controls) {
+  dataset.workbook = null;
+  dataset.sheetName = "";
+  dataset.rows = [];
+  dataset.headers = [];
+  dataset.fileLabel = "";
+  dataset.proteinName = "";
+  if (controls?.fileName) controls.fileName.textContent = "Choose Excel or CSV file";
+  if (controls?.protein) controls.protein.value = "";
+  if (controls?.sheet) controls.sheet.innerHTML = "";
+  if (controls?.lane) controls.lane.innerHTML = "";
+  if (controls?.signal) controls.signal.innerHTML = "";
 }
 
 function collectHeaders(rows) {
@@ -762,37 +830,13 @@ function findHeader(headers, terms) {
 }
 
 function refreshNormalizationLanes() {
+  const readiness = workflowReadiness();
+  updateNormalizationOptions(readiness.commonLanes);
+  renderWorkflowState(readiness);
+}
+
+function updateNormalizationOptions(lanes) {
   const previous = els.normalizationLane.value;
-  let lanes = [];
-
-  if (state.mode === "comparison") {
-    const blotDataset = getBlotSourceDataset("pair-sample", 0);
-    if (blotDataset) {
-      lanes = blotDataset.rows.map((row, index) => normalizeLaneName(row.Name, index));
-    } else {
-      const source = state.pairedSets[0]?.sample;
-      const controls = pairControls[0]?.sample;
-      lanes = source && controls ? extractLaneNames(source, controls) : [];
-    }
-  } else {
-    // Check if sample 0 is using blot source mode
-    const blotPanel = document.getElementById("sampleBlot0");
-    const usingBlot = blotPanel && !blotPanel.hidden;
-
-    if (usingBlot) {
-      const blotSelect = document.querySelector(`[data-blot-source-blot="sample-0"]`);
-      const scanSelect = document.querySelector(`[data-blot-source-scan="sample-0"]`);
-      if (blotSelect?.value && scanSelect?.value !== "") {
-        const scan = findScanByRef(blotSelect.value, scanSelect.value);
-        lanes = scan ? scan.lanes.map(lane => lane.name) : [];
-      }
-    } else {
-      const source = state.sharedSamples[0];
-      const controls = sharedSampleControls[0];
-      lanes = source && controls ? extractLaneNames(source, controls) : [];
-    }
-  }
-
   els.normalizationLane.innerHTML = lanes
     .map((lane) => `<option value="${escapeHtml(lane)}">${escapeHtml(lane)}</option>`)
     .join("");
@@ -808,6 +852,291 @@ function extractLaneNames(dataset, controls) {
   const laneColumn = controls?.lane?.value;
   if (!dataset?.rows?.length || !laneColumn) return [];
   return dataset.rows.map((row, index) => normalizeLaneName(row[laneColumn], index)).filter(Boolean);
+}
+
+function hiddenAttr(hidden) {
+  return hidden ? " hidden" : "";
+}
+
+function datasetHasWorkbook(dataset) {
+  return Boolean(dataset?.workbook && Array.isArray(dataset.rows) && dataset.headers?.length);
+}
+
+function datasetDetailsHiddenAttr(dataset) {
+  return hiddenAttr(!datasetHasWorkbook(dataset));
+}
+
+function hasAvailableBlotScans() {
+  return blotState.blots.some((blot) => scansForBlot(blot.id).length > 0);
+}
+
+function blotSourceControlsHtml(sourceKey, refreshRole, refreshIndex) {
+  const hasScans = hasAvailableBlotScans();
+  return `
+    <p class="workflow-message" data-blot-empty-message="${sourceKey}"${hiddenAttr(hasScans)}>
+      Create and save a blot scan before using this source.
+    </p>
+    <div class="blot-source-fields" data-blot-source-fields="${sourceKey}"${hiddenAttr(!hasScans)}>
+      <div class="field-row">
+        <label>
+          Blot
+          <select data-blot-source-blot="${sourceKey}" data-refresh-scan-role="${refreshRole}" data-refresh-scan-index="${refreshIndex}">
+            <option value="">-- Select blot --</option>
+          </select>
+        </label>
+      </div>
+      <div class="field-row">
+        <label>
+          Protein scan
+          <select data-blot-source-scan="${sourceKey}">
+            <option value="">-- Select scan --</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  `;
+}
+
+function setWorkflowMessage(message, tone = "neutral") {
+  if (!els.analysisReadiness) return;
+  els.analysisReadiness.textContent = message || "";
+  els.analysisReadiness.classList.toggle("success", tone === "success");
+  els.analysisReadiness.classList.toggle("error", tone === "error");
+}
+
+function renderWorkflowState(readiness = workflowReadiness()) {
+  updateDatasetDetailVisibility();
+  updateBlotSourceFieldVisibility();
+  updateNormalizationOptions(readiness.commonLanes);
+
+  const hasSharedResults = state.mode === "shared" && state.sharedAnalyses.length > 0;
+  const hasComparisonResults = state.mode === "comparison" && state.pairedAnalyses.length > 0;
+  const hasCurrentResults = hasSharedResults || hasComparisonResults;
+
+  if (els.normalizationLaneWrap) els.normalizationLaneWrap.hidden = !readiness.dataReady;
+  els.sharedResults.hidden = !hasSharedResults;
+  els.comparisonResults.hidden = !hasComparisonResults;
+  els.groupControlsPanel.hidden = !hasCurrentResults;
+  if (els.groupModeWrap) els.groupModeWrap.hidden = !hasCurrentResults;
+  if (els.groupSizeWrap) els.groupSizeWrap.hidden = !hasCurrentResults;
+  if (els.groupToggleWrap) els.groupToggleWrap.hidden = !hasCurrentResults;
+
+  const tone = readiness.ready ? "success" : "error";
+  setWorkflowMessage(readiness.message, tone);
+}
+
+function updateDatasetDetailVisibility() {
+  if (els.controlProteinRow) els.controlProteinRow.hidden = !datasetHasWorkbook(state.sharedControl);
+  if (els.controlMappingGrid) els.controlMappingGrid.hidden = !datasetHasWorkbook(state.sharedControl);
+
+  state.sharedSamples.forEach((dataset, index) => {
+    document.querySelectorAll(`[data-dataset-details="sample-${index}"]`).forEach((element) => {
+      element.hidden = !datasetHasWorkbook(dataset);
+    });
+  });
+
+  state.pairedSets.forEach((pair, index) => {
+    ["sample", "control"].forEach((role) => {
+      document.querySelectorAll(`[data-dataset-details="pair-${role}-${index}"]`).forEach((element) => {
+        element.hidden = !datasetHasWorkbook(pair[role]);
+      });
+    });
+  });
+}
+
+function updateBlotSourceFieldVisibility() {
+  const hasScans = hasAvailableBlotScans();
+  document.querySelectorAll("[data-blot-source-fields]").forEach((element) => {
+    element.hidden = !hasScans;
+  });
+  document.querySelectorAll("[data-blot-empty-message]").forEach((element) => {
+    element.hidden = hasScans;
+  });
+}
+
+function workflowReadiness() {
+  const result = state.mode === "comparison"
+    ? comparisonWorkflowReadiness()
+    : sharedWorkflowReadiness();
+  if (!result.dataReady) return result;
+
+  const laneSets = result.sources.map((source) => new Set(source.lanes));
+  const commonLanes = laneSets.length
+    ? [...laneSets[0]].filter((lane) => laneSets.every((set) => set.has(lane)))
+    : [];
+  result.commonLanes = commonLanes;
+
+  if (!commonLanes.length) {
+    return {
+      ...result,
+      ready: false,
+      message: "No lane is present in every required source. Check lane names before analyzing.",
+    };
+  }
+
+  const adjustmentText = state.mode === "shared" && result.loadingControlAdjusted === false
+    ? " without loading control adjustment"
+    : "";
+  return {
+    ...result,
+    ready: true,
+    message: `Ready to analyze ${commonLanes.length} shared lane${commonLanes.length === 1 ? "" : "s"}${adjustmentText}.`,
+  };
+}
+
+function sharedWorkflowReadiness() {
+  const sources = [];
+  const control = optionalSharedControlReadiness();
+  if (!control.ready) return workflowBlocked(control.message);
+  if (control.source) sources.push(control.source);
+
+  for (let index = 0; index < state.sharedSamples.length; index += 1) {
+    const sample = sourceReadiness({
+      role: "sample",
+      index,
+      label: `Sample ${index + 1}`,
+      dataset: state.sharedSamples[index],
+      controls: sharedSampleControls[index],
+    });
+    if (!sample.ready) return workflowBlocked(sample.message);
+    sources.push(sample.source);
+  }
+
+  return {
+    dataReady: true,
+    ready: false,
+    message: "",
+    sources,
+    commonLanes: [],
+    loadingControlAdjusted: Boolean(control.source),
+  };
+}
+
+function optionalSharedControlReadiness() {
+  const label = "Loading control";
+  if (isBlotSourceActive("control", 0)) {
+    const blotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
+    const scanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
+    if (!blotSelect?.value || scanSelect?.value === "") {
+      return { ready: true, source: null };
+    }
+    return blotSourceReadiness("control", 0, label);
+  }
+
+  if (!datasetHasWorkbook(state.sharedControl)) {
+    return { ready: true, source: null };
+  }
+  return fileSourceReadiness(state.sharedControl, sharedControlControls(), label);
+}
+
+function comparisonWorkflowReadiness() {
+  const sources = [];
+  for (let index = 0; index < state.pairedSets.length; index += 1) {
+    for (const role of ["sample", "control"]) {
+      const status = sourceReadiness({
+        role: `pair-${role}`,
+        index,
+        label: `Pair ${index + 1} ${role}`,
+        dataset: state.pairedSets[index]?.[role],
+        controls: pairControls[index]?.[role],
+      });
+      if (!status.ready) return workflowBlocked(status.message);
+      sources.push(status.source);
+    }
+  }
+
+  return { dataReady: true, ready: false, message: "", sources, commonLanes: [] };
+}
+
+function workflowBlocked(message) {
+  return {
+    dataReady: false,
+    ready: false,
+    message,
+    sources: [],
+    commonLanes: [],
+  };
+}
+
+function sourceReadiness({ role, index, label, dataset, controls }) {
+  if (isBlotSourceActive(role, index)) {
+    return blotSourceReadiness(role, index, label);
+  }
+  return fileSourceReadiness(dataset, controls, label);
+}
+
+function fileSourceReadiness(dataset, controls, label) {
+  if (!datasetHasWorkbook(dataset)) {
+    return { ready: false, message: `Upload ${label.toLowerCase()} data to continue.` };
+  }
+  if (!controls?.lane?.value || !controls?.signal?.value) {
+    return { ready: false, message: `Choose lane and signal columns for ${label.toLowerCase()}.` };
+  }
+  try {
+    const rows = buildRows(dataset, controls, label);
+    if (!rows.length) {
+      return { ready: false, message: `${label} needs readable lanes and signals.` };
+    }
+    assertUniqueLanes(rows, label);
+    return sourceReady(label, rows);
+  } catch (error) {
+    return { ready: false, message: error.message };
+  }
+}
+
+function blotSourceReadiness(role, index, label) {
+  if (!hasAvailableBlotScans()) {
+    return { ready: false, message: "Create and save a blot scan before using blot data." };
+  }
+  const blotSelect = document.querySelector(`[data-blot-source-blot="${role}-${index}"]`);
+  const scanSelect = document.querySelector(`[data-blot-source-scan="${role}-${index}"]`);
+  if (!blotSelect?.value || scanSelect?.value === "") {
+    return { ready: false, message: `Select a blot and scan for ${label.toLowerCase()}.` };
+  }
+  const dataset = scanToDataset(blotSelect.value, scanSelect.value);
+  if (!dataset) {
+    return { ready: false, message: `${label}'s selected blot scan is no longer available.` };
+  }
+  return fileSourceReadiness(dataset, blotDatasetControls(), label);
+}
+
+function sourceReady(label, rows) {
+  return {
+    ready: true,
+    source: {
+      label,
+      rows,
+      lanes: rows.map((row) => row.lane),
+    },
+  };
+}
+
+function invalidateAnalyses() {
+  state.sharedAnalyses = [];
+  state.pairedAnalyses = [];
+  state.comparisonCustomGroups = [];
+  state.activeSampleIndex = 0;
+
+  els.sampleTabsPanel.hidden = true;
+  els.sampleTabs.innerHTML = "";
+  els.downloadChartButton.disabled = true;
+  els.downloadCsvButton.disabled = true;
+  els.downloadWorkbookButton.disabled = true;
+  els.downloadComparisonChartButton.disabled = true;
+  els.downloadComparisonWorkbookButton.disabled = true;
+  els.labelPanel.hidden = true;
+  els.groupPanel.hidden = true;
+  els.comparisonLabelPanel.hidden = true;
+  els.comparisonChartPanel.hidden = true;
+  els.comparisonGroupPanel.hidden = true;
+  els.comparisonCustomGroupingPanel.hidden = true;
+  document.getElementById("pptxPanel").hidden = true;
+
+  els.chartTitle.textContent = "Upload files to begin";
+  els.comparisonChartTitle.textContent = "Comparison graph";
+  els.resultTableBody.innerHTML = `<tr><td colspan="4">No analysis yet.</td></tr>`;
+  drawEmptyChart(els.foldChart);
+  drawEmptyChart(els.comparisonChart);
 }
 
 function blotDatasetControls() {
@@ -837,6 +1166,8 @@ function getBlotSourceDataset(role, index) {
 
 function getPairAnalysisSource(index, role) {
   if (isBlotSourceActive(`pair-${role}`, index)) {
+    const blotSelect = document.querySelector(`[data-blot-source-blot="pair-${role}-${index}"]`);
+    const scanSelect = document.querySelector(`[data-blot-source-scan="pair-${role}-${index}"]`);
     const blotDataset = getBlotSourceDataset(`pair-${role}`, index);
     if (!blotDataset) {
       throw new Error(`Pair ${index + 1} ${role} needs a selected blot scan.`);
@@ -844,16 +1175,30 @@ function getPairAnalysisSource(index, role) {
     return {
       dataset: blotDataset,
       controls: blotDatasetControls(),
+      label: blotDataset.proteinName || `Pair ${index + 1} ${role}`,
+      sourceType: "blot",
+      blotId: blotSelect?.value || "",
+      scanId: scanSelect?.value || "",
     };
   }
 
   return {
     dataset: state.pairedSets[index][role],
     controls: pairControls[index][role],
+    label: role === "sample"
+      ? pairControls[index].sample.label.value.trim() || `Sample ${index + 1}`
+      : `Pair ${index + 1} control`,
+    sourceType: "file",
   };
 }
 
 function runAnalysis() {
+  renderWorkflowState();
+  const readiness = workflowReadiness();
+  if (!readiness.ready) {
+    setWorkflowMessage(readiness.message, "error");
+    return;
+  }
   if (state.mode === "comparison") {
     runComparisonAnalysis();
   } else {
@@ -872,18 +1217,22 @@ function renderCurrentGrouping() {
 function runSharedAnalysis() {
   try {
     const controlSource = getSharedControlSource();
-    const controlRows = buildSharedRows(controlSource, controlSource.label);
-    if (!controlRows.length) throw new Error("The control needs readable lanes and signals.");
+    const controlRows = controlSource ? buildSharedRows(controlSource, controlSource.label) : null;
+    if (controlSource && !controlRows.length) throw new Error("The control needs readable lanes and signals.");
+    const normalizationLane = els.normalizationLane.value;
 
     state.sharedAnalyses = state.sharedSamples.map((sampleDataset, index) =>
-      buildSharedAnalysis(sampleDataset, index, controlSource.label, controlRows)
+      buildSharedAnalysis(sampleDataset, index, controlSource, controlRows, normalizationLane)
     );
 
     state.activeSampleIndex = Math.min(state.activeSampleIndex, state.sharedAnalyses.length - 1);
     renderSampleTabs();
     renderActiveSharedAnalysis();
+    renderWorkflowState();
   } catch (error) {
     showSharedError(error.message);
+    renderWorkflowState();
+    setWorkflowMessage(error.message, "error");
   }
 }
 
@@ -893,15 +1242,17 @@ function getSharedControlSource() {
   const usingBlot = blotSelect && !document.getElementById("controlBlot0")?.hidden;
 
   if (!usingBlot) {
+    if (!datasetHasWorkbook(state.sharedControl)) return null;
     return {
       dataset: state.sharedControl,
       controls: sharedControlControls(),
       label: els.controlProtein.value.trim() || "Loading control",
+      sourceType: "file",
     };
   }
 
   if (!blotSelect.value || scanSelect.value === "") {
-    throw new Error("Select a loading control blot scan.");
+    return null;
   }
   const dataset = scanToDataset(blotSelect.value, scanSelect.value);
   if (!dataset) throw new Error("The selected loading control scan is no longer available.");
@@ -909,6 +1260,9 @@ function getSharedControlSource() {
     dataset,
     controls: blotDatasetControls(),
     label: dataset.proteinName,
+    sourceType: "blot",
+    blotId: blotSelect.value,
+    scanId: scanSelect.value,
   };
 }
 
@@ -923,6 +1277,7 @@ function getSharedSampleSource(sampleDataset, index) {
       dataset: sampleDataset,
       controls,
       label: controls.protein.value.trim() || `Sample ${index + 1}`,
+      sourceType: "file",
     };
   }
 
@@ -935,6 +1290,9 @@ function getSharedSampleSource(sampleDataset, index) {
     dataset,
     controls: blotDatasetControls(),
     label: dataset.proteinName,
+    sourceType: "blot",
+    blotId: blotSelect.value,
+    scanId: scanSelect.value,
   };
 }
 
@@ -942,22 +1300,57 @@ function buildSharedRows(source, label) {
   return buildRows(source.dataset, source.controls, label);
 }
 
-function buildSharedAnalysis(sampleDataset, index, controlLabel, controlRows) {
+function analysisSourceSnapshot({ mode, role, index, source, rows }) {
+  return {
+    mode,
+    role,
+    index,
+    label: source.label || role,
+    sourceType: source.sourceType || "file",
+    fileLabel: source.dataset?.fileLabel || "",
+    sheetName: source.dataset?.sheetName || "",
+    blotId: source.blotId || "",
+    scanId: source.scanId || "",
+    rows: rows.map((row, rowIndex) => ({
+      rowIndex: rowIndex + 1,
+      lane: row.lane,
+      displayLane: row.displayLane || row.lane,
+      signal: row.signal,
+    })),
+  };
+}
+
+function buildSharedAnalysis(sampleDataset, index, controlSource, controlRows, normalizationLane) {
   const sampleSource = getSharedSampleSource(sampleDataset, index);
   const sampleRows = buildSharedRows(sampleSource, sampleSource.label);
   if (!sampleRows.length) throw new Error(`Sample ${index + 1} needs readable lanes and signals.`);
 
   sampleDataset.proteinName = sampleSource.label;
-  const title = `${sampleSource.label} - ${controlLabel} fold change`;
+  const controlLabel = controlSource?.label || "";
+  const title = controlSource
+    ? `${sampleSource.label} - ${controlLabel} fold change`
+    : `${sampleSource.label} fold change`;
+  const sources = [
+    analysisSourceSnapshot({ mode: "Shared control", role: "Sample", index: index + 1, source: sampleSource, rows: sampleRows }),
+  ];
+  if (controlSource) {
+    sources.unshift(analysisSourceSnapshot({ mode: "Shared control", role: "Control", index: 1, source: controlSource, rows: controlRows }));
+  }
   return createAnalysisState(
     sampleSource.label,
     title,
-    computeFoldChange(sampleRows, controlRows, els.normalizationLane.value, sampleSource.label, controlLabel)
+    computeFoldChange(sampleRows, controlRows, normalizationLane, sampleSource.label, controlLabel),
+    {
+      normalizationLane,
+      loadingControlAdjusted: Boolean(controlSource),
+      sources,
+    },
   );
 }
 
 function runComparisonAnalysis() {
   try {
+    const normalizationLane = els.normalizationLane.value;
     state.pairedAnalyses = state.pairedSets.map((pair, index) => {
       const sampleSource = getPairAnalysisSource(index, "sample");
       const controlSource = getPairAnalysisSource(index, "control");
@@ -972,7 +1365,14 @@ function runComparisonAnalysis() {
       return createAnalysisState(
         label,
         label,
-        computeFoldChange(sampleRows, controlRows, els.normalizationLane.value, `${label} sample`, `${label} control`)
+        computeFoldChange(sampleRows, controlRows, normalizationLane, `${label} sample`, `${label} control`),
+        {
+          normalizationLane,
+          sources: [
+            analysisSourceSnapshot({ mode: "Pairs", role: "Sample", index: index + 1, source: { ...sampleSource, label }, rows: sampleRows }),
+            analysisSourceSnapshot({ mode: "Pairs", role: "Control", index: index + 1, source: controlSource, rows: controlRows }),
+          ],
+        },
       );
     });
     state.comparisonCustomGroups = createDefaultCustomGroups(buildComparisonRows(), comparisonRowKey);
@@ -982,12 +1382,18 @@ function runComparisonAnalysis() {
     els.comparisonLabelPanel.hidden = false;
     els.comparisonChartPanel.hidden = false;
     els.downloadComparisonChartButton.disabled = !chartOk;
+    els.downloadComparisonWorkbookButton.disabled = !chartOk;
+    renderWorkflowState();
   } catch (error) {
+    state.pairedAnalyses = [];
     els.comparisonChartTitle.innerHTML = `<span class="error-text">${escapeHtml(error.message)}</span>`;
     els.comparisonLabelPanel.hidden = true;
     els.comparisonChartPanel.hidden = false;
     els.downloadComparisonChartButton.disabled = true;
+    els.downloadComparisonWorkbookButton.disabled = true;
     drawEmptyChart(els.comparisonChart);
+    renderWorkflowState();
+    setWorkflowMessage(error.message, "error");
   }
 }
 
@@ -1025,25 +1431,42 @@ function assertUniqueLanes(rows, label) {
 
 function computeFoldChange(sampleRows, controlRows, normalizationLane, sampleLabel = "Sample", controlLabel = "Control") {
   assertUniqueLanes(sampleRows, sampleLabel);
-  assertUniqueLanes(controlRows, controlLabel);
+  const hasControlRows = Array.isArray(controlRows) && controlRows.length > 0;
+  if (hasControlRows) assertUniqueLanes(controlRows, controlLabel);
 
   const sampleMap = new Map(sampleRows.map((row) => [row.lane, row]));
-  const controlMap = new Map(controlRows.map((row) => [row.lane, row]));
+  const controlMap = hasControlRows ? new Map(controlRows.map((row) => [row.lane, row])) : new Map();
   const baselineSample = sampleMap.get(normalizationLane);
-  const baselineControl = controlMap.get(normalizationLane);
+  const baselineControl = hasControlRows ? controlMap.get(normalizationLane) : null;
 
-  if (!baselineSample || !baselineControl) {
-    throw new Error("The normalization lane must exist in every sample and control file.");
+  if (!baselineSample || (hasControlRows && !baselineControl)) {
+    throw new Error(hasControlRows
+      ? "The normalization lane must exist in every sample and control file."
+      : "The normalization lane must exist in every sample file.");
   }
-  if (baselineSample.signal === 0 || baselineControl.signal === 0) {
-    throw new Error("The normalization lane must have non-zero sample and control signals.");
+  if (baselineSample.signal === 0 || (hasControlRows && baselineControl.signal === 0)) {
+    throw new Error(hasControlRows
+      ? "The normalization lane must have non-zero sample and control signals."
+      : "The normalization lane must have a non-zero sample signal.");
   }
 
   return sampleRows.map((sampleRow) => {
+    const samplePercent = (sampleRow.signal / baselineSample.signal) * 100;
+    if (!hasControlRows) {
+      return {
+        lane: sampleRow.lane,
+        displayLane: sampleRow.displayLane,
+        sampleSignal: sampleRow.signal,
+        controlSignal: null,
+        samplePercent,
+        controlPercent: null,
+        foldChange: samplePercent / 100,
+      };
+    }
+
     const controlRow = controlMap.get(sampleRow.lane);
     if (!controlRow) throw new Error(`No matching control lane found for "${sampleRow.lane}".`);
 
-    const samplePercent = (sampleRow.signal / baselineSample.signal) * 100;
     const controlPercent = (controlRow.signal / baselineControl.signal) * 100;
     if (controlPercent === 0) throw new Error(`Control lane "${sampleRow.lane}" has a zero normalized signal.`);
 
@@ -1094,8 +1517,10 @@ function renderActiveSharedAnalysis() {
   renderGroupedGraphs();
   els.downloadChartButton.disabled = false;
   els.downloadCsvButton.disabled = false;
+  els.downloadWorkbookButton.disabled = false;
   els.labelPanel.hidden = false;
   document.getElementById("pptxPanel").hidden = false;
+  renderWorkflowState();
 }
 
 function drawEmptyChart(canvas) {
@@ -1512,6 +1937,7 @@ function renderComparisonChart() {
     }
 
     els.downloadComparisonChartButton.disabled = false;
+    els.downloadComparisonWorkbookButton.disabled = false;
     renderComparisonGroupedGraphs(rows);
     return true;
   } catch (error) {
@@ -1520,6 +1946,7 @@ function renderComparisonChart() {
     els.comparisonGroupPanel.hidden = true;
     els.comparisonCustomGroupingPanel.hidden = true;
     els.downloadComparisonChartButton.disabled = true;
+    els.downloadComparisonWorkbookButton.disabled = true;
     return false;
   }
 }
@@ -1783,6 +2210,374 @@ function downloadSharedCsv() {
   URL.revokeObjectURL(url);
 }
 
+function downloadSharedWorkbook() {
+  if (!state.sharedAnalyses.length || !ensureWorkbookExporter()) return;
+  if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.sharedAnalyses))) return;
+  try {
+    const workbook = XLSX.utils.book_new();
+    const usedSheetNames = new Set();
+    appendWorkbookSheet(workbook, usedSheetNames, "Summary", sharedWorkbookSummaryRows());
+    appendWorkbookSheet(workbook, usedSheetNames, "Fold changes", sharedWorkbookResultRows());
+    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", sharedWorkbookInputRows());
+
+    const groupRows = sharedWorkbookGroupRows();
+    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
+
+    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.sharedAnalyses));
+    downloadWorkbookFile(workbook, "western-blot-shared-analysis.xlsx");
+  } catch (error) {
+    alert(`Workbook export failed: ${error.message}`);
+  }
+}
+
+function downloadComparisonWorkbook() {
+  if (!state.pairedAnalyses.length || !ensureWorkbookExporter()) return;
+  if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.pairedAnalyses))) return;
+  try {
+    const workbook = XLSX.utils.book_new();
+    const usedSheetNames = new Set();
+    appendWorkbookSheet(workbook, usedSheetNames, "Summary", comparisonWorkbookSummaryRows());
+    appendWorkbookSheet(workbook, usedSheetNames, "Common lanes", comparisonWorkbookCommonRows());
+    appendWorkbookSheet(workbook, usedSheetNames, "Pair fold changes", comparisonWorkbookPairRows());
+    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", comparisonWorkbookInputRows());
+
+    const groupRows = comparisonWorkbookGroupRows();
+    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
+
+    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.pairedAnalyses));
+    downloadWorkbookFile(workbook, "western-blot-comparison-analysis.xlsx");
+  } catch (error) {
+    alert(`Workbook export failed: ${error.message}`);
+  }
+}
+
+function downloadScanAuditWorkbook(blotId, scanIndex) {
+  if (!ensureWorkbookExporter()) return;
+  const blot = blotById(blotId);
+  const scan = scansForBlot(blotId)[scanIndex];
+  if (!blot || !scan) return;
+
+  try {
+    const workbook = XLSX.utils.book_new();
+    const usedSheetNames = new Set();
+    appendWorkbookSheet(workbook, usedSheetNames, "Scan metadata", scanMetadataRows({ blotId, scanId: scan.id }));
+    appendWorkbookSheet(workbook, usedSheetNames, "Extraction audit", scanAuditRows({ blotId, scanId: scan.id }));
+    downloadWorkbookFile(workbook, `${filenameSafe(blot.name)}-${filenameSafe(scan.proteinName)}-audit.xlsx`);
+  } catch (error) {
+    alert(`Audit export failed: ${error.message}`);
+  }
+}
+
+function ensureWorkbookExporter() {
+  if (window.XLSX?.utils?.book_new && window.XLSX?.writeFile) return true;
+  alert("The Excel exporter has not loaded yet. Check the network connection and retry.");
+  return false;
+}
+
+function ensureWorkbookRowBudget(rowCount) {
+  if (rowCount <= MAX_WORKBOOK_EXPORT_ROWS) return true;
+  alert(`Workbook export is too large (${rowCount.toLocaleString()} rows). Reduce inputs or export smaller pieces before trying again.`);
+  return false;
+}
+
+function estimateWorkbookRows(analyses) {
+  const resultRows = analyses.reduce((total, analysis) => total + analysis.results.length, 0);
+  const inputRows = analyses.reduce(
+    (total, analysis) => total + (analysis.sources || []).reduce((sourceTotal, source) => sourceTotal + source.rows.length, 0),
+    0,
+  );
+  const scanAuditRowsCount = scanAuditRows({ refs: scanRefsForAnalyses(analyses) }).length;
+  return resultRows + inputRows + scanAuditRowsCount + 32;
+}
+
+function appendWorkbookSheet(workbook, usedSheetNames, name, rows) {
+  const safeRows = sanitizeWorkbookRows(rows.length ? rows : [{ Note: "No data" }]);
+  const worksheet = XLSX.utils.json_to_sheet(safeRows);
+  XLSX.utils.book_append_sheet(workbook, worksheet, uniqueSheetName(name, usedSheetNames));
+}
+
+function uniqueSheetName(name, usedSheetNames) {
+  const base = String(name || "Sheet")
+    .replace(/[\[\]*?/\\:]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 31) || "Sheet";
+  let candidate = base;
+  let index = 2;
+  while (usedSheetNames.has(candidate)) {
+    const suffix = ` ${index}`;
+    candidate = `${base.slice(0, 31 - suffix.length)}${suffix}`;
+    index += 1;
+  }
+  usedSheetNames.add(candidate);
+  return candidate;
+}
+
+function sanitizeWorkbookRows(rows) {
+  return rows.map((row) =>
+    Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [key, workbookCell(value)]),
+    ),
+  );
+}
+
+function workbookCell(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" && /^\s*[=+\-@\t\r]/.test(value)) return `'${value}`;
+  return value;
+}
+
+function downloadWorkbookFile(workbook, filename) {
+  const safeName = filenameSafe(filename).replace(/\.xlsx$/i, "");
+  XLSX.writeFile(workbook, `${safeName}.xlsx`);
+}
+
+function sharedWorkbookSummaryRows() {
+  const normalizationLanes = [...new Set(state.sharedAnalyses.map((analysis) => analysis.normalizationLane).filter(Boolean))];
+  const loadingControlModes = [...new Set(state.sharedAnalyses.map((analysis) =>
+    analysis.loadingControlAdjusted ? "Applied" : "Skipped",
+  ))];
+  return [
+    { Setting: "Generated at", Value: new Date().toISOString() },
+    { Setting: "Mode", Value: "Multiple samples, optional control" },
+    { Setting: "Normalization lane", Value: normalizationLanes.join(", ") },
+    { Setting: "Loading control adjustment", Value: loadingControlModes.join(", ") },
+    { Setting: "Analyses", Value: state.sharedAnalyses.length },
+    { Setting: "Active analysis", Value: activeAnalysis()?.name || "" },
+    { Setting: "Grouped graphs", Value: els.enableGroupedGraphs.checked ? "Enabled" : "Disabled" },
+    { Setting: "Grouping mode", Value: els.groupMode.value },
+    { Setting: "Group size", Value: Number(els.groupSize.value) },
+  ];
+}
+
+function comparisonWorkbookSummaryRows() {
+  const normalizationLanes = [...new Set(state.pairedAnalyses.map((analysis) => analysis.normalizationLane).filter(Boolean))];
+  return [
+    { Setting: "Generated at", Value: new Date().toISOString() },
+    { Setting: "Mode", Value: "Compare sample/control pairs" },
+    { Setting: "Normalization lane", Value: normalizationLanes.join(", ") },
+    { Setting: "Pairs", Value: state.pairedAnalyses.length },
+    { Setting: "Comparison graph", Value: els.comparisonChartType.value },
+    { Setting: "Grouped graphs", Value: els.enableGroupedGraphs.checked ? "Enabled" : "Disabled" },
+    { Setting: "Grouping mode", Value: els.groupMode.value },
+    { Setting: "Group size", Value: Number(els.groupSize.value) },
+  ];
+}
+
+function sharedWorkbookResultRows() {
+  return state.sharedAnalyses.flatMap((analysis) =>
+    analysis.results.map((row, index) => ({
+      Analysis: analysis.name,
+      Title: analysis.title,
+      "Normalization lane": analysis.normalizationLane,
+      "Lane #": index + 1,
+      Lane: row.lane,
+      "Graph label": row.displayLane || row.lane,
+      "Sample signal": row.sampleSignal,
+      "Control signal": row.controlSignal,
+      "Sample %": row.samplePercent,
+      "Control %": row.controlPercent,
+      "Fold change": row.foldChange,
+    })),
+  );
+}
+
+function comparisonWorkbookPairRows() {
+  return state.pairedAnalyses.flatMap((analysis, pairIndex) =>
+    analysis.results.map((row, laneIndex) => ({
+      Pair: analysis.name,
+      "Pair #": pairIndex + 1,
+      "Normalization lane": analysis.normalizationLane,
+      "Lane #": laneIndex + 1,
+      Lane: row.lane,
+      "Graph label": row.displayLane || row.lane,
+      "Sample signal": row.sampleSignal,
+      "Control signal": row.controlSignal,
+      "Sample %": row.samplePercent,
+      "Control %": row.controlPercent,
+      "Fold change": row.foldChange,
+    })),
+  );
+}
+
+function comparisonWorkbookCommonRows() {
+  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
+  return buildComparisonRows().map((row) => {
+    const output = {
+      Lane: row.label,
+      Average: average(row.values),
+    };
+    row.values.forEach((value, index) => {
+      output[seriesNames[index] || `Pair ${index + 1}`] = value;
+    });
+    return output;
+  });
+}
+
+function sharedWorkbookInputRows() {
+  return workbookInputRowsFromAnalyses(state.sharedAnalyses);
+}
+
+function comparisonWorkbookInputRows() {
+  return workbookInputRowsFromAnalyses(state.pairedAnalyses);
+}
+
+function workbookInputRowsFromAnalyses(analyses) {
+  return analyses.flatMap((analysis) =>
+    (analysis.sources || []).flatMap((source) =>
+      source.rows.map((row) => ({
+        Analysis: analysis.name,
+        Mode: source.mode,
+        Role: source.role,
+        Index: source.index,
+        Source: source.label,
+        "Source type": source.sourceType,
+        "Source file": source.fileLabel,
+        Sheet: source.sheetName,
+        "Blot ID": source.blotId,
+        "Scan ID": source.scanId,
+        "Row #": row.rowIndex,
+        Lane: row.lane,
+        "Display lane": row.displayLane,
+        Signal: row.signal,
+      })),
+    ),
+  );
+}
+
+function sharedWorkbookGroupRows() {
+  if (!els.enableGroupedGraphs.checked) return [];
+  return state.sharedAnalyses.flatMap((analysis) =>
+    buildGroupedRows(analysis).flatMap((group) => {
+      const normalizedRows = normalizedGroupRows(group);
+      if (!normalizedRows) {
+        return [{
+          Analysis: analysis.name,
+          Group: group.name,
+          Error: groupBaselineError(group),
+        }];
+      }
+      return normalizedRows.map((row, index) => ({
+        Analysis: analysis.name,
+        Group: group.name,
+        "Group row #": index + 1,
+        Lane: row.lane,
+        "Graph label": row.displayLane || row.lane,
+        "Normalized fold change": row.foldChange,
+      }));
+    }),
+  );
+}
+
+function comparisonWorkbookGroupRows() {
+  if (!els.enableGroupedGraphs.checked) return [];
+  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
+  return buildComparisonGroups(buildComparisonRows()).flatMap((group) =>
+    group.rows.map((row, rowIndex) => {
+      const output = {
+        Group: group.name,
+        "Group row #": rowIndex + 1,
+        Lane: row.label,
+        Average: average(row.values),
+      };
+      row.values.forEach((value, index) => {
+        output[seriesNames[index] || `Pair ${index + 1}`] = value;
+      });
+      return output;
+    }),
+  );
+}
+
+function appendScanSheets(workbook, usedSheetNames, refs = []) {
+  const metadataRows = scanMetadataRows({ refs });
+  if (metadataRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Scan metadata", metadataRows);
+  const auditRows = scanAuditRows({ refs });
+  if (auditRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Scan audit", auditRows);
+}
+
+function scanRefsForAnalyses(analyses) {
+  const refsByKey = new Map();
+  analyses.forEach((analysis) => {
+    (analysis.sources || []).forEach((source) => {
+      if (source.sourceType !== "blot" || !source.blotId || !source.scanId) return;
+      refsByKey.set(`${source.blotId}:${source.scanId}`, {
+        blotId: source.blotId,
+        scanId: source.scanId,
+      });
+    });
+  });
+  return [...refsByKey.values()];
+}
+
+function scanRecords(filters = {}) {
+  const records = [];
+  const hasRefsFilter = Array.isArray(filters.refs);
+  const refKeys = new Set(
+    hasRefsFilter
+      ? filters.refs.map((ref) => `${ref.blotId}:${ref.scanId}`)
+      : [],
+  );
+  if (hasRefsFilter && !refKeys.size) return records;
+  blotState.blots.forEach((blot) => {
+    if (filters.blotId && blot.id !== filters.blotId) return;
+    scansForBlot(blot.id).forEach((scan, scanIndex) => {
+      if (filters.scanId && scan.id !== filters.scanId) return;
+      if (hasRefsFilter && !refKeys.has(`${blot.id}:${scan.id}`)) return;
+      records.push({ blot, scan, scanIndex });
+    });
+  });
+  return records;
+}
+
+function scanMetadataRows(filters = {}) {
+  return scanRecords(filters).map(({ blot, scan, scanIndex }) => ({
+    Blot: blot.name,
+    "Blot ID": blot.id,
+    "Scan #": scanIndex + 1,
+    Scan: scan.proteinName,
+    "Scan ID": scan.id,
+    "Saved at": scan.createdAt || "",
+    Channel: `${scan.channel}nm`,
+    Background: scan.backgroundAxis,
+    Lanes: scan.lanes.length,
+    "Color mode": scan.settings?.colorMode || "",
+    "Brightness 700": scan.settings?.brightness700 ?? "",
+    "Contrast 700": scan.settings?.contrast700 ?? "",
+    "Brightness 800": scan.settings?.brightness800 ?? "",
+    "Contrast 800": scan.settings?.contrast800 ?? "",
+  }));
+}
+
+function scanAuditRows(filters = {}) {
+  return scanRecords(filters).flatMap(({ blot, scan, scanIndex }) =>
+    scan.lanes.map((lane, laneIndex) => ({
+      Blot: blot.name,
+      "Blot ID": blot.id,
+      "Scan #": scanIndex + 1,
+      Scan: scan.proteinName,
+      "Scan ID": scan.id,
+      "Saved at": scan.createdAt || "",
+      Channel: `${scan.channel}nm`,
+      Background: scan.backgroundAxis,
+      "Lane #": laneIndex + 1,
+      Lane: lane.name,
+      "Adjusted signal": lane.adjustedSignal ?? lane.signal,
+      "Raw signal": lane.rawSignal ?? "",
+      "Background signal": lane.backgroundSignal ?? "",
+      X: lane.x ?? "",
+      Y: lane.y ?? "",
+      W: lane.w ?? "",
+      H: lane.h ?? "",
+      "Area px2": lane.area ?? "",
+      "Color mode": scan.settings?.colorMode || "",
+      "Brightness 700": scan.settings?.brightness700 ?? "",
+      "Contrast 700": scan.settings?.contrast700 ?? "",
+      "Brightness 800": scan.settings?.brightness800 ?? "",
+      "Contrast 800": scan.settings?.contrast800 ?? "",
+    })),
+  );
+}
+
 function createDefaultCustomGroups(rowsOrCount, keyForRow = analysisRowKey) {
   const rows = Array.isArray(rowsOrCount)
     ? rowsOrCount
@@ -1804,10 +2599,12 @@ function createDefaultCustomGroups(rowsOrCount, keyForRow = analysisRowKey) {
 }
 
 function showSharedError(message) {
+  state.sharedAnalyses = [];
   els.chartTitle.innerHTML = `<span class="error-text">${escapeHtml(message)}</span>`;
   drawEmptyChart(els.foldChart);
   els.downloadChartButton.disabled = true;
   els.downloadCsvButton.disabled = true;
+  els.downloadWorkbookButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
   document.getElementById("pptxPanel").hidden = true;
@@ -1848,6 +2645,11 @@ function parseSignal(value) {
   return Number.isFinite(number) ? number : NaN;
 }
 
+function finiteNumberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function formatRowList(rows) {
   const visibleRows = rows.slice(0, 8).join(", ");
   return rows.length > 8 ? `${visibleRows}, and ${rows.length - 8} more` : visibleRows;
@@ -1855,6 +2657,11 @@ function formatRowList(rows) {
 
 function clampInteger(value, min, max, fallback) {
   if (!Number.isInteger(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampNumber(value, min, max, fallback) {
+  if (!Number.isFinite(value)) return fallback;
   return Math.min(max, Math.max(min, value));
 }
 
@@ -1873,6 +2680,17 @@ function formatNumber(value) {
     maximumFractionDigits: 3,
     minimumFractionDigits: 0,
   });
+}
+
+function formatAuditNumber(value) {
+  const number = finiteNumberOrNull(value);
+  return number === null ? "N/A" : formatNumber(number);
+}
+
+function formatTimestamp(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || "");
+  return date.toLocaleString();
 }
 
 function csvCell(value) {
@@ -1906,13 +2724,6 @@ document.querySelectorAll(".main-tab-button").forEach(button => {
 
 // ─── Blot browser ─────────────────────────────────────────────────────────
 
-const blotState = {
-  blots: [],
-  activeBlotIndex: null,
-  scans: {},  // key: blotId, value: array of {proteinName, channel, backgroundAxis, lanes: [{name, signal}]}
-  scanById: {},
-};
-
 function createCanvasState() {
   return {
     image: null,
@@ -1928,6 +2739,7 @@ function createCanvasState() {
     startY: 0,
     lastPanX: 0,
     lastPanY: 0,
+    selectedBoxIndex: null,
     currentBlotId: null,
     imageWidth: 0,
     imageHeight: 0,
@@ -1969,6 +2781,9 @@ blotListElement?.addEventListener("scroll", updateBlotScrollButtons);
 if (window.ResizeObserver && blotListElement) {
   new ResizeObserver(updateBlotScrollButtons).observe(blotListElement);
 }
+document.querySelectorAll("[data-blot-analysis-tab]").forEach(button => {
+  button.addEventListener("click", () => setBlotAnalysisTab(button.dataset.blotAnalysisTab));
+});
 
 function clientId(prefix) {
   return `${prefix}-${window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
@@ -2053,23 +2868,24 @@ function renderBlotList() {
   });
 }
 
-function blotListRowHeight() {
-  return blotListElement?.querySelector(".blot-list-row")?.offsetHeight || 40;
+function blotListScrollAmount() {
+  if (!blotListElement) return 320;
+  return Math.max(280, Math.round(blotListElement.clientWidth * 0.72));
 }
 
 function scrollBlotList(direction) {
   if (!blotListElement) return;
   blotListElement.scrollTo({
-    top: blotListElement.scrollTop + direction * blotListRowHeight(),
+    left: blotListElement.scrollLeft + direction * blotListScrollAmount(),
     behavior: "smooth",
   });
 }
 
 function updateBlotScrollButtons() {
   if (!blotListElement || !blotScrollUpButton || !blotScrollDownButton) return;
-  const maxScrollTop = Math.max(0, blotListElement.scrollHeight - blotListElement.clientHeight);
-  blotScrollUpButton.disabled = blotListElement.scrollTop <= 1;
-  blotScrollDownButton.disabled = blotListElement.scrollTop >= maxScrollTop - 1;
+  const maxScrollLeft = Math.max(0, blotListElement.scrollWidth - blotListElement.clientWidth);
+  blotScrollUpButton.disabled = blotListElement.scrollLeft <= 1;
+  blotScrollDownButton.disabled = blotListElement.scrollLeft >= maxScrollLeft - 1;
 }
 
 function ensureActiveBlotVisible() {
@@ -2078,14 +2894,14 @@ function ensureActiveBlotVisible() {
   const activeRow = activeButton?.closest(".blot-list-row");
   if (!activeRow) return;
 
-  const rowTop = activeRow.offsetTop;
-  const rowBottom = rowTop + activeRow.offsetHeight;
-  const visibleTop = blotListElement.scrollTop;
-  const visibleBottom = visibleTop + blotListElement.clientHeight;
-  if (rowTop < visibleTop) {
-    blotListElement.scrollTo({ top: rowTop, behavior: "smooth" });
-  } else if (rowBottom > visibleBottom) {
-    blotListElement.scrollTo({ top: rowBottom - blotListElement.clientHeight, behavior: "smooth" });
+  const rowLeft = activeRow.offsetLeft;
+  const rowRight = rowLeft + activeRow.offsetWidth;
+  const visibleLeft = blotListElement.scrollLeft;
+  const visibleRight = visibleLeft + blotListElement.clientWidth;
+  if (rowLeft < visibleLeft) {
+    blotListElement.scrollTo({ left: rowLeft, behavior: "smooth" });
+  } else if (rowRight > visibleRight) {
+    blotListElement.scrollTo({ left: rowRight - blotListElement.clientWidth, behavior: "smooth" });
   }
 }
 
@@ -2114,6 +2930,7 @@ async function deleteBlot(index, button) {
     disposeCanvasResources();
     const preview = document.querySelector("#blotPreview");
     if (preview) preview.innerHTML = '<p class="blot-empty-state">Select a blot to preview</p>';
+    renderBlotAnalysisEmpty("Select a blot to adjust channels and draw boxes.");
   }
 
   renderBlotList();
@@ -2126,6 +2943,7 @@ async function deleteBlot(index, button) {
 }
 
 function switchSource(button, role, index, mode) {
+  invalidateAnalyses();
   const group = button.dataset.sourceGroup;
   document.querySelectorAll(`[data-source-group="${group}"]`).forEach((sourceButton) => {
     sourceButton.classList.remove("active");
@@ -2140,6 +2958,7 @@ function switchSource(button, role, index, mode) {
   } else {
     refreshNormalizationLanes();
   }
+  renderWorkflowState();
 }
 
 function handleDocumentClick(event) {
@@ -2165,6 +2984,18 @@ function handleDocumentClick(event) {
     return;
   }
 
+  const boxSelect = event.target.closest("[data-box-select]");
+  if (boxSelect) {
+    selectBox(Number(boxSelect.dataset.boxSelect), canvasState.currentBlotId);
+    return;
+  }
+
+  const scanAuditExport = event.target.closest("[data-scan-audit-export]");
+  if (scanAuditExport) {
+    downloadScanAuditWorkbook(canvasState.currentBlotId, Number(scanAuditExport.dataset.scanAuditExport));
+    return;
+  }
+
   const scanDelete = event.target.closest("[data-scan-delete]");
   if (scanDelete) {
     deleteScan(canvasState.currentBlotId, Number(scanDelete.dataset.scanDelete));
@@ -2174,12 +3005,16 @@ function handleDocumentClick(event) {
 function handleDocumentChange(event) {
   const blotSelect = event.target.closest("[data-refresh-scan-role]");
   if (blotSelect) {
+    invalidateAnalyses();
     refreshScanDropdown(blotSelect.dataset.refreshScanRole, Number(blotSelect.dataset.refreshScanIndex));
+    renderWorkflowState();
     return;
   }
 
   if (event.target.closest("[data-blot-source-scan]")) {
+    invalidateAnalyses();
     refreshNormalizationLanes();
+    renderWorkflowState();
   }
 }
 
@@ -2199,11 +3034,24 @@ function normalizeScan(scan) {
   const lanes = Array.isArray(scan.lanes)
     ? scan.lanes.map((lane, index) => {
       if (!lane || typeof lane !== "object") return null;
-      const signal = parseSignal(lane.signal);
+      const signal = parseSignal(lane.signal ?? lane.adjustedSignal);
       if (!Number.isFinite(signal)) return null;
+      const x = finiteNumberOrNull(lane.x);
+      const y = finiteNumberOrNull(lane.y);
+      const w = finiteNumberOrNull(lane.w);
+      const h = finiteNumberOrNull(lane.h);
+      const area = finiteNumberOrNull(lane.area) ?? (Number.isFinite(w) && Number.isFinite(h) ? Math.round(w * h) : null);
       return {
         name: normalizeLaneName(lane.name, index),
         signal,
+        adjustedSignal: signal,
+        rawSignal: finiteNumberOrNull(lane.rawSignal),
+        backgroundSignal: finiteNumberOrNull(lane.backgroundSignal),
+        x,
+        y,
+        w,
+        h,
+        area,
       };
     }).filter(Boolean)
     : [];
@@ -2211,12 +3059,18 @@ function normalizeScan(scan) {
   const id = typeof scan.id === "string" && scan.id.trim() ? scan.id.trim() : clientId("scan");
   const channel = ["700", "800"].includes(String(scan.channel)) ? String(scan.channel) : "700";
   const backgroundAxis = ["leftright", "topbottom"].includes(String(scan.backgroundAxis)) ? String(scan.backgroundAxis) : "leftright";
+  const createdAt = typeof scan.createdAt === "string" ? scan.createdAt : "";
+  const settings = scan.settings && typeof scan.settings === "object" && !Array.isArray(scan.settings)
+    ? scan.settings
+    : {};
   return {
     ...scan,
     id,
     proteinName: String(scan.proteinName ?? "Untitled scan").trim() || "Untitled scan",
     channel,
     backgroundAxis,
+    createdAt,
+    settings,
     lanes,
   };
 }
@@ -2261,6 +3115,7 @@ function refreshAllScanDropdowns() {
 function refreshBlotDependentControls() {
   refreshBlotSourceDropdowns();
   refreshAllScanDropdowns();
+  renderWorkflowState();
 }
 
 function refreshScanDropdown(role, index) {
@@ -2545,38 +3400,79 @@ async function selectBlot(index) {
   if (!preview) return;
 
   preview.innerHTML = `<p class="blot-empty-state">Loading...</p>`;
+  renderBlotAnalysisEmpty("Loading blot analysis...");
 
   try {
     preview.innerHTML = blotViewerHtml();
+    renderBlotAnalysis(blot.id);
     initCanvas(blot.id);
     bindBlotViewerControls(blot.id);
   } catch (error) {
     preview.innerHTML = `<p class="blot-empty-state">Failed to load blot: ${escapeHtml(error.message)}</p>`;
+    renderBlotAnalysisEmpty(`Failed to load blot: ${error.message}`);
   }
 }
 
 function blotViewerHtml() {
   return `
     <div class="blot-viewer">
+      <div class="blot-canvas-wrap">
+        <canvas id="blotCanvas"></canvas>
+      </div>
+    </div>
+  `;
+}
+
+function renderBlotAnalysis(blotId) {
+  const toolsPanel = document.getElementById("blotAnalysisTools");
+  const boxesPanel = document.getElementById("blotAnalysisBoxes");
+  if (toolsPanel) {
+    toolsPanel.innerHTML = `
       <div class="blot-controls-bar">
         ${blotModeControlsHtml()}
         ${channelAdjustmentControlsHtml("red", "700")}
         ${channelAdjustmentControlsHtml("green", "800")}
         ${boxToolControlsHtml()}
+        ${boxLayoutControlsHtml()}
       </div>
-
-      <div class="blot-canvas-wrap">
-        <canvas id="blotCanvas"></canvas>
-      </div>
-
+    `;
+  }
+  if (boxesPanel) {
+    boxesPanel.innerHTML = `
       <div class="blot-box-list-wrap">
-        <p class="eyebrow" style="margin-bottom:8px;">Drawn boxes</p>
+        <p class="eyebrow">Drawn boxes</p>
         <div id="blotBoxList" class="blot-box-list">
           <p class="blot-empty-state">No boxes drawn yet.</p>
         </div>
       </div>
-    </div>
-  `;
+    `;
+  }
+  setBlotAnalysisTab(currentBlotAnalysisTab());
+  renderBoxList(blotId);
+}
+
+function renderBlotAnalysisEmpty(message) {
+  const toolsPanel = document.getElementById("blotAnalysisTools");
+  const boxesPanel = document.getElementById("blotAnalysisBoxes");
+  if (toolsPanel) toolsPanel.innerHTML = `<p class="blot-empty-state">${escapeHtml(message)}</p>`;
+  if (boxesPanel) boxesPanel.innerHTML = `<p class="blot-empty-state">Select a blot to view drawn boxes.</p>`;
+  setBlotAnalysisTab("analysis");
+}
+
+function currentBlotAnalysisTab() {
+  return document.querySelector("[data-blot-analysis-tab].active")?.dataset.blotAnalysisTab || "analysis";
+}
+
+function setBlotAnalysisTab(tabName) {
+  const nextTab = tabName === "boxes" ? "boxes" : "analysis";
+  document.querySelectorAll("[data-blot-analysis-tab]").forEach(button => {
+    const isActive = button.dataset.blotAnalysisTab === nextTab;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
+  document.querySelectorAll("[data-blot-analysis-panel]").forEach(panel => {
+    panel.hidden = panel.dataset.blotAnalysisPanel !== nextTab;
+  });
 }
 
 function blotModeControlsHtml() {
@@ -2633,6 +3529,52 @@ function boxToolControlsHtml() {
   `;
 }
 
+function boxLayoutControlsHtml() {
+  return `
+    <div class="blot-control-group box-layout-tools">
+      <span class="channel-label">Box layout</span>
+      <p class="box-selected-status" id="selectedBoxStatus">Select a box below.</p>
+      <div class="box-tool-row">
+        <label>Copies
+          <input id="duplicateBoxCount" type="number" min="1" max="48" step="1" value="1" />
+        </label>
+        <label>Gap px
+          <input id="duplicateBoxGap" type="number" min="-2000" max="2000" step="1" value="8" />
+        </label>
+        <label>Direction
+          <select id="duplicateBoxDirection">
+            <option value="right">Right</option>
+            <option value="left">Left</option>
+            <option value="down">Down</option>
+            <option value="up">Up</option>
+          </select>
+        </label>
+        <button class="ghost-button box-button" id="duplicateBoxButton" type="button">Duplicate</button>
+      </div>
+      <div class="box-button-grid" aria-label="Align boxes to selected box">
+        <button class="ghost-button box-button" type="button" data-box-align="left">Left</button>
+        <button class="ghost-button box-button" type="button" data-box-align="centerX">Center X</button>
+        <button class="ghost-button box-button" type="button" data-box-align="right">Right</button>
+        <button class="ghost-button box-button" type="button" data-box-align="top">Top</button>
+        <button class="ghost-button box-button" type="button" data-box-align="centerY">Center Y</button>
+        <button class="ghost-button box-button" type="button" data-box-align="bottom">Bottom</button>
+      </div>
+      <div class="box-tool-row">
+        <button class="ghost-button box-button" id="matchBoxSizeButton" type="button">Match size</button>
+        <label>Step px
+          <input id="boxNudgeStep" type="number" min="1" max="100" step="1" value="1" />
+        </label>
+        <div class="box-nudge-grid" aria-label="Nudge selected box">
+          <button class="ghost-button box-button" type="button" data-box-nudge="0,-1" aria-label="Nudge box up">&uarr;</button>
+          <button class="ghost-button box-button" type="button" data-box-nudge="-1,0" aria-label="Nudge box left">&larr;</button>
+          <button class="ghost-button box-button" type="button" data-box-nudge="1,0" aria-label="Nudge box right">&rarr;</button>
+          <button class="ghost-button box-button" type="button" data-box-nudge="0,1" aria-label="Nudge box down">&darr;</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function bindBlotViewerControls(blotId) {
   ["brightness700", "contrast700", "brightness800", "contrast800", "colorMode"].forEach(id => {
     document.getElementById(id)?.addEventListener("input", () => {
@@ -2642,6 +3584,18 @@ function bindBlotViewerControls(blotId) {
       scheduleCanvasImageReload(blotId, true);
     });
   });
+  document.getElementById("duplicateBoxButton")?.addEventListener("click", () => duplicateSelectedBox(blotId));
+  document.getElementById("matchBoxSizeButton")?.addEventListener("click", () => matchBoxesToSelectedSize(blotId));
+  document.querySelectorAll("[data-box-align]").forEach(button => {
+    button.addEventListener("click", () => alignBoxesToSelected(button.dataset.boxAlign, blotId));
+  });
+  document.querySelectorAll("[data-box-nudge]").forEach(button => {
+    button.addEventListener("click", () => {
+      const [dx, dy] = button.dataset.boxNudge.split(",").map(Number);
+      nudgeSelectedBox(dx, dy, blotId);
+    });
+  });
+  updateBoxToolState();
 }
 
 // ─── Blot canvas engine ───────────────────────────────────────────────────────
@@ -2670,10 +3624,12 @@ function initCanvas(blotId) {
   document.getElementById("modeDraw")?.addEventListener("click", () => setCanvasMode("draw"));
   document.getElementById("clearBoxesButton")?.addEventListener("click", () => {
     canvasState.boxes = [];
+    canvasState.selectedBoxIndex = null;
     renderCanvas();
     renderBoxList(blotId);
   });
   document.getElementById("extractSignalsButton")?.addEventListener("click", () => extractSignals(blotId));
+  renderBoxList(blotId);
 
   // Mouse events
   canvas.addEventListener("mousedown", onMouseDown);
@@ -2846,6 +3802,7 @@ async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
 function renderCanvas() {
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
+  normalizeSelectedBoxIndex();
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -2861,12 +3818,17 @@ function renderCanvas() {
 
     // Draw boxes in image space
     canvasState.boxes.forEach((box, index) => {
-      ctx.strokeStyle = themeToken("--annotation");
-      ctx.lineWidth = 2 / canvasState.zoom;
+      const isSelected = index === canvasState.selectedBoxIndex;
+      ctx.strokeStyle = isSelected
+        ? (themeToken("--annotation-selected") || themeToken("--primary"))
+        : themeToken("--annotation");
+      ctx.lineWidth = (isSelected ? 3 : 2) / canvasState.zoom;
       ctx.strokeRect(box.x, box.y, box.w, box.h);
 
       // Number label
-      ctx.fillStyle = themeToken("--annotation");
+      ctx.fillStyle = isSelected
+        ? (themeToken("--annotation-selected") || themeToken("--primary"))
+        : themeToken("--annotation");
       ctx.font = themeFont(600, 14 / canvasState.zoom, "--font-mono");
       ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
     });
@@ -2960,16 +3922,18 @@ function onMouseUp(event) {
 
     // Only reject clicks with no drag at all
     if (Math.abs(w) > 0.5 && Math.abs(h) > 0.5) {
-      const box = {
+      if (remainingBoxSlots() <= 0) {
+        alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+        return;
+      }
+      const box = createCanvasBox({
         x: w > 0 ? canvasState.startX : coords.x,
         y: h > 0 ? canvasState.startY : coords.y,
         w: Math.abs(w),
         h: Math.abs(h),
-        signal: null,
-        signalStatus: "loading",
-        signalRequestId: 0,
-      };
+      });
       canvasState.boxes.push(box);
+      canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
       renderCanvas();
       void extractSignalsForBoxes(canvasState.currentBlotId, [box], { alertOnError: false });
     }
@@ -3000,14 +3964,17 @@ function onWheel(event) {
 function renderBoxList(blotId) {
   const container = document.getElementById("blotBoxList");
   if (!container) return;
+  normalizeSelectedBoxIndex();
 
   if (!canvasState.boxes.length) {
     container.innerHTML = emptyBoxListHtml(blotId);
+    updateBoxToolState();
     return;
   }
 
   container.innerHTML = activeBoxListHtml(blotId);
   bindBoxListInputs(container, blotId);
+  updateBoxToolState();
 }
 
 function emptyBoxListHtml(blotId) {
@@ -3030,9 +3997,12 @@ function activeBoxListHtml(blotId) {
 }
 
 function boxListItemHtml(box, index) {
+  const isSelected = index === canvasState.selectedBoxIndex;
   return `
-    <div class="box-list-item">
-      <span class="box-number">${index + 1}</span>
+    <div class="box-list-item ${isSelected ? "selected" : ""}">
+      <button class="box-number" type="button" data-box-select="${index}" aria-label="Select box ${index + 1}" aria-pressed="${isSelected}">
+        ${index + 1}
+      </button>
       <input
         type="text"
         class="box-lane-name"
@@ -3098,20 +4068,276 @@ function renderSavedScans(blotId) {
       <p class="eyebrow" style="margin: 12px 0 8px;">Session scans</p>
       ${scans.map((scan, index) => `
         <div class="saved-scan-item">
-          <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
-          <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundAxis}</span>
-          <button class="ghost-button box-button danger" type="button"
-            data-scan-delete="${index}">Delete</button>
+          <div class="saved-scan-main">
+            <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
+            <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundAxis}${scan.createdAt ? ` · ${escapeHtml(formatTimestamp(scan.createdAt))}` : ""}</span>
+            <button class="ghost-button box-button danger" type="button"
+              data-scan-delete="${index}">Delete</button>
+          </div>
+          ${scanAuditDetailsHtml(scan, index)}
         </div>
       `).join("")}
     </div>
   `;
 }
 
+function scanAuditDetailsHtml(scan, index) {
+  return `
+    <details class="scan-audit">
+      <summary>Extraction audit</summary>
+      <div class="scan-audit-toolbar">
+        <span class="muted-text">${escapeHtml(scanAuditSummary(scan))}</span>
+        <button class="ghost-button box-button" type="button" data-scan-audit-export="${index}">Export XLSX</button>
+      </div>
+      <div class="scan-audit-table-wrap">
+        <table class="scan-audit-table">
+          <thead>
+            <tr>
+              <th>Lane</th>
+              <th>Adjusted</th>
+              <th>Raw</th>
+              <th>Background</th>
+              <th>X</th>
+              <th>Y</th>
+              <th>W</th>
+              <th>H</th>
+              <th>Area</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${scan.lanes.map(scanAuditLaneRowHtml).join("")}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  `;
+}
+
+function scanAuditLaneRowHtml(lane) {
+  return `
+    <tr>
+      <td>${escapeHtml(lane.name)}</td>
+      <td>${formatAuditNumber(lane.adjustedSignal ?? lane.signal)}</td>
+      <td>${formatAuditNumber(lane.rawSignal)}</td>
+      <td>${formatAuditNumber(lane.backgroundSignal)}</td>
+      <td>${formatAuditNumber(lane.x)}</td>
+      <td>${formatAuditNumber(lane.y)}</td>
+      <td>${formatAuditNumber(lane.w)}</td>
+      <td>${formatAuditNumber(lane.h)}</td>
+      <td>${formatAuditNumber(lane.area)}</td>
+    </tr>
+  `;
+}
+
+function scanAuditSummary(scan) {
+  const settings = scan.settings || {};
+  const colorMode = settings.colorMode ? `${settings.colorMode} view` : "viewer settings";
+  return `${scan.channel}nm, ${scan.backgroundAxis}, ${colorMode}`;
+}
+
 function formatBoxArea(box) {
   const width = Math.max(1, Math.round(Math.abs(Number(box.w) || 0)));
   const height = Math.max(1, Math.round(Math.abs(Number(box.h) || 0)));
   return width * height;
+}
+
+function createCanvasBox({ x, y, w, h, laneName = "" }) {
+  return constrainBoxToImage({
+    x,
+    y,
+    w,
+    h,
+    laneName,
+    signal: null,
+    signalStatus: "loading",
+    signalError: "",
+    signalRequestId: 0,
+  });
+}
+
+function normalizeSelectedBoxIndex() {
+  if (!canvasState.boxes.length) {
+    canvasState.selectedBoxIndex = null;
+    return null;
+  }
+  if (!Number.isInteger(canvasState.selectedBoxIndex)) {
+    canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+  }
+  canvasState.selectedBoxIndex = Math.min(
+    canvasState.boxes.length - 1,
+    Math.max(0, canvasState.selectedBoxIndex),
+  );
+  return canvasState.selectedBoxIndex;
+}
+
+function selectedBox() {
+  const index = normalizeSelectedBoxIndex();
+  return index === null ? null : canvasState.boxes[index];
+}
+
+function selectBox(index, blotId = canvasState.currentBlotId) {
+  if (!Number.isInteger(index) || index < 0 || index >= canvasState.boxes.length) return;
+  canvasState.selectedBoxIndex = index;
+  renderCanvas();
+  renderBoxList(blotId);
+}
+
+function updateBoxToolState() {
+  const selectedIndex = normalizeSelectedBoxIndex();
+  const hasSelection = selectedIndex !== null;
+  const canAlign = hasSelection && canvasState.boxes.length > 1;
+  const hasBoxCapacity = remainingBoxSlots() > 0;
+  const status = document.getElementById("selectedBoxStatus");
+  if (status) {
+    status.textContent = hasSelection
+      ? `Box ${selectedIndex + 1} selected.`
+      : "Select a box below.";
+  }
+
+  document.getElementById("duplicateBoxButton")?.toggleAttribute("disabled", !hasSelection || !hasBoxCapacity);
+  document.getElementById("matchBoxSizeButton")?.toggleAttribute("disabled", !canAlign);
+  document.querySelectorAll("[data-box-align]").forEach(button => {
+    button.toggleAttribute("disabled", !canAlign);
+  });
+  document.querySelectorAll("[data-box-nudge]").forEach(button => {
+    button.toggleAttribute("disabled", !hasSelection);
+  });
+}
+
+function remainingBoxSlots() {
+  return Math.max(0, MAX_CANVAS_BOXES - canvasState.boxes.length);
+}
+
+function constrainBoxToImage(box) {
+  const constrained = {
+    ...box,
+    x: Number(box.x) || 0,
+    y: Number(box.y) || 0,
+    w: Math.max(1, Math.abs(Number(box.w) || 1)),
+    h: Math.max(1, Math.abs(Number(box.h) || 1)),
+  };
+  if (canvasState.imageWidth > 0) {
+    constrained.w = Math.min(constrained.w, canvasState.imageWidth);
+    constrained.x = Math.min(Math.max(0, constrained.x), Math.max(0, canvasState.imageWidth - constrained.w));
+  }
+  if (canvasState.imageHeight > 0) {
+    constrained.h = Math.min(constrained.h, canvasState.imageHeight);
+    constrained.y = Math.min(Math.max(0, constrained.y), Math.max(0, canvasState.imageHeight - constrained.h));
+  }
+  return constrained;
+}
+
+function boxOverlapsImage(box) {
+  if (canvasState.imageWidth <= 0 || canvasState.imageHeight <= 0) return true;
+  return box.x < canvasState.imageWidth
+    && box.y < canvasState.imageHeight
+    && box.x + box.w > 0
+    && box.y + box.h > 0;
+}
+
+function markBoxGeometryChanged(box) {
+  box.signal = null;
+  box.signalStatus = "loading";
+  box.signalError = "";
+}
+
+function duplicateSelectedBox(blotId) {
+  const source = selectedBox();
+  const sourceIndex = canvasState.selectedBoxIndex;
+  if (!source) return;
+
+  const remainingSlots = remainingBoxSlots();
+  if (remainingSlots <= 0) {
+    alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    return;
+  }
+  const count = Math.min(
+    remainingSlots,
+    clampInteger(Number(document.getElementById("duplicateBoxCount")?.value), 1, 48, 1),
+  );
+  const gap = clampNumber(Number(document.getElementById("duplicateBoxGap")?.value), -2000, 2000, 8);
+  const direction = document.getElementById("duplicateBoxDirection")?.value || "right";
+  const offsets = {
+    right: [source.w + gap, 0],
+    left: [-(source.w + gap), 0],
+    down: [0, source.h + gap],
+    up: [0, -(source.h + gap)],
+  };
+  const [stepX, stepY] = offsets[direction] || offsets.right;
+  const copies = [];
+
+  for (let copyIndex = 1; copyIndex <= count; copyIndex += 1) {
+    const candidate = {
+      x: source.x + stepX * copyIndex,
+      y: source.y + stepY * copyIndex,
+      w: source.w,
+      h: source.h,
+    };
+    if (!boxOverlapsImage(candidate)) break;
+    copies.push(createCanvasBox(candidate));
+  }
+
+  if (!copies.length) return;
+  canvasState.boxes.splice(sourceIndex + 1, 0, ...copies);
+  canvasState.selectedBoxIndex = sourceIndex + copies.length;
+  renderCanvas();
+  void extractSignalsForBoxes(blotId, copies, { alertOnError: false });
+}
+
+function alignBoxesToSelected(alignment, blotId) {
+  const anchor = selectedBox();
+  if (!anchor || canvasState.boxes.length < 2) return;
+
+  const changedBoxes = [];
+  canvasState.boxes.forEach((box, index) => {
+    if (index === canvasState.selectedBoxIndex) return;
+    if (alignment === "left") box.x = anchor.x;
+    if (alignment === "centerX") box.x = anchor.x + anchor.w / 2 - box.w / 2;
+    if (alignment === "right") box.x = anchor.x + anchor.w - box.w;
+    if (alignment === "top") box.y = anchor.y;
+    if (alignment === "centerY") box.y = anchor.y + anchor.h / 2 - box.h / 2;
+    if (alignment === "bottom") box.y = anchor.y + anchor.h - box.h;
+    Object.assign(box, constrainBoxToImage(box));
+    markBoxGeometryChanged(box);
+    changedBoxes.push(box);
+  });
+
+  renderCanvas();
+  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
+}
+
+function matchBoxesToSelectedSize(blotId) {
+  const anchor = selectedBox();
+  if (!anchor || canvasState.boxes.length < 2) return;
+
+  const changedBoxes = [];
+  canvasState.boxes.forEach((box, index) => {
+    if (index === canvasState.selectedBoxIndex) return;
+    const centerX = box.x + box.w / 2;
+    const centerY = box.y + box.h / 2;
+    box.w = anchor.w;
+    box.h = anchor.h;
+    box.x = centerX - box.w / 2;
+    box.y = centerY - box.h / 2;
+    Object.assign(box, constrainBoxToImage(box));
+    markBoxGeometryChanged(box);
+    changedBoxes.push(box);
+  });
+
+  renderCanvas();
+  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
+}
+
+function nudgeSelectedBox(dx, dy, blotId) {
+  const box = selectedBox();
+  if (!box) return;
+  const step = clampInteger(Number(document.getElementById("boxNudgeStep")?.value), 1, 100, 1);
+  box.x += dx * step;
+  box.y += dy * step;
+  Object.assign(box, constrainBoxToImage(box));
+  markBoxGeometryChanged(box);
+  renderCanvas();
+  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
 }
 
 async function saveScan(blotId) {
@@ -3137,12 +4363,33 @@ async function saveScan(blotId) {
   const scan = {
     id: clientId("scan"),
     proteinName,
+    createdAt: new Date().toISOString(),
     channel,
     backgroundAxis,
-    lanes: canvasState.boxes.map((box, index) => ({
-      name: box.laneName || `Lane ${index + 1}`,
-      signal: box.signal.adjustedSignal,
-    })),
+    settings: {
+      colorMode: document.getElementById("colorMode")?.value ?? "color",
+      brightness700: Number(document.getElementById("brightness700")?.value ?? 1),
+      contrast700: Number(document.getElementById("contrast700")?.value ?? 1),
+      brightness800: Number(document.getElementById("brightness800")?.value ?? 1),
+      contrast800: Number(document.getElementById("contrast800")?.value ?? 1),
+    },
+    lanes: canvasState.boxes.map((box, index) => {
+      const signal = box.signal || {};
+      const w = finiteNumberOrNull(signal.w) ?? box.w;
+      const h = finiteNumberOrNull(signal.h) ?? box.h;
+      return {
+        name: box.laneName || `Lane ${index + 1}`,
+        signal: signal.adjustedSignal,
+        adjustedSignal: signal.adjustedSignal,
+        rawSignal: signal.rawSignal,
+        backgroundSignal: signal.backgroundSignal,
+        x: finiteNumberOrNull(signal.x) ?? box.x,
+        y: finiteNumberOrNull(signal.y) ?? box.y,
+        w,
+        h,
+        area: Math.round(Math.max(1, w) * Math.max(1, h)),
+      };
+    }),
   };
 
   if (!blotState.scans[blotId]) blotState.scans[blotId] = [];
@@ -3151,6 +4398,7 @@ async function saveScan(blotId) {
 
   // Clear boxes for next scan
   canvasState.boxes = [];
+  canvasState.selectedBoxIndex = null;
   renderCanvas();
   renderBoxList(blotId);
 
@@ -3170,12 +4418,22 @@ function moveBox(index, direction, blotId) {
   if (newIndex < 0 || newIndex >= canvasState.boxes.length) return;
   const boxes = canvasState.boxes;
   [boxes[index], boxes[newIndex]] = [boxes[newIndex], boxes[index]];
+  if (canvasState.selectedBoxIndex === index) {
+    canvasState.selectedBoxIndex = newIndex;
+  } else if (canvasState.selectedBoxIndex === newIndex) {
+    canvasState.selectedBoxIndex = index;
+  }
   renderCanvas();
   renderBoxList(blotId);
 }
 
 function deleteBox(index, blotId) {
   canvasState.boxes.splice(index, 1);
+  if (canvasState.selectedBoxIndex === index) {
+    canvasState.selectedBoxIndex = canvasState.boxes.length ? Math.min(index, canvasState.boxes.length - 1) : null;
+  } else if (canvasState.selectedBoxIndex > index) {
+    canvasState.selectedBoxIndex -= 1;
+  }
   renderCanvas();
   renderBoxList(blotId);
 }
@@ -3207,35 +4465,38 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
   renderBoxList(blotId);
 
   try {
-    const data = await apiJson(apiUrl("/extract"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
-      timeoutMs: SIGNAL_EXTRACTION_TIMEOUT_MS,
-      body: JSON.stringify({
-        sessionId: activeSessionId,
-        blot: blotById(blotId),
-        boxes: boxes.map(box => ({ x: box.x, y: box.y, w: box.w, h: box.h })),
-        channel,
-        backgroundAxis,
-      }),
-    }, "Signal extraction failed.");
+    for (let start = 0; start < requests.length; start += MAX_CANVAS_BOXES) {
+      const requestChunk = requests.slice(start, start + MAX_CANVAS_BOXES);
+      const data = await apiJson(apiUrl("/extract"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        timeoutMs: SIGNAL_EXTRACTION_TIMEOUT_MS,
+        body: JSON.stringify({
+          sessionId: activeSessionId,
+          blot: blotById(blotId),
+          boxes: requestChunk.map(({ box }) => ({ x: box.x, y: box.y, w: box.w, h: box.h })),
+          channel,
+          backgroundAxis,
+        }),
+      }, "Signal extraction failed.");
 
-    if (canvasState.currentBlotId !== blotId) return;
-    if (!Array.isArray(data.results) || data.results.length !== requests.length) {
-      throw new Error("Signal extraction returned an incomplete result set.");
-    }
-    const activeBoxes = new Set(canvasState.boxes);
-    data.results.forEach((result, index) => {
-      if (!result || !Number.isFinite(Number(result.adjustedSignal)) || !Number.isFinite(Number(result.rawSignal))) {
-        throw new Error("Signal extraction returned invalid signal data.");
+      if (canvasState.currentBlotId !== blotId) return;
+      if (!Array.isArray(data.results) || data.results.length !== requestChunk.length) {
+        throw new Error("Signal extraction returned an incomplete result set.");
       }
-      const request = requests[index];
-      if (!request || !activeBoxes.has(request.box)) return;
-      if (request.box.signalRequestId !== request.requestId) return;
-      request.box.signal = result;
-      request.box.signalStatus = "complete";
-    });
+      const activeBoxes = new Set(canvasState.boxes);
+      data.results.forEach((result, index) => {
+        if (!result || !Number.isFinite(Number(result.adjustedSignal)) || !Number.isFinite(Number(result.rawSignal))) {
+          throw new Error("Signal extraction returned invalid signal data.");
+        }
+        const request = requestChunk[index];
+        if (!request || !activeBoxes.has(request.box)) return;
+        if (request.box.signalRequestId !== request.requestId) return;
+        request.box.signal = result;
+        request.box.signalStatus = "complete";
+      });
+    }
 
     renderBoxList(blotId);
   } catch (error) {

@@ -40,7 +40,7 @@
           <label>
             Analysis mode
             <select id="analysisMode">
-              <option value="shared">Multiple samples, one control</option>
+              <option value="shared">Multiple samples, optional control</option>
               <option value="comparison">Compare sample/control pairs</option>
             </select>
           </label>
@@ -77,7 +77,7 @@
             <div class="upload-column">
               <div class="section-heading">
                 <span class="badge control">Control</span>
-                <h2>Shared loading control file</h2>
+                <h2>Shared loading control file (optional)</h2>
               </div>
 
               <div class="source-toggle">
@@ -96,11 +96,11 @@
                   <input id="controlFile" type="file" accept=".xlsx,.xls,.csv,.tsv" />
                   <span id="controlFileName">Choose Excel or CSV file</span>
                 </label>
-                <div class="field-row">
+                <div class="field-row" id="controlProteinRow" hidden>
                   <label for="controlProtein">Protein name</label>
                   <input id="controlProtein" type="text" placeholder="e.g. GAPDH" />
                 </div>
-                <div class="mapping-grid">
+                <div class="mapping-grid" id="controlMappingGrid" hidden>
                   <label>
                     Sheet
                     <select id="controlSheet"></select>
@@ -117,21 +117,26 @@
               </div>
 
               <div id="controlBlot0" class="source-panel" hidden>
-                <div class="field-row">
-                  <label>
-                    Blot
-                    <select data-blot-source-blot="control-0" data-refresh-scan-role="control" data-refresh-scan-index="0">
-                      <option value="">-- Select blot --</option>
-                    </select>
-                  </label>
-                </div>
-                <div class="field-row">
-                  <label>
-                    Protein scan
-                    <select data-blot-source-scan="control-0">
-                      <option value="">-- Select scan --</option>
-                    </select>
-                  </label>
+                <p class="workflow-message" data-blot-empty-message="control-0" hidden>
+                  Create and save a blot scan before using this source.
+                </p>
+                <div class="blot-source-fields" data-blot-source-fields="control-0" hidden>
+                  <div class="field-row">
+                    <label>
+                      Blot
+                      <select data-blot-source-blot="control-0" data-refresh-scan-role="control" data-refresh-scan-index="0">
+                        <option value="">-- Select blot --</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="field-row">
+                    <label>
+                      Protein scan
+                      <select data-blot-source-scan="control-0">
+                        <option value="">-- Select scan --</option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
               </div>
             </div>
@@ -151,12 +156,17 @@
           </section>
         </section>
 
-        <section class="panel settings-bar" aria-label="Analysis settings">
-          <label>
+        <section class="panel settings-bar analysis-action-bar" id="analysisActionPanel" aria-label="Analysis settings">
+          <label id="normalizationLaneWrap" hidden>
             Normalization lane
             <select id="normalizationLane"></select>
           </label>
-          <label>
+          <button class="primary-button" id="analyzeButton" type="button">Analyze</button>
+          <p class="workflow-message" id="analysisReadiness" role="status"></p>
+        </section>
+
+        <section class="panel settings-bar grouped-controls" id="groupControlsPanel" aria-label="Grouped graph settings" hidden>
+          <label id="groupModeWrap">
             Grouping mode
             <select id="groupMode">
               <option value="interleaved">Group every N lanes</option>
@@ -164,7 +174,7 @@
               <option value="custom">Pick lanes manually</option>
             </select>
           </label>
-          <label>
+          <label id="groupSizeWrap">
             Group size
             <input id="groupSize" type="number" min="2" max="24" step="1" value="2" />
           </label>
@@ -172,10 +182,9 @@
             <input id="enableGroupedGraphs" type="checkbox" />
             Show grouped graphs
           </label>
-          <button class="primary-button" id="analyzeButton" type="button">Analyze</button>
         </section>
 
-        <section id="sharedResults">
+        <section id="sharedResults" hidden>
           <div class="panel tabs-panel" id="sampleTabsPanel" hidden>
             <div id="sampleTabs" class="tabs"></div>
           </div>
@@ -190,6 +199,7 @@
                 <div class="button-row">
                   <button class="ghost-button" id="downloadChartButton" type="button" disabled>Export JPG</button>
                   <button class="ghost-button" id="downloadCsvButton" type="button" disabled>Export CSV</button>
+                  <button class="ghost-button" id="downloadWorkbookButton" type="button" disabled>Export XLSX</button>
                 </div>
               </div>
               <div class="chart-wrap">
@@ -278,7 +288,10 @@
                 <p class="eyebrow">Common lanes only</p>
                 <h2 id="comparisonChartTitle">Comparison graph</h2>
               </div>
-              <button class="ghost-button" id="downloadComparisonChartButton" type="button" disabled>Export JPG</button>
+              <div class="button-row">
+                <button class="ghost-button" id="downloadComparisonChartButton" type="button" disabled>Export JPG</button>
+                <button class="ghost-button" id="downloadComparisonWorkbookButton" type="button" disabled>Export XLSX</button>
+              </div>
             </div>
             <div class="chart-wrap">
               <canvas id="comparisonChart" width="1080" height="560" aria-label="Comparison graph"></canvas>
@@ -306,38 +319,59 @@
       <div id="tabBlotBrowser" hidden>
         <section class="panel blot-browser-panel" aria-label="Blot browser">
           <div class="blot-browser-header">
-            <div>
+            <div class="blot-browser-title">
               <p class="eyebrow">Image viewer</p>
               <h2>Blot Browser</h2>
+              <p class="upload-status" id="zipUploadStatus" role="status" hidden></p>
             </div>
             <label class="file-drop blot-zip-drop">
               <input id="zipFileInput" type="file" accept=".zip" multiple />
               <span>Choose ZIP file(s) — multiple allowed</span>
             </label>
-            <p class="upload-status" id="zipUploadStatus" role="status" hidden></p>
           </div>
 
           <div class="blot-browser-layout">
+            <div class="blot-main-area">
+              <div class="blot-viewer-wrap">
+                <div id="blotPreview" class="blot-preview">
+                  <p class="blot-empty-state">Select a blot to preview</p>
+                </div>
+              </div>
+
+              <aside class="blot-analysis-panel" aria-label="Blot analysis">
+                <div class="blot-analysis-tabs" role="tablist" aria-label="Blot analysis sections">
+                  <button class="blot-analysis-tab active" type="button" role="tab"
+                    aria-selected="true" aria-controls="blotAnalysisTools" data-blot-analysis-tab="analysis">
+                    Analysis
+                  </button>
+                  <button class="blot-analysis-tab" type="button" role="tab"
+                    aria-selected="false" aria-controls="blotAnalysisBoxes" data-blot-analysis-tab="boxes">
+                    Drawn boxes
+                  </button>
+                </div>
+                <div id="blotAnalysisTools" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="analysis">
+                  <p class="blot-empty-state">Select a blot to adjust channels and draw boxes.</p>
+                </div>
+                <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="boxes" hidden>
+                  <p class="blot-empty-state">Select a blot to view drawn boxes.</p>
+                </div>
+              </aside>
+            </div>
+
             <div class="blot-list-wrap">
               <p class="eyebrow">Loaded blots</p>
               <div class="blot-list-navigation">
                 <button class="blot-scroll-button" id="blotScrollUp" type="button"
-                  aria-label="Scroll loaded blots up" aria-controls="blotList" disabled>
-                  &#9652;
+                  aria-label="Scroll loaded blots left" aria-controls="blotList" disabled>
+                  &#9666;
                 </button>
                 <div id="blotList" class="blot-list">
                   <p class="blot-empty-state">No blots loaded yet.</p>
                 </div>
                 <button class="blot-scroll-button" id="blotScrollDown" type="button"
-                  aria-label="Scroll loaded blots down" aria-controls="blotList" disabled>
-                  &#9662;
+                  aria-label="Scroll loaded blots right" aria-controls="blotList" disabled>
+                  &#9656;
                 </button>
-              </div>
-            </div>
-
-            <div class="blot-viewer-wrap">
-              <div id="blotPreview" class="blot-preview">
-                <p class="blot-empty-state">Select a blot to preview</p>
               </div>
             </div>
           </div>
