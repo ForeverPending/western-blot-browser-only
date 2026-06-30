@@ -2868,24 +2868,25 @@ function renderBlotList() {
   });
 }
 
-function blotListScrollAmount() {
-  if (!blotListElement) return 320;
-  return Math.max(280, Math.round(blotListElement.clientWidth * 0.72));
+function blotListRowHeight() {
+  const row = blotListElement?.querySelector(".blot-list-row");
+  const gap = Number.parseFloat(getComputedStyle(blotListElement).rowGap || "0") || 0;
+  return (row?.offsetHeight || 48) + gap;
 }
 
 function scrollBlotList(direction) {
   if (!blotListElement) return;
   blotListElement.scrollTo({
-    left: blotListElement.scrollLeft + direction * blotListScrollAmount(),
+    top: blotListElement.scrollTop + direction * blotListRowHeight(),
     behavior: "smooth",
   });
 }
 
 function updateBlotScrollButtons() {
   if (!blotListElement || !blotScrollUpButton || !blotScrollDownButton) return;
-  const maxScrollLeft = Math.max(0, blotListElement.scrollWidth - blotListElement.clientWidth);
-  blotScrollUpButton.disabled = blotListElement.scrollLeft <= 1;
-  blotScrollDownButton.disabled = blotListElement.scrollLeft >= maxScrollLeft - 1;
+  const maxScrollTop = Math.max(0, blotListElement.scrollHeight - blotListElement.clientHeight);
+  blotScrollUpButton.disabled = blotListElement.scrollTop <= 1;
+  blotScrollDownButton.disabled = blotListElement.scrollTop >= maxScrollTop - 1;
 }
 
 function ensureActiveBlotVisible() {
@@ -2894,14 +2895,14 @@ function ensureActiveBlotVisible() {
   const activeRow = activeButton?.closest(".blot-list-row");
   if (!activeRow) return;
 
-  const rowLeft = activeRow.offsetLeft;
-  const rowRight = rowLeft + activeRow.offsetWidth;
-  const visibleLeft = blotListElement.scrollLeft;
-  const visibleRight = visibleLeft + blotListElement.clientWidth;
-  if (rowLeft < visibleLeft) {
-    blotListElement.scrollTo({ left: rowLeft, behavior: "smooth" });
-  } else if (rowRight > visibleRight) {
-    blotListElement.scrollTo({ left: rowRight - blotListElement.clientWidth, behavior: "smooth" });
+  const rowTop = activeRow.offsetTop;
+  const rowBottom = rowTop + activeRow.offsetHeight;
+  const visibleTop = blotListElement.scrollTop;
+  const visibleBottom = visibleTop + blotListElement.clientHeight;
+  if (rowTop < visibleTop) {
+    blotListElement.scrollTo({ top: rowTop, behavior: "smooth" });
+  } else if (rowBottom > visibleBottom) {
+    blotListElement.scrollTo({ top: rowBottom - blotListElement.clientHeight, behavior: "smooth" });
   }
 }
 

@@ -1141,7 +1141,8 @@ td strong {
 .blot-list-navigation {
   min-width: 0;
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) 30px;
+  grid-template-columns: 1fr;
+  grid-template-rows: 30px minmax(0, auto) 30px;
   gap: var(--space-1);
   align-items: stretch;
 }
@@ -1174,22 +1175,25 @@ td strong {
 .blot-list {
   min-width: 0;
   display: flex;
+  flex-direction: column;
   gap: var(--space-2);
   position: relative;
   min-height: 56px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-bottom: var(--space-1);
+  max-height: min(360px, 42vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: var(--space-1);
   scroll-behavior: smooth;
   scrollbar-width: thin;
-  overscroll-behavior-inline: contain;
+  overscroll-behavior-block: contain;
 }
 
 .blot-list-row {
   min-width: 0;
+  width: 100%;
   min-height: 48px;
-  flex: 1 0 280px;
-  max-width: 520px;
+  flex: 0 0 auto;
+  max-width: none;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: stretch;
@@ -1666,10 +1670,6 @@ td strong {
   .blot-preview,
   .blot-viewer-wrap {
     min-height: 420px;
-  }
-
-  .blot-list-row {
-    flex-basis: min(280px, 82vw);
   }
 }
 
