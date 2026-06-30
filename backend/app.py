@@ -52,6 +52,15 @@ def handle_unexpected_error(error):
     return jsonify({"error": "Unexpected backend error."}), 500
 
 
+@app.errorhandler(413)
+def handle_request_too_large(error):
+    # Werkzeug rejects bodies over MAX_CONTENT_LENGTH before a view runs; give a
+    # clearer hint than the default "capacity limit" message.
+    return jsonify({
+        "error": "Upload is too large for direct API processing. Use the Storage (Blob) upload path for large ZIP files.",
+    }), 413
+
+
 @app.after_request
 def add_security_headers(response):
     response.headers.setdefault("Cache-Control", "no-store")
@@ -143,8 +152,29 @@ CORS(
 )
 
 # ─── Rate limiting ─────────────────────────────────────────────────────────────
+def client_ip_key():
+    # Behind Vercel's proxy, request.remote_addr is the proxy address, so every
+    # client would share one bucket. Vercel populates X-Forwarded-For with the
+    # real client IP, so prefer it (falling back to the peer address locally).
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        client = forwarded.split(",")[0].strip()
+        if client:
+            return client
+    return request.headers.get("X-Real-IP") or get_remote_address()
+
+
+# Wire RATELIMIT_ENABLED into Flask config; flask-limiter reads app.config, not
+# os.environ, so setting the env var alone would otherwise have no effect.
+app.config["RATELIMIT_ENABLED"] = (
+    os.environ.get("RATELIMIT_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+)
+
+# RATELIMIT_STORAGE_URI defaults to in-process memory, which does NOT persist or
+# share across serverless invocations. Set it to a shared backend (e.g. Redis /
+# Upstash) in production so limits are actually enforced.
 limiter = Limiter(
-    get_remote_address,
+    client_ip_key,
     app=app,
     default_limits=["200 per day", "50 per hour"],
     storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
@@ -157,12 +187,17 @@ MAX_ZIP_ENTRIES = 400
 MAX_ZIP_UNCOMPRESSED = int(os.environ.get("MAX_ZIP_UNCOMPRESSED_BYTES", 400 * 1024 * 1024))
 MAX_ZIP_COMPRESSION_RATIO = 200
 MAX_IMAGE_PIXELS = 80_000_000
+# Rendering a composite decodes two channels to float32 and makes several resize
+# copies, so cap the per-channel size lower than the extraction limit to bound
+# peak memory on small serverless functions.
+MAX_RENDER_PIXELS = int(os.environ.get("MAX_RENDER_PIXELS", 40_000_000))
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_JPEG_BYTES = 50 * 1024 * 1024
 MAX_NAME_LENGTH = 200
 MAX_TIF_PAGES = 16
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 16 * 1024 * 1024))
 MAX_PPTX_SLIDES = 40
+MAX_PPTX_IMAGES = 40
 MAX_PPTX_GRAPHS = 120
 MAX_PPTX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PPTX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
@@ -221,7 +256,39 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
     "western-blot-browser-only",
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
-BLOB_ACCESS = "public" if os.environ.get("BLOB_ACCESS") == "public" else "private"
+
+
+def resolve_blob_access():
+    """Public access makes stored blot images world-readable by URL with no auth
+    in front of them. Require an explicit acknowledgment so it cannot be flipped
+    on by a single stray env var; otherwise fall back to private."""
+    requested = (os.environ.get("BLOB_ACCESS") or "").strip().lower()
+    if requested != "public":
+        return "private"
+    acknowledged = (os.environ.get("BLOB_PUBLIC_ACCESS_ACK") or "").strip().lower() in ("true", "1", "yes")
+    if not acknowledged:
+        print(
+            json.dumps({
+                "event": "blob_access_public_blocked",
+                "message": (
+                    "BLOB_ACCESS=public ignored because BLOB_PUBLIC_ACCESS_ACK is not set; "
+                    "stored blot images would be world-readable. Falling back to private."
+                ),
+            }),
+            flush=True,
+        )
+        return "private"
+    print(
+        json.dumps({
+            "event": "blob_access_public_enabled",
+            "message": "Vercel Blob temporary files will be PUBLICLY readable by URL.",
+        }),
+        flush=True,
+    )
+    return "public"
+
+
+BLOB_ACCESS = resolve_blob_access()
 RUNTIME_BLOB_ACCESS = BLOB_ACCESS
 BLOB_API_BASE_URL = "https://vercel.com/api/blob"
 BLOB_API_VERSION = "12"
@@ -1179,6 +1246,12 @@ def render_composite():
 def read_tif_channel(tif_bytes):
     # Display normalization starts from the same validated pixels used for quantification.
     arr = read_raw_channel(tif_bytes)
+    if arr.size > MAX_RENDER_PIXELS:
+        raise PublicError(
+            "Blot image is too large to render a composite preview. "
+            f"Maximum is {MAX_RENDER_PIXELS:,} pixels.",
+            413,
+        )
     low  = np.percentile(arr, 1)
     high = np.percentile(arr, 99)
     if high > low:
@@ -1429,7 +1502,7 @@ def validate_pptx_payload(slides_data):
         slide_type, images, graphs = pptx_slide_parts(slide)
         image_slide_count = validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count)
         image_count += len(images)
-        if image_count > MAX_PPTX_SLIDES:
+        if image_count > MAX_PPTX_IMAGES:
             raise PublicError("Too many blot images in PowerPoint export.")
         graph_count += len(graphs)
         total_image_bytes += validate_pptx_images(images)
