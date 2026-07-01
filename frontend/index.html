@@ -5,6 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Western Blot Fold Change Analyzer</title>
+  <link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'/%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
@@ -17,24 +18,45 @@
 </head>
 
 <body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#3b82f6" />
+              <stop offset="1" stop-color="#0ea5a4" />
+            </linearGradient>
+          </defs>
+          <rect width="32" height="32" rx="8" fill="url(#brandGrad)" />
+          <rect x="8" y="14" width="3.2" height="10" rx="1.6" fill="#fff" opacity=".9" />
+          <rect x="13" y="9" width="3.2" height="15" rx="1.6" fill="#fff" />
+          <rect x="18" y="17" width="3.2" height="7" rx="1.6" fill="#fff" opacity=".8" />
+          <rect x="23" y="12" width="3.2" height="12" rx="1.6" fill="#fff" opacity=".95" />
+        </svg>
+      </div>
+      <div class="brand-text">
+        <p class="eyebrow">Western blot analysis</p>
+        <h1>Fold Change Analyzer</h1>
+      </div>
+    </div>
+
+    <nav class="header-nav main-tabs" aria-label="Main navigation">
+      <button class="main-tab-button active" type="button" data-main-tab="quantification">
+        Quantification
+      </button>
+      <button class="main-tab-button" type="button" data-main-tab="blot-browser">
+        Blot Browser
+      </button>
+    </nav>
+
+    <div class="header-right">
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Switch theme" title="Switch theme">☾</button>
+    </div>
+  </header>
+
   <main class="app-shell" id="appWorkspace">
     <section class="workspace">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">Western blot analysis</p>
-          <h1>Fold Change Analyzer</h1>
-        </div>
-      </header>
-
-      <nav class="main-tabs" aria-label="Main navigation">
-        <button class="main-tab-button active" type="button" data-main-tab="quantification">
-          Quantification
-        </button>
-        <button class="main-tab-button" type="button" data-main-tab="blot-browser">
-          Blot Browser
-        </button>
-      </nav>
-
       <div id="tabQuantification">
         <section class="panel settings-bar" aria-label="Workflow settings">
           <label>
@@ -77,7 +99,7 @@
             <div class="upload-column">
               <div class="section-heading">
                 <span class="badge control">Control</span>
-                <h2>Shared loading control file (optional)</h2>
+                <h2>Loading control file</h2>
               </div>
 
               <div class="source-toggle">
@@ -339,39 +361,43 @@
               </div>
 
               <aside class="blot-analysis-panel" aria-label="Blot analysis">
-                <div class="blot-analysis-tabs" role="tablist" aria-label="Blot analysis sections">
-                  <button class="blot-analysis-tab active" type="button" role="tab"
-                    aria-selected="true" aria-controls="blotAnalysisTools" data-blot-analysis-tab="analysis">
-                    Analysis
-                  </button>
-                  <button class="blot-analysis-tab" type="button" role="tab"
-                    aria-selected="false" aria-controls="blotAnalysisBoxes" data-blot-analysis-tab="boxes">
-                    Drawn boxes
-                  </button>
-                </div>
-                <div id="blotAnalysisTools" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="analysis">
+                <p class="eyebrow">Analysis</p>
+                <div id="blotAnalysisTools" class="blot-analysis-pane">
                   <p class="blot-empty-state">Select a blot to adjust channels and draw boxes.</p>
-                </div>
-                <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="boxes" hidden>
-                  <p class="blot-empty-state">Select a blot to view drawn boxes.</p>
                 </div>
               </aside>
             </div>
 
-            <div class="blot-list-wrap">
-              <p class="eyebrow">Loaded blots</p>
-              <div class="blot-list-navigation">
-                <button class="blot-scroll-button" id="blotScrollUp" type="button"
-                  aria-label="Scroll loaded blots up" aria-controls="blotList" disabled>
-                  &#9652;
+            <div class="blot-bottom-panel">
+              <div class="blot-bottom-tabs" role="tablist" aria-label="Blot browser sections">
+                <button class="blot-analysis-tab active" type="button" role="tab"
+                  aria-selected="true" aria-controls="blotAnalysisLoaded" data-blot-analysis-tab="loaded">
+                  Loaded blots
                 </button>
-                <div id="blotList" class="blot-list">
-                  <p class="blot-empty-state">No blots loaded yet.</p>
+                <button class="blot-analysis-tab" type="button" role="tab"
+                  aria-selected="false" aria-controls="blotAnalysisBoxes" data-blot-analysis-tab="boxes">
+                  Drawn boxes
+                </button>
+              </div>
+
+              <div id="blotAnalysisLoaded" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="loaded">
+                <div class="blot-list-navigation">
+                  <button class="blot-scroll-button" id="blotScrollUp" type="button"
+                    aria-label="Scroll loaded blots up" aria-controls="blotList" disabled>
+                    &#9652;
+                  </button>
+                  <div id="blotList" class="blot-list">
+                    <p class="blot-empty-state">No blots loaded yet.</p>
+                  </div>
+                  <button class="blot-scroll-button" id="blotScrollDown" type="button"
+                    aria-label="Scroll loaded blots down" aria-controls="blotList" disabled>
+                    &#9662;
+                  </button>
                 </div>
-                <button class="blot-scroll-button" id="blotScrollDown" type="button"
-                  aria-label="Scroll loaded blots down" aria-controls="blotList" disabled>
-                  &#9662;
-                </button>
+              </div>
+
+              <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="boxes" hidden>
+                <p class="blot-empty-state">Select a blot to view drawn boxes.</p>
               </div>
             </div>
           </div>

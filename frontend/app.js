@@ -2719,8 +2719,48 @@ document.querySelectorAll(".main-tab-button").forEach(button => {
     const tab = button.dataset.mainTab;
     document.getElementById("tabQuantification").hidden = tab !== "quantification";
     document.getElementById("tabBlotBrowser").hidden = tab !== "blot-browser";
+
+    // Loaded blots should be the first thing shown when entering the browser.
+    if (tab === "blot-browser") setBlotAnalysisTab("loaded");
   });
 });
+
+// ─── Theme toggle ──────────────────────────────────────────────────────────
+const themeToggleButton = document.querySelector("#themeToggle");
+
+function activeTheme() {
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+}
+
+function syncThemeToggle() {
+  if (!themeToggleButton) return;
+  const dark = activeTheme() === "dark";
+  themeToggleButton.textContent = dark ? "☀" : "☾";
+  const label = dark ? "Switch to light theme" : "Switch to dark theme";
+  themeToggleButton.setAttribute("aria-label", label);
+  themeToggleButton.setAttribute("title", label);
+}
+
+function redrawThemedViews() {
+  // Canvas charts read CSS color tokens at draw time, so re-render what is shown.
+  [renderActiveSharedAnalysis, renderCurrentGrouping].forEach((fn) => {
+    try { fn(); } catch (_error) { /* ignore off-screen render errors */ }
+  });
+  try {
+    if (canvasState.image && canvasState.currentBlotId) renderCanvas();
+  } catch (_error) { /* ignore */ }
+}
+
+function toggleTheme() {
+  const next = activeTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { window.localStorage.setItem("blot-theme", next); } catch (_error) { /* ignore */ }
+  syncThemeToggle();
+  redrawThemedViews();
+}
+
+themeToggleButton?.addEventListener("click", toggleTheme);
+syncThemeToggle();
 
 // ─── Blot browser ─────────────────────────────────────────────────────────
 
@@ -3457,15 +3497,18 @@ function renderBlotAnalysisEmpty(message) {
   const boxesPanel = document.getElementById("blotAnalysisBoxes");
   if (toolsPanel) toolsPanel.innerHTML = `<p class="blot-empty-state">${escapeHtml(message)}</p>`;
   if (boxesPanel) boxesPanel.innerHTML = `<p class="blot-empty-state">Select a blot to view drawn boxes.</p>`;
-  setBlotAnalysisTab("analysis");
+  setBlotAnalysisTab("loaded");
 }
 
 function currentBlotAnalysisTab() {
-  return document.querySelector("[data-blot-analysis-tab].active")?.dataset.blotAnalysisTab || "analysis";
+  return document.querySelector("[data-blot-analysis-tab].active")?.dataset.blotAnalysisTab || "loaded";
 }
 
+// The right-hand Analysis panel (#blotAnalysisTools) is always visible and has no
+// [data-blot-analysis-panel], so it is never toggled here. The bottom tabs switch
+// only between the loaded-blot list and the drawn-box list.
 function setBlotAnalysisTab(tabName) {
-  const nextTab = tabName === "boxes" ? "boxes" : "analysis";
+  const nextTab = tabName === "boxes" ? "boxes" : "loaded";
   document.querySelectorAll("[data-blot-analysis-tab]").forEach(button => {
     const isActive = button.dataset.blotAnalysisTab === nextTab;
     button.classList.toggle("active", isActive);
