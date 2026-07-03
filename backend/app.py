@@ -4,12 +4,13 @@ import json
 import re
 import hashlib
 import random
+import shutil
 import tempfile
 import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import numpy as np
@@ -256,6 +257,14 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
     "western-blot-browser-only",
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
+
+# Client cleanup only runs while a tab is open, so temp files from sessions whose
+# tab was closed are orphaned. On each upload we best-effort reclaim session files
+# older than this TTL. Set TEMP_FILE_TTL_SECONDS=0 to disable the sweep.
+TEMP_FILE_TTL_SECONDS = int(os.environ.get("TEMP_FILE_TTL_SECONDS", 24 * 60 * 60))
+TEMP_SWEEP_MAX_DELETES = int(os.environ.get("TEMP_SWEEP_MAX_DELETES", 500))
+TEMP_SWEEP_MAX_PAGES = int(os.environ.get("TEMP_SWEEP_MAX_PAGES", 10))
+MAX_BLOB_LIST_BYTES = 8 * 1024 * 1024
 
 
 def resolve_blob_access():
@@ -743,6 +752,164 @@ def delete_temp_files_safely(descriptors, session_id=None, allow_uploads=False, 
         app.logger.exception("%s failed", context)
 
 
+# ─── Temporary file TTL sweep ─────────────────────────────────────────────────
+# Reclaims blot images from sessions whose browser tab was closed or navigated
+# away (client cleanup can no longer run for them). Scoped to the "sessions/"
+# prefix — uploaded ZIPs are already deleted after processing — and never touches
+# the caller's own in-flight session. All entry points are best-effort: a failure
+# is logged and swallowed so it can never break an upload.
+
+def parse_iso_epoch(value):
+    """Parse an ISO-8601 timestamp (e.g. Vercel Blob's `uploadedAt`) to epoch
+    seconds, tolerating a trailing 'Z'. Returns None when unparseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def session_id_from_temp_path(path):
+    """Return the session-id segment of a 'sessions/<id>/...' path, else None."""
+    if not isinstance(path, str):
+        return None
+    parts = path.split("/")
+    if len(parts) < 2 or parts[0] != "sessions" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def expired_session_blobs(blobs, cutoff_epoch, exclude_session_id=None):
+    """Pure selector: from a Vercel Blob list page, return the {pathname, url}
+    entries under sessions/ that were uploaded at or before `cutoff_epoch` and do
+    not belong to the excluded session. Side-effect free for unit testing."""
+    excluded = safe_id(exclude_session_id) if exclude_session_id else None
+    expired = []
+    for blob in blobs or []:
+        if not isinstance(blob, dict):
+            continue
+        pathname = blob.get("pathname") or blob.get("path") or ""
+        url = blob.get("url")
+        session_id = session_id_from_temp_path(pathname)
+        if not session_id or not isinstance(url, str):
+            continue
+        if excluded and session_id == excluded:
+            continue
+        uploaded = parse_iso_epoch(blob.get("uploadedAt"))
+        if uploaded is None or uploaded > cutoff_epoch:
+            continue
+        expired.append({"pathname": pathname, "url": url})
+    return expired
+
+
+def newest_descendant_mtime(path):
+    """Newest mtime across a directory tree, so a session still being written is
+    not swept mid-upload. Returns None if the path is unreadable."""
+    try:
+        newest = os.path.getmtime(path)
+    except OSError:
+        return None
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(dirpath, name)))
+            except OSError:
+                continue
+    return newest
+
+
+def sweep_expired_local_files(cutoff_epoch, exclude_session_id, max_deletes):
+    base = os.path.join(os.path.abspath(LOCAL_TEMP_DIR), "sessions")
+    if not os.path.isdir(base):
+        return 0
+    excluded = safe_id(exclude_session_id) if exclude_session_id else None
+    removed = 0
+    with os.scandir(base) as entries:
+        for entry in entries:
+            if removed >= max_deletes:
+                break
+            if not entry.is_dir() or not SAFE_PATH_PART_PATTERN.fullmatch(entry.name):
+                continue
+            if excluded and entry.name == excluded:
+                continue
+            newest = newest_descendant_mtime(entry.path)
+            if newest is None or newest > cutoff_epoch:
+                continue
+            shutil.rmtree(entry.path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def vercel_blob_list(prefix=None, cursor=None, limit=1000):
+    params = {"limit": str(limit)}
+    if prefix:
+        params["prefix"] = prefix
+    if cursor:
+        params["cursor"] = cursor
+    url = f"{BLOB_API_BASE_URL}?{urlencode(params)}"
+    result = vercel_blob_request(
+        "GET", url, api_request=True, retries=2, max_response_bytes=MAX_BLOB_LIST_BYTES
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def sweep_expired_vercel_blobs(cutoff_epoch, exclude_session_id, max_deletes):
+    to_delete = []  # (descriptor, validated_path)
+    cursor = None
+    for _page in range(TEMP_SWEEP_MAX_PAGES):
+        page = vercel_blob_list(prefix="sessions/", cursor=cursor) or {}
+        for blob in expired_session_blobs(page.get("blobs", []), cutoff_epoch, exclude_session_id):
+            try:
+                path = validate_temp_path(blob["pathname"])
+            except PublicError:
+                continue
+            to_delete.append(({"url": blob["url"], "pathname": path}, path))
+            if len(to_delete) >= max_deletes:
+                break
+        if len(to_delete) >= max_deletes or not page.get("hasMore"):
+            break
+        cursor = page.get("cursor")
+        if not cursor:
+            break
+    if not to_delete:
+        return 0
+    return vercel_blob_delete(to_delete)
+
+
+def sweep_expired_temp_files(exclude_session_id=None, max_age_seconds=None, max_deletes=None):
+    """Best-effort reclamation of orphaned session temp files. Never raises."""
+    if max_age_seconds is None:
+        max_age_seconds = TEMP_FILE_TTL_SECONDS
+    if max_age_seconds <= 0:
+        return 0
+    if max_deletes is None:
+        max_deletes = TEMP_SWEEP_MAX_DELETES
+    cutoff_epoch = time.time() - max_age_seconds
+    try:
+        if USE_VERCEL_BLOB:
+            removed = sweep_expired_vercel_blobs(cutoff_epoch, exclude_session_id, max_deletes)
+            backend = "vercel-blob"
+        else:
+            removed = sweep_expired_local_files(cutoff_epoch, exclude_session_id, max_deletes)
+            backend = "local"
+        if removed:
+            app.logger.info(
+                "Temp TTL sweep removed=%d backend=%s ttlSeconds=%d",
+                removed, backend, max_age_seconds,
+            )
+        return removed
+    except Exception:
+        app.logger.exception("Temp file TTL sweep failed")
+        return 0
+
+
 def collect_blot_file_descriptors(blots):
     descriptors = []
     for blot in blots or []:
@@ -814,7 +981,9 @@ def upload_zip():
         return jsonify({"error": "Invalid ZIP file."}), 400
 
     try:
-        blots = parse_zip(file_bytes, request_session_id())
+        session_id = request_session_id()
+        blots = parse_zip(file_bytes, session_id)
+        sweep_expired_temp_files(exclude_session_id=session_id)
         return jsonify({"blots": blots})
     except PublicError as error:
         return error_response(error, "ZIP import failed.")
@@ -854,6 +1023,7 @@ def process_storage_upload():
         if not is_valid_zip(file_bytes):
             raise PublicError("Stored object is not a valid ZIP file.")
         blots = parse_zip(file_bytes, session_id)
+        sweep_expired_temp_files(exclude_session_id=session_id)
         print(
             json.dumps({
                 "event": "process_upload_zip_parsed",

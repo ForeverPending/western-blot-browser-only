@@ -1,5 +1,7 @@
 const BACKEND_URL = (CONFIG.BACKEND_URL || "").replace(/\/$/, "");
 const SESSION_STORAGE_KEY = "western-blot:browser-session-id";
+const WORKSPACE_STORAGE_KEY = "western-blot:workspace";
+const WORKSPACE_SCHEMA_VERSION = 1;
 const ALLOWED_TABULAR_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx"]);
 const ALLOWED_ZIP_MIME_TYPES = new Set(["", "application/zip", "application/x-zip-compressed", "application/octet-stream"]);
 const DEFAULT_API_TIMEOUT_MS = 60000;
@@ -2875,6 +2877,7 @@ function sortBlotsByCreatedAt() {
 }
 
 function renderBlotList() {
+  syncClearWorkspaceButton();
   const container = blotListElement;
   if (!container) return;
 
@@ -2976,6 +2979,7 @@ async function deleteBlot(index, button) {
 
   renderBlotList();
   refreshBlotDependentControls();
+  saveWorkspace();
   setZipUploadStatus(`${blot.name} deleted.`, true);
 
   if (wasActive && blotState.blots.length) {
@@ -3208,6 +3212,7 @@ async function uploadZip(file) {
     }
     renderBlotList();
     refreshBlotDependentControls();
+    saveWorkspace();
     setZipUploadStatus(`${file.name} imported.`, true);
   } catch (error) {
     setZipUploadStatus("");
@@ -3427,8 +3432,15 @@ function cleanupBlots(blots, keepalive = false) {
 }
 
 window.addEventListener("pagehide", () => {
+  // Mirror the workspace so a same-tab reload can restore it, then release
+  // in-memory canvas resources. We intentionally no longer delete the
+  // server-side temp images here: doing so destroyed every blot on an
+  // accidental reload. Server files are still reclaimed when the user removes a
+  // blot; sessions abandoned by a genuine tab close (which also clears
+  // sessionStorage and the session id keyed to those files) are left for a
+  // server-side TTL sweep.
+  saveWorkspace();
   disposeCanvasResources();
-  cleanupBlots(blotState.blots, true);
 });
 
 async function selectBlot(index) {
@@ -3627,6 +3639,11 @@ function bindBlotViewerControls(blotId) {
     document.getElementById(id)?.addEventListener("change", () => {
       scheduleCanvasImageReload(blotId, true);
     });
+  });
+  // Switching the background axis changes which flanking strips are sampled, so
+  // redraw the dotted overlay to match. No image reload is needed.
+  document.getElementById("backgroundAxis")?.addEventListener("change", () => {
+    if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
   });
   document.getElementById("duplicateBoxButton")?.addEventListener("click", () => duplicateSelectedBox(blotId));
   document.getElementById("matchBoxSizeButton")?.addEventListener("click", () => matchBoxesToSelectedSize(blotId));
@@ -3843,6 +3860,42 @@ async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
   return response.blob();
 }
 
+// Width, in image pixels, of the strips sampled next to each box to estimate
+// local background. Must match `border` in the backend extract_box_signal().
+const BACKGROUND_BORDER = 3;
+
+function currentBackgroundAxis() {
+  return document.getElementById("backgroundAxis")?.value === "topbottom"
+    ? "topbottom"
+    : "leftright";
+}
+
+// The background-reference strips flanking a box, clamped to the image bounds so
+// the dotted overlay matches exactly what the backend measures.
+function backgroundRegionsForBox(box, axis) {
+  const imgW = canvasState.imageWidth || canvasState.image?.naturalWidth || 0;
+  const imgH = canvasState.imageHeight || canvasState.image?.naturalHeight || 0;
+  const x = Math.max(0, box.x);
+  const y = Math.max(0, box.y);
+  const x2 = imgW ? Math.min(box.x + box.w, imgW) : box.x + box.w;
+  const y2 = imgH ? Math.min(box.y + box.h, imgH) : box.y + box.h;
+  const regions = [];
+
+  if (axis === "topbottom") {
+    const top = Math.max(0, y - BACKGROUND_BORDER);
+    if (y > top) regions.push({ x, y: top, w: x2 - x, h: y - top });
+    const bottom = imgH ? Math.min(imgH, y2 + BACKGROUND_BORDER) : y2 + BACKGROUND_BORDER;
+    if (bottom > y2) regions.push({ x, y: y2, w: x2 - x, h: bottom - y2 });
+  } else {
+    const left = Math.max(0, x - BACKGROUND_BORDER);
+    if (x > left) regions.push({ x: left, y, w: x - left, h: y2 - y });
+    const right = imgW ? Math.min(imgW, x2 + BACKGROUND_BORDER) : x2 + BACKGROUND_BORDER;
+    if (right > x2) regions.push({ x: x2, y, w: right - x2, h: y2 - y });
+  }
+
+  return regions.filter(r => r.w > 0 && r.h > 0);
+}
+
 function renderCanvas() {
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
@@ -3860,19 +3913,32 @@ function renderCanvas() {
     ctx.scale(canvasState.zoom, canvasState.zoom);
     ctx.drawImage(canvasState.image, 0, 0);
 
+    const backgroundAxis = currentBackgroundAxis();
+
     // Draw boxes in image space
     canvasState.boxes.forEach((box, index) => {
       const isSelected = index === canvasState.selectedBoxIndex;
-      ctx.strokeStyle = isSelected
+      const color = isSelected
         ? (themeToken("--annotation-selected") || themeToken("--primary"))
         : themeToken("--annotation");
+
+      ctx.strokeStyle = color;
       ctx.lineWidth = (isSelected ? 3 : 2) / canvasState.zoom;
       ctx.strokeRect(box.x, box.y, box.w, box.h);
 
+      // Dotted outlines of the background regions sampled for this box.
+      const bgRegions = backgroundRegionsForBox(box, backgroundAxis);
+      if (bgRegions.length) {
+        ctx.save();
+        ctx.setLineDash([4 / canvasState.zoom, 3 / canvasState.zoom]);
+        ctx.lineWidth = (isSelected ? 2 : 1.5) / canvasState.zoom;
+        ctx.strokeStyle = color;
+        bgRegions.forEach(r => ctx.strokeRect(r.x, r.y, r.w, r.h));
+        ctx.restore();
+      }
+
       // Number label
-      ctx.fillStyle = isSelected
-        ? (themeToken("--annotation-selected") || themeToken("--primary"))
-        : themeToken("--annotation");
+      ctx.fillStyle = color;
       ctx.font = themeFont(600, 14 / canvasState.zoom, "--font-mono");
       ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
     });
@@ -4447,6 +4513,7 @@ async function saveScan(blotId) {
   renderBoxList(blotId);
 
   refreshBlotDependentControls();
+  saveWorkspace();
 }
 
 async function deleteScan(blotId, scanIndex) {
@@ -4455,6 +4522,7 @@ async function deleteScan(blotId, scanIndex) {
   indexScansForBlot(blotId);
   renderBoxList(blotId);
   refreshBlotDependentControls();
+  saveWorkspace();
 }
 
 function moveBox(index, direction, blotId) {
@@ -4731,4 +4799,184 @@ function downloadBlob(blob, filename) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+// ─── Workspace persistence (survive accidental reloads) ───────────────────────
+// The loaded blots, their extracted scans, and the active selection are mirrored
+// into sessionStorage so a same-tab reload restores the workspace instead of
+// losing it. sessionStorage survives reloads but is cleared when the tab closes,
+// which fits the browser-only, no-durable-storage model: nothing is left behind
+// once the tab goes away. The server-side temp images are keyed by the (also
+// sessionStorage-backed) session id, so the restored descriptors still resolve
+// after a reload. Drawn boxes are transient working state and are not persisted;
+// the durable analysis lives in each scan's lane coordinates.
+
+function hasUnsavedWork() {
+  return blotState.blots.length > 0;
+}
+
+function serializeWorkspace() {
+  const scans = {};
+  blotState.blots.forEach((blot) => {
+    scans[blot.id] = scansForBlot(blot.id);
+  });
+  return {
+    version: WORKSPACE_SCHEMA_VERSION,
+    sessionId: activeSessionId,
+    activeBlotIndex: blotState.activeBlotIndex,
+    blots: blotState.blots,
+    scans,
+  };
+}
+
+function saveWorkspace() {
+  try {
+    if (!hasUnsavedWork()) {
+      window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(serializeWorkspace()));
+  } catch (_error) {
+    /* sessionStorage may be unavailable or full — persistence is best-effort. */
+  }
+}
+
+function clearSavedWorkspace() {
+  try {
+    window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  } catch (_error) {
+    /* ignore */
+  }
+}
+
+function syncClearWorkspaceButton() {
+  const button = document.getElementById("clearWorkspaceButton");
+  if (button) button.hidden = !hasUnsavedWork();
+}
+
+// Explicit "I'm done" cleanup. Unlike a tab close, we hold the live session id
+// here, so we can delete this session's server-side temp images immediately
+// instead of waiting for the TTL sweep, and we drop the saved snapshot too.
+async function clearWorkspace() {
+  if (!blotState.blots.length) return;
+  if (!window.confirm("Clear all loaded blots and their scans from this session? This cannot be undone.")) return;
+
+  void cleanupBlots(blotState.blots.slice());
+  clearSavedWorkspace();
+  disposeCanvasResources();
+
+  blotState.blots = [];
+  blotState.scans = {};
+  blotState.scanById = {};
+  blotState.activeBlotIndex = null;
+
+  const preview = document.querySelector("#blotPreview");
+  if (preview) preview.innerHTML = '<p class="blot-empty-state">Select a blot to preview</p>';
+  renderBlotAnalysisEmpty("Select a blot to adjust channels and draw boxes.");
+  renderBlotList();
+  refreshBlotDependentControls();
+  setZipUploadStatus("Workspace cleared.", true);
+}
+
+document.querySelector("#clearWorkspaceButton")?.addEventListener("click", clearWorkspace);
+
+function readSavedWorkspace() {
+  let raw;
+  try {
+    raw = window.sessionStorage.getItem(WORKSPACE_STORAGE_KEY);
+  } catch (_error) {
+    return null;
+  }
+  if (!raw) return null;
+
+  let snapshot;
+  try {
+    snapshot = JSON.parse(raw);
+  } catch (_error) {
+    clearSavedWorkspace();
+    return null;
+  }
+  if (!snapshot || typeof snapshot !== "object") {
+    clearSavedWorkspace();
+    return null;
+  }
+  if (snapshot.version !== WORKSPACE_SCHEMA_VERSION) {
+    clearSavedWorkspace();
+    return null;
+  }
+  if (snapshot.sessionId && snapshot.sessionId !== activeSessionId) {
+    // Belongs to a different browser session; its server-side files are keyed to
+    // that id and are not reachable here, so discard it.
+    clearSavedWorkspace();
+    return null;
+  }
+  return snapshot;
+}
+
+function restoreWorkspace() {
+  const snapshot = readSavedWorkspace();
+  if (!snapshot) return false;
+
+  const blots = Array.isArray(snapshot.blots) ? snapshot.blots.map(normalizeBlot) : [];
+  if (!blots.length) {
+    clearSavedWorkspace();
+    return false;
+  }
+
+  blotState.blots = blots;
+  blotState.scans = {};
+  blotState.scanById = {};
+  const savedScans = snapshot.scans && typeof snapshot.scans === "object" ? snapshot.scans : {};
+  blots.forEach((blot) => {
+    const scans = Array.isArray(savedScans[blot.id]) ? savedScans[blot.id] : [];
+    setScansForBlot(blot.id, scans);
+    if (!blotState.scans[blot.id]) blotState.scans[blot.id] = [];
+  });
+
+  const savedIndex = snapshot.activeBlotIndex;
+  const activeIndex = Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < blots.length
+    ? savedIndex
+    : null;
+  blotState.activeBlotIndex = activeIndex;
+
+  renderBlotList();
+  refreshBlotDependentControls();
+  if (activeIndex !== null) {
+    // selectBlot re-fetches the composite from the server temp image, which is
+    // still present because we no longer delete it on reload.
+    void selectBlot(activeIndex);
+  }
+  return true;
+}
+
+window.addEventListener("beforeunload", (event) => {
+  // Capture state first so it survives even if the user confirms the reload,
+  // then trigger the browser's native "leave site?" prompt when work is loaded.
+  saveWorkspace();
+  if (!hasUnsavedWork()) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+document.addEventListener("visibilitychange", () => {
+  // pagehide is not always delivered (notably on mobile tab switches), so also
+  // snapshot whenever the page is backgrounded.
+  if (document.visibilityState === "hidden") saveWorkspace();
+});
+
+if (window.__WESTERN_BLOT_TEST__) {
+  // Test-only hook: exercised by the jsdom suite, not exposed in production.
+  // Auto-restore is skipped here so tests can drive it deterministically.
+  window.__westernBlotWorkspace = {
+    hasUnsavedWork,
+    serializeWorkspace,
+    saveWorkspace,
+    readSavedWorkspace,
+    restoreWorkspace,
+    clearSavedWorkspace,
+    clearWorkspace,
+    syncClearWorkspaceButton,
+  };
+} else {
+  restoreWorkspace();
 }

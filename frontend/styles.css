@@ -1193,6 +1193,15 @@ td strong {
   margin: 0;
 }
 
+.blot-clear-button {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.blot-clear-button[hidden] {
+  display: none;
+}
+
 .blot-browser-layout {
   display: flex;
   flex-direction: column;
