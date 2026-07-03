@@ -255,6 +255,14 @@ function validateTokenBodyLength(request) {
 }
 
 async function handlePresignedBlobEvent(request, body) {
+  if (body?.type === "blob.upload-completed" && !webhookPublicKey()) {
+    // Fail closed: without a public key the upload-completed webhook signature
+    // cannot be verified, so a forged completion event could be accepted. The
+    // handler is log-only today, but reject an unverifiable event rather than
+    // trust it (defense-in-depth against future side effects on this path).
+    logEvent("blob_upload_webhook_key_missing");
+    return json({ error: "Upload webhook verification is not configured." }, 500);
+  }
   const response = await handleUploadPresigned({
     body,
     request,

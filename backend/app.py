@@ -264,6 +264,10 @@ USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
 TEMP_FILE_TTL_SECONDS = int(os.environ.get("TEMP_FILE_TTL_SECONDS", 24 * 60 * 60))
 TEMP_SWEEP_MAX_DELETES = int(os.environ.get("TEMP_SWEEP_MAX_DELETES", 500))
 TEMP_SWEEP_MAX_PAGES = int(os.environ.get("TEMP_SWEEP_MAX_PAGES", 10))
+# The sweep fires on every upload; a full LIST+DELETE scan per request amplifies
+# Blob API cost under load. Run it at most once per interval per process — ample
+# for a multi-hour TTL. Set to 0 to sweep on every upload (previous behavior).
+TEMP_SWEEP_MIN_INTERVAL_SECONDS = int(os.environ.get("TEMP_SWEEP_MIN_INTERVAL_SECONDS", 300))
 MAX_BLOB_LIST_BYTES = 8 * 1024 * 1024
 
 
@@ -883,12 +887,28 @@ def sweep_expired_vercel_blobs(cutoff_epoch, exclude_session_id, max_deletes):
     return vercel_blob_delete(to_delete)
 
 
+_last_temp_sweep_monotonic = None
+
+
 def sweep_expired_temp_files(exclude_session_id=None, max_age_seconds=None, max_deletes=None):
     """Best-effort reclamation of orphaned session temp files. Never raises."""
     if max_age_seconds is None:
         max_age_seconds = TEMP_FILE_TTL_SECONDS
     if max_age_seconds <= 0:
         return 0
+    # Throttle to at most one scan per interval per process to bound the Blob
+    # LIST+DELETE amplification when uploads arrive in bursts. Per-process only:
+    # each serverless instance keeps its own timer, which is fine for best-effort
+    # reclamation of a multi-hour-TTL orphan.
+    global _last_temp_sweep_monotonic
+    now = time.monotonic()
+    if (
+        TEMP_SWEEP_MIN_INTERVAL_SECONDS > 0
+        and _last_temp_sweep_monotonic is not None
+        and now - _last_temp_sweep_monotonic < TEMP_SWEEP_MIN_INTERVAL_SECONDS
+    ):
+        return 0
+    _last_temp_sweep_monotonic = now
     if max_deletes is None:
         max_deletes = TEMP_SWEEP_MAX_DELETES
     cutoff_epoch = time.time() - max_age_seconds
@@ -1444,6 +1464,19 @@ def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, 
     if ch_700.shape != ch_800.shape:
         h = max(ch_700.shape[0], ch_800.shape[0])
         w = max(ch_700.shape[1], ch_800.shape[1])
+        # Each channel individually passes read_tif_channel's MAX_RENDER_PIXELS
+        # cap, but that only bounds each array's total pixels. Two channels with
+        # orthogonal aspect ratios (e.g. 30000x1334 and 1334x30000) both fit under
+        # the cap while their union (max height x max width) explodes into a
+        # multi-gigapixel resize target — a sub-1MB upload can force multi-GB
+        # allocation. Bound the union before allocating so the documented memory
+        # ceiling actually holds.
+        if w * h > MAX_RENDER_PIXELS:
+            raise PublicError(
+                "Blot channels differ in size and are too large to composite "
+                f"at a common resolution. Maximum is {MAX_RENDER_PIXELS:,} pixels.",
+                413,
+            )
         ch_700 = np.array(Image.fromarray((ch_700 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
         ch_800 = np.array(Image.fromarray((ch_800 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
 
@@ -1670,6 +1703,8 @@ def validate_pptx_payload(slides_data):
     total_image_bytes = 0
     for slide in slides_data:
         slide_type, images, graphs = pptx_slide_parts(slide)
+        if len(str(slide.get("title", ""))) > MAX_NAME_LENGTH:
+            raise PublicError("A PowerPoint slide title is too long.")
         image_slide_count = validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count)
         image_count += len(images)
         if image_count > MAX_PPTX_IMAGES:
