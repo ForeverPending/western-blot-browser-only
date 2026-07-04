@@ -1405,14 +1405,18 @@ def render_composite():
 
         brightness_700 = float(data.get("brightness700", 1.0))
         contrast_700 = float(data.get("contrast700", 1.0))
+        gamma_700 = float(data.get("gamma700", 1.0))
         brightness_800 = float(data.get("brightness800", 1.0))
         contrast_800 = float(data.get("contrast800", 1.0))
+        gamma_800 = float(data.get("gamma800", 1.0))
         color_mode = data.get("colorMode", "color")
 
         brightness_700 = max(0.1, min(5.0, brightness_700))
         contrast_700 = max(0.1, min(10.0, contrast_700))
+        gamma_700 = max(0.1, min(5.0, gamma_700))
         brightness_800 = max(0.1, min(5.0, brightness_800))
         contrast_800 = max(0.1, min(10.0, contrast_800))
+        gamma_800 = max(0.1, min(5.0, gamma_800))
 
         img = build_composite(
             blot["tif_700_bytes"],
@@ -1420,6 +1424,7 @@ def render_composite():
             brightness_700, contrast_700,
             brightness_800, contrast_800,
             color_mode,
+            gamma_700, gamma_800,
         )
 
         buf = io.BytesIO()
@@ -1451,13 +1456,17 @@ def read_tif_channel(tif_bytes):
     return np.clip(arr, 0.0, 1.0)
 
 
-def apply_adjustments(channel, brightness, contrast):
-    adjusted = (channel - 0.5) * contrast + 0.5
+def apply_adjustments(channel, brightness, contrast, gamma=1.0):
+    # Gamma acts on the normalized [0,1] intensities first: gamma < 1 lifts faint
+    # bands without blowing out strong ones (matching Image Studio's display curve),
+    # gamma > 1 darkens. Contrast (pivot at mid-gray) and additive brightness follow.
+    adjusted = np.power(np.clip(channel, 0.0, 1.0), gamma)
+    adjusted = (adjusted - 0.5) * contrast + 0.5
     adjusted = adjusted + (brightness - 1.0)
     return np.clip(adjusted, 0.0, 1.0)
 
 
-def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, brightness_800, contrast_800, color_mode="color"):
+def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, brightness_800, contrast_800, color_mode="color", gamma_700=1.0, gamma_800=1.0):
     ch_700 = read_tif_channel(tif_700_bytes)
     ch_800 = read_tif_channel(tif_800_bytes)
 
@@ -1480,8 +1489,8 @@ def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, 
         ch_700 = np.array(Image.fromarray((ch_700 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
         ch_800 = np.array(Image.fromarray((ch_800 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
 
-    ch_700 = apply_adjustments(ch_700, brightness_700, contrast_700)
-    ch_800 = apply_adjustments(ch_800, brightness_800, contrast_800)
+    ch_700 = apply_adjustments(ch_700, brightness_700, contrast_700, gamma_700)
+    ch_800 = apply_adjustments(ch_800, brightness_800, contrast_800, gamma_800)
 
     if color_mode == "grayscale":
         blended = np.clip(ch_700 + ch_800, 0.0, 1.0)

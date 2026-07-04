@@ -1177,10 +1177,20 @@ td strong {
   margin-top: var(--space-1);
 }
 
+/* Right-side stack: the Clear button sits below the ZIP control so that
+   toggling it visible never shifts the ZIP picker sideways. */
+.blot-browser-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
+  flex: 0 1 auto;
+}
+
 .blot-zip-drop {
   min-width: 280px;
   min-height: 52px;
-  flex: 0 1 auto;
+  width: 100%;
   grid-template-columns: auto 1fr;
   place-items: center start;
   gap: var(--space-2);
@@ -1194,8 +1204,7 @@ td strong {
 }
 
 .blot-clear-button {
-  flex: 0 0 auto;
-  align-self: center;
+  align-self: flex-end;
 }
 
 .blot-clear-button[hidden] {
@@ -1458,7 +1467,88 @@ td strong {
 .blot-controls-bar {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
+}
+
+.blot-control-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.blot-section-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.blot-section-summary::-webkit-details-marker {
+  display: none;
+}
+
+.blot-section-summary:hover .blot-section-title {
+  color: var(--accent);
+}
+
+.blot-section-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.blot-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-primary);
+}
+
+.blot-section-hint {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.blot-section-chevron {
+  margin-left: auto;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--text-muted);
+  border-bottom: 2px solid var(--text-muted);
+  transform: rotate(-45deg);
+  transition: transform var(--transition);
+}
+
+.blot-control-section[open] > .blot-section-summary .blot-section-chevron {
+  transform: rotate(45deg);
+}
+
+.blot-section-body {
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+/* Groups inside a section drop their own dividers; the section card supplies the
+   separation, and a thin rule only splits stacked groups (e.g. 700/800 view). */
+.blot-section-body .blot-control-group {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.blot-section-body .blot-control-group + .blot-control-group {
+  margin-top: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
 }
 
 .blot-control-group {
@@ -1478,6 +1568,13 @@ td strong {
   color: var(--text-secondary);
   font-size: 11px;
   font-weight: 600;
+}
+
+.control-hint {
+  margin-left: var(--space-1);
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 500;
 }
 
 .blot-control-group input[type="range"] {
@@ -1877,8 +1974,16 @@ td strong {
     padding: var(--space-4);
   }
 
+  .blot-browser-actions {
+    flex: 1 1 100%;
+  }
+
   .blot-zip-drop {
     min-width: 100%;
+  }
+
+  .blot-clear-button {
+    align-self: stretch;
   }
 
   .primary-button,

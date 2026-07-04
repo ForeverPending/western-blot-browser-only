@@ -2545,8 +2545,10 @@ function scanMetadataRows(filters = {}) {
     "Color mode": scan.settings?.colorMode || "",
     "Brightness 700": scan.settings?.brightness700 ?? "",
     "Contrast 700": scan.settings?.contrast700 ?? "",
+    "Gamma 700": scan.settings?.gamma700 ?? "",
     "Brightness 800": scan.settings?.brightness800 ?? "",
     "Contrast 800": scan.settings?.contrast800 ?? "",
+    "Gamma 800": scan.settings?.gamma800 ?? "",
   }));
 }
 
@@ -2574,8 +2576,10 @@ function scanAuditRows(filters = {}) {
       "Color mode": scan.settings?.colorMode || "",
       "Brightness 700": scan.settings?.brightness700 ?? "",
       "Contrast 700": scan.settings?.contrast700 ?? "",
+      "Gamma 700": scan.settings?.gamma700 ?? "",
       "Brightness 800": scan.settings?.brightness800 ?? "",
       "Contrast 800": scan.settings?.contrast800 ?? "",
+      "Gamma 800": scan.settings?.gamma800 ?? "",
     })),
   );
 }
@@ -3482,11 +3486,18 @@ function renderBlotAnalysis(blotId) {
   if (toolsPanel) {
     toolsPanel.innerHTML = `
       <div class="blot-controls-bar">
-        ${blotModeControlsHtml()}
-        ${channelAdjustmentControlsHtml("red", "700")}
-        ${channelAdjustmentControlsHtml("green", "800")}
-        ${boxToolControlsHtml()}
-        ${boxLayoutControlsHtml()}
+        ${analysisSectionHtml("Measurement", blotModeControlsHtml(), { hint: "affects results", open: true })}
+        ${analysisSectionHtml(
+          "Display",
+          channelAdjustmentControlsHtml("red", "700") + channelAdjustmentControlsHtml("green", "800"),
+          { hint: "view only" },
+        )}
+        ${analysisSectionHtml("Boxes", boxToolControlsHtml(), { open: true })}
+        ${analysisSectionHtml("Selected box", boxLayoutControlsHtml(), {
+          id: "selectedBoxSection",
+          open: true,
+          hidden: true,
+        })}
       </div>
     `;
   }
@@ -3531,6 +3542,24 @@ function setBlotAnalysisTab(tabName) {
   });
 }
 
+// Wraps a group of analysis controls in a collapsible <details> section so the
+// panel reads as a few labelled headers instead of one long flat list. `hidden`
+// keeps a section (e.g. "Selected box") out of the DOM flow until it's relevant.
+function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = "", hidden = false } = {}) {
+  return `
+    <details class="blot-control-section"${id ? ` id="${id}"` : ""}${open ? " open" : ""}${hidden ? " hidden" : ""}>
+      <summary class="blot-section-summary">
+        <span class="blot-section-title">${title}</span>
+        ${hint ? `<span class="blot-section-hint">${hint}</span>` : ""}
+        <span class="blot-section-chevron" aria-hidden="true"></span>
+      </summary>
+      <div class="blot-section-body">
+        ${bodyHtml}
+      </div>
+    </details>
+  `;
+}
+
 function blotModeControlsHtml() {
   return `
     <div class="blot-control-group">
@@ -3564,7 +3593,10 @@ function channelAdjustmentControlsHtml(colorClass, channel) {
         <input type="range" min="0.1" max="3" step="0.05" value="1" id="brightness${channel}" />
       </label>
       <label>Contrast
-        <input type="range" min="0.1" max="5" step="0.1" value="1" id="contrast${channel}" />
+        <input type="range" min="0.1" max="10" step="0.1" value="1" id="contrast${channel}" />
+      </label>
+      <label>Gamma <span class="control-hint">lower = reveal faint</span>
+        <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
       </label>
     </div>
   `;
@@ -3632,7 +3664,7 @@ function boxLayoutControlsHtml() {
 }
 
 function bindBlotViewerControls(blotId) {
-  ["brightness700", "contrast700", "brightness800", "contrast800", "colorMode"].forEach(id => {
+  ["brightness700", "contrast700", "gamma700", "brightness800", "contrast800", "gamma800", "colorMode"].forEach(id => {
     document.getElementById(id)?.addEventListener("input", () => {
       scheduleCanvasImageReload(blotId);
     });
@@ -3830,8 +3862,10 @@ function blotById(blotId) {
 function buildCompositePayload(blotId, defaultColorMode = "color") {
   const brightness700 = document.getElementById("brightness700")?.value ?? 1;
   const contrast700   = document.getElementById("contrast700")?.value   ?? 1;
+  const gamma700      = document.getElementById("gamma700")?.value       ?? 1;
   const brightness800 = document.getElementById("brightness800")?.value ?? 1;
   const contrast800   = document.getElementById("contrast800")?.value   ?? 1;
+  const gamma800      = document.getElementById("gamma800")?.value       ?? 1;
   const colorMode     = document.getElementById("colorMode")?.value     ?? defaultColorMode;
   const blot = blotById(blotId);
   if (!blot) throw new Error("Blot is no longer loaded.");
@@ -3840,8 +3874,10 @@ function buildCompositePayload(blotId, defaultColorMode = "color") {
     blot,
     brightness700,
     contrast700,
+    gamma700,
     brightness800,
     contrast800,
+    gamma800,
     colorMode,
   };
 }
@@ -4304,6 +4340,14 @@ function updateBoxToolState() {
       : "Select a box below.";
   }
 
+  // Box layout tools only apply to a selected box, so keep the whole section out
+  // of the panel until there's a selection (and expand it when one appears).
+  const selectedSection = document.getElementById("selectedBoxSection");
+  if (selectedSection) {
+    selectedSection.hidden = !hasSelection;
+    if (hasSelection) selectedSection.open = true;
+  }
+
   document.getElementById("duplicateBoxButton")?.toggleAttribute("disabled", !hasSelection || !hasBoxCapacity);
   document.getElementById("matchBoxSizeButton")?.toggleAttribute("disabled", !canAlign);
   document.querySelectorAll("[data-box-align]").forEach(button => {
@@ -4480,8 +4524,10 @@ async function saveScan(blotId) {
       colorMode: document.getElementById("colorMode")?.value ?? "color",
       brightness700: Number(document.getElementById("brightness700")?.value ?? 1),
       contrast700: Number(document.getElementById("contrast700")?.value ?? 1),
+      gamma700: Number(document.getElementById("gamma700")?.value ?? 1),
       brightness800: Number(document.getElementById("brightness800")?.value ?? 1),
       contrast800: Number(document.getElementById("contrast800")?.value ?? 1),
+      gamma800: Number(document.getElementById("gamma800")?.value ?? 1),
     },
     lanes: canvasState.boxes.map((box, index) => {
       const signal = box.signal || {};
