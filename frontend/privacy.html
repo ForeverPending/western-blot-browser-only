@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy — Western Blot Fold Change Analyzer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css?v=browser-session-1" />
+  <script src="./config.js?v=browser-session-1"></script>
+</head>
+
+<body>
+  <main class="legal-page">
+    <a class="back-link" href="./index.html">← Back to analyzer</a>
+    <h1>Privacy Policy</h1>
+    <p class="legal-meta">Last updated: July 5, 2026</p>
+
+    <p>
+      The Western Blot Fold Change Analyzer (the “app”) is a free, non-commercial
+      research tool. It is built to work without accounts and without collecting
+      personal information about you. This policy explains, plainly, what the app
+      does and does not do with data.
+    </p>
+
+    <h2>The short version</h2>
+    <ul>
+      <li>No accounts, no login, no user database.</li>
+      <li>No analytics, no advertising, no tracking cookies, no fingerprinting.</li>
+      <li>Files you upload are processed temporarily and are not kept.</li>
+      <li>Nothing you do is durably stored — reloading or closing the tab clears your workspace.</li>
+    </ul>
+
+    <h2>What is stored in your browser</h2>
+    <p>The app stores two small values locally in your own browser. Neither is used to identify or track you:</p>
+    <ul>
+      <li><strong>A random session ID</strong> (in <code>sessionStorage</code>) used only to namespace your temporary uploads for the current tab. It is cleared when the tab closes.</li>
+      <li><strong>A theme preference</strong> (light/dark, in <code>localStorage</code>) so the app remembers your display choice.</li>
+    </ul>
+
+    <h2>What happens to files you upload</h2>
+    <p>
+      When you upload blot images (ZIP/TIFF), they are processed to produce your
+      analysis. In the hosted version, images are written as <strong>temporary</strong>
+      objects and are cleaned up when you delete a blot or close the tab. The app
+      is not a storage product and does not guarantee retention: results, scans,
+      and drawn boxes live only in your current session and are not backed up.
+      Export anything you want to keep before leaving.
+    </p>
+
+    <h2>Third-party services (sub-processors)</h2>
+    <p>
+      Serving any website necessarily reveals your IP address to the services that
+      deliver it. The app relies on the following third parties, which may receive
+      your IP address as a normal part of handling requests. The app does not
+      control their logging practices, and does not send them your uploaded data
+      for tracking:
+    </p>
+    <ul>
+      <li><strong>Vercel</strong> — hosting and temporary file storage (Vercel Blob). See <a href="https://vercel.com/legal/privacy-policy" target="_blank" rel="noopener noreferrer">Vercel’s privacy policy</a>.</li>
+      <li><strong>Google Fonts</strong> — serves the Inter and IBM Plex Mono webfonts.</li>
+      <li><strong>SheetJS CDN</strong> — serves the spreadsheet-export library used to build your CSV/XLSX downloads (the export runs in your browser).</li>
+    </ul>
+
+    <h2>Children</h2>
+    <p>
+      This app is intended for researchers and is not directed to children under 13.
+      It does not knowingly collect personal information from anyone, including children.
+    </p>
+
+    <h2>Your choices</h2>
+    <p>
+      Because the app sets no tracking cookies and keeps no account, there is little
+      to manage. You can clear the app’s stored values at any time by clearing your
+      browser’s site data for this site.
+    </p>
+
+    <h2>Changes to this policy</h2>
+    <p>
+      If this policy changes, the “Last updated” date above will change. Material
+      changes to how data is handled will be reflected here before they take effect.
+    </p>
+
+    <h2>Contact</h2>
+    <p>
+      Questions about this policy: <a href="mailto:westernblotanalyzer@gmail.com">westernblotanalyzer@gmail.com</a>.
+    </p>
+
+    <p class="legal-fineprint">
+      This app is a non-commercial research tool. See also the
+      <a href="./terms.html">Terms &amp; Disclaimer</a>.
+    </p>
+  </main>
+</body>
+
+</html>
