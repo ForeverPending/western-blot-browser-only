@@ -2717,9 +2717,14 @@ function filenameSafe(value) {
 
 document.querySelectorAll(".main-tab-button").forEach(button => {
   button.addEventListener("click", () => {
-    // Update active tab button
-    document.querySelectorAll(".main-tab-button").forEach(b => b.classList.remove("active"));
+    // Update active tab button (aria-current exposes the active tab to
+    // assistive tech, since these are nav buttons rather than ARIA tabs).
+    document.querySelectorAll(".main-tab-button").forEach(b => {
+      b.classList.remove("active");
+      b.removeAttribute("aria-current");
+    });
     button.classList.add("active");
+    button.setAttribute("aria-current", "page");
 
     // Show correct content panel
     const tab = button.dataset.mainTab;
@@ -3474,7 +3479,7 @@ function blotViewerHtml() {
   return `
     <div class="blot-viewer">
       <div class="blot-canvas-wrap">
-        <canvas id="blotCanvas"></canvas>
+        <canvas id="blotCanvas" role="img" aria-label="Blot image viewer. Draw boxes over lanes to quantify them; drawn boxes and their signals are listed in the Drawn boxes tab."></canvas>
       </div>
     </div>
   `;
@@ -4155,6 +4160,7 @@ function boxListItemHtml(box, index) {
         value="${escapeHtml(box.laneName || `Lane ${index + 1}`)}"
         data-box-index="${index}"
         placeholder="Lane name"
+        aria-label="Name for box ${index + 1}"
       />
       <span class="box-area">Area <strong>${formatBoxArea(box).toLocaleString()} px²</strong></span>
       ${boxSignalHtml(box)}
@@ -4189,7 +4195,7 @@ function boxSignalHtml(box) {
 function saveScanBarHtml() {
   return `
     <div class="save-scan-bar">
-      <input type="text" id="scanProteinName" placeholder="Protein name (e.g. pERK)" />
+      <input type="text" id="scanProteinName" placeholder="Protein name (e.g. pERK)" aria-label="Protein name for this scan" />
       <button class="primary-button" type="button" id="saveScanButton">Save scan</button>
     </div>
   `;
