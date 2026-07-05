@@ -30,7 +30,15 @@ import base64
 app = Flask(__name__)
 
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
-FRONTEND_FILES = {"index.html", "styles.css", "config.js", "app.js"}
+FRONTEND_FILES = {
+    "index.html",
+    "styles.css",
+    "config.js",
+    "app.js",
+    "privacy.html",
+    "terms.html",
+    "accessibility.html",
+}
 FRONTEND_CONNECT_SOURCES = (
     "'self'",
     "https://vercel.com",
