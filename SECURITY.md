@@ -3,8 +3,9 @@
 ## Browser-session workspace
 
 - The app has no login system and no per-user database records.
-- Supabase Auth, database RLS, and per-user Storage policies are intentionally
-  not part of this build because there is no durable per-user data store.
+- Authentication, database access controls, and per-user storage policies are
+  intentionally not part of this app because there is no durable per-user data
+  store.
 - A random browser-session id is stored in `sessionStorage` and used only to
   namespace temporary upload paths.
 - Blots and scans are not durable application data. Reloading the page clears the
@@ -14,8 +15,8 @@
 ## Authorization stance
 
 - Public API routes are expected for this anonymous, stateless workflow. They do
-  not grant access to saved accounts, saved blots, or Supabase rows because those
-  resources do not exist in this build.
+  not grant access to saved accounts, saved blots, or database rows because those
+  resources do not exist.
 - The security boundary is the temporary browser-session namespace. Treat the
   session id as an unguessable capability for temporary objects, not as a user
   identity.

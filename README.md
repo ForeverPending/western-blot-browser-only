@@ -3,19 +3,20 @@
 Western blot quantification and fold-change analysis with a browser-session
 workspace and a stateless Flask processing backend.
 
-The app no longer has login, database persistence, or saved blot libraries. ZIP
+The app has no login, database persistence, or saved blot libraries. ZIP
 uploads are processed into temporary file descriptors for the current browser
 session. Scans, drawn boxes, and selected blots live only in memory and disappear
-when the page is reloaded. Because this build has no durable per-user data store,
-Supabase Auth and RLS are not required for the current security model.
+when the page is reloaded. Because there is no durable per-user data store,
+authentication and database access controls are not part of the security model.
 
 ## Local development
 
 1. Copy `backend/.env.example` to `backend/.env` if you want to override defaults.
 2. Start the Flask backend from `backend/` on port `5001`.
 3. Serve `frontend/` with any static file server.
-4. Keep `frontend/config.js` set to `BACKEND_URL: "http://127.0.0.1:5001"` and
-   `USE_VERCEL_BLOB_UPLOADS: false`.
+4. No `frontend/config.js` changes are needed. When served from `localhost` or
+   `127.0.0.1`, it auto-detects local mode: `BACKEND_URL` becomes
+   `http://127.0.0.1:5001` and `USE_VERCEL_BLOB_UPLOADS` is disabled.
 
 In local mode, temporary blot files are written under the OS temp directory unless
 `BLOT_TEMP_DIR` is set.
