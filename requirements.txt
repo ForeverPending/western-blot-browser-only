@@ -8,13 +8,11 @@ Flask-Limiter==4.1.1
 itsdangerous==2.2.0
 Jinja2==3.1.6
 limits==5.8.0
-lxml==6.1.1
 MarkupSafe==3.0.3
 numpy==2.4.6
-ordered-set==4.1.0
 packaging==26.2
 pillow==12.2.0
-python-pptx==1.0.2
+redis==8.0.1
 tifffile==2026.5.15
 typing_extensions==4.15.0
 Werkzeug==3.1.8

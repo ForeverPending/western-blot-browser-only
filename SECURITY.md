@@ -8,9 +8,10 @@
   store.
 - A random browser-session id is stored in `sessionStorage` and used only to
   namespace temporary upload paths.
-- Blots and scans are not durable application data. Reloading the page clears the
-  visible workspace; temporary backend objects are cleaned up on blot deletion or
-  page close when the browser can send the cleanup request.
+- Blots and scans are not durable application data. The frontend mirrors the
+  workspace to `sessionStorage` so a same-tab reload can recover it, but it is
+  still tied to the browser session. Temporary backend objects are cleaned up on
+  blot deletion, explicit workspace clearing, or the backend TTL sweep.
 
 ## Authorization stance
 
@@ -43,8 +44,8 @@
 ## No durable storage guarantee
 
 - This is intentionally not a storage product. Do not rely on the app to preserve
-  blots, scans, or results after reload, tab close, failed cleanup, deployment, or
-  provider lifecycle events.
+  blots, scans, or results after tab close, session storage eviction, failed
+  cleanup, deployment, or provider lifecycle events.
 - Temporary Blob objects may remain if a browser closes before cleanup completes.
   Use provider lifecycle/retention tooling if production needs guaranteed
   expiration.
@@ -65,3 +66,11 @@
 - Configure Vercel WAF or platform rate limiting for public API routes. The
   in-app rate limits are useful guardrails, not a replacement for edge-level
   abuse controls.
+- Configure `RATELIMIT_STORAGE_URI` with shared Redis/Upstash. Production refuses
+  the in-memory backend unless `ALLOW_IN_MEMORY_RATE_LIMITS=true` explicitly
+  acknowledges equivalent edge controls.
+- Set `CRON_SECRET` to protect the daily `/api/cron-cleanup` request. Vercel sends
+  it in the `Authorization` header; the endpoint fails closed when it is absent.
+- Keep per-client request, concurrent-processing, and uploaded-byte quotas at the
+  edge. The anonymous Blob-token endpoint's in-process limiter is only a local
+  burst guardrail across warm invocations.

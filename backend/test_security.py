@@ -1,4 +1,3 @@
-import base64
 import io
 import os
 import sys
@@ -109,6 +108,84 @@ class StatelessSessionBackendTests(unittest.TestCase):
         local.close()
         self.assertIn("http://localhost:*", local_csp)
         self.assertIn("http://127.0.0.1:*", local_csp)
+
+    def test_frontend_csp_self_hosts_scripts_and_blocks_inline_styles(self):
+        response = self.client.get("/", headers={"Host": "analysis.example"})
+        csp = response.headers["Content-Security-Policy"]
+        response.close()
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("style-src 'self'", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("cdn.sheetjs.com", csp)
+        self.assertNotIn("fonts.googleapis.com", csp)
+
+    def test_client_config_reports_effective_direct_upload_limit(self):
+        response = self.client.get("/client-config")
+        payload = response.get_json()
+        self.assertEqual(payload["maxDirectUploadBytes"], min(backend.MAX_REQUEST_BYTES, backend.MAX_ZIP_BYTES))
+        self.assertEqual(payload["maxZipUploadBytes"], backend.MAX_ZIP_BYTES)
+
+    def test_cron_cleanup_requires_secret_and_forces_sweep(self):
+        unauthorized = self.client.get("/cron-cleanup")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        with mock.patch.dict(os.environ, {"CRON_SECRET": "test-cron-secret-value"}), mock.patch.object(
+            backend, "sweep_expired_temp_files", return_value=3
+        ) as sweep:
+            response = self.client.get(
+                "/cron-cleanup",
+                headers={"Authorization": "Bearer test-cron-secret-value"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["removed"], 3)
+        sweep.assert_called_once_with(max_deletes=backend.TEMP_SWEEP_MAX_DELETES, force=True)
+
+    def test_zip_validation_preserves_seekable_stream_position(self):
+        archive = make_test_zip()
+        archive.seek(7)
+        self.assertTrue(backend.is_valid_zip(archive))
+        self.assertEqual(archive.tell(), 7)
+
+    def test_local_temp_object_can_stream_to_seekable_file(self):
+        path = f"uploads/{SESSION_ID}/stream-test.zip"
+        source_path = backend.local_temp_file_path(path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        archive_bytes = make_test_zip().getvalue()
+        with open(source_path, "wb") as source:
+            source.write(archive_bytes)
+        try:
+            output = io.BytesIO()
+            copied = backend.copy_temp_file_to_handle(
+                {"path": path},
+                output,
+                SESSION_ID,
+                allow_uploads=True,
+                max_bytes=len(archive_bytes),
+            )
+            self.assertEqual(copied, len(archive_bytes))
+            self.assertEqual(output.getvalue(), archive_bytes)
+        finally:
+            os.remove(source_path)
+
+    def test_stored_zip_processing_streams_and_deletes_upload(self):
+        path = f"uploads/{SESSION_ID}/stored-stream-test.zip"
+        source_path = backend.local_temp_file_path(path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "wb") as source:
+            source.write(make_test_zip().getvalue())
+
+        response = self.client.post(
+            "/process-upload",
+            json={"sessionId": SESSION_ID, "upload": {"path": path}},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(response.get_json()["blots"]), 1)
+        self.assertFalse(os.path.exists(source_path))
+        cleanup = self.client.post(
+            "/cleanup",
+            json={"sessionId": SESSION_ID, "blots": response.get_json()["blots"]},
+        )
+        self.assertEqual(cleanup.status_code, 200)
 
     def test_renders_composite_and_extracts_signals_from_descriptor(self):
         blot = self.upload_blot()
@@ -372,23 +449,6 @@ class StatelessSessionBackendTests(unittest.TestCase):
         tif_bytes, expected = make_licor_pyramid_tif()
         result = backend.decode_validated_tif(tif_bytes, "LI-COR TIF")
         np.testing.assert_array_equal(result, expected)
-
-    def test_pptx_export_rejects_svg_data_urls(self):
-        svg = base64.b64encode(b"<svg></svg>").decode("ascii")
-        with self.assertRaises(backend.PublicError):
-            backend.validate_data_url_size(f"data:image/svg+xml;base64,{svg}")
-
-    def test_pptx_export_rejects_invalid_png_data_urls(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_data_url_size("data:image/png;base64,AAAA")
-
-    def test_pptx_export_rejects_unknown_slide_types(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_pptx_payload([{"type": "image", "images": [], "graphs": []}])
-
-    def test_pptx_export_rejects_mixed_slide_contracts(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_pptx_payload([{"type": "graphs", "images": [{"image": ""}], "graphs": []}])
 
 
 if __name__ == "__main__":

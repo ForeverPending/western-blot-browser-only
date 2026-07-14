@@ -10,24 +10,42 @@ const BLOB_UPLOAD_TIMEOUT_MS = 240000;
 const ZIP_PROCESSING_TIMEOUT_MS = 270000;
 const IMAGE_RENDER_TIMEOUT_MS = 120000;
 const SIGNAL_EXTRACTION_TIMEOUT_MS = 120000;
-const PPTX_EXPORT_TIMEOUT_MS = 180000;
 const DEFAULT_ZIP_UPLOAD_BYTES = 250 * 1024 * 1024;
 const DEFAULT_TABULAR_UPLOAD_BYTES = 25 * 1024 * 1024;
 const JPEG_MIME_TYPE = "image/jpeg";
 const CHART_JPEG_QUALITY = 0.95;
-const PPTX_JPEG_QUALITY = 0.92;
-const PPTX_IMAGE_SLIDE_TYPE = "images";
-const PPTX_GRAPH_SLIDE_TYPE = "graphs";
 const MAX_CANVAS_BOXES = 200;
 const MAX_WORKBOOK_EXPORT_ROWS = 50000;
 const SIGNAL_NUMBER_PATTERN = /^[+-]?(?:(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
 let runtimeConfigPromise = null;
+let sessionRecoveryAvailable = true;
+let sessionStartupWarning = "";
+
+function secureClientId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  throw new Error("This browser cannot create a secure temporary workspace id.");
+}
 
 function browserSessionId() {
-  let sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
-  if (!sessionId) {
-    sessionId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  let sessionId = "";
+  try {
+    sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY) || "";
+    if (!sessionId) {
+      sessionId = secureClientId();
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    }
+  } catch (_error) {
+    sessionRecoveryAvailable = false;
+    sessionStartupWarning = "Tab recovery is unavailable in this browser. Export results before leaving.";
+    sessionId = secureClientId();
   }
   return sessionId;
 }
@@ -38,8 +56,18 @@ function apiUrl(path) {
   return `${BACKEND_URL}${path}`;
 }
 
+// getComputedStyle() forces a style flush and allocates a CSSStyleDeclaration on
+// every call, and these tokens are read many times per canvas/chart frame. The
+// values only change when the theme flips, so cache them and clear on toggleTheme().
+const themeTokenCache = new Map();
+
 function themeToken(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  let value = themeTokenCache.get(name);
+  if (value === undefined) {
+    value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    themeTokenCache.set(name, value);
+  }
+  return value;
 }
 
 function themeFont(weight, size, familyToken = "--font-sans") {
@@ -61,6 +89,7 @@ const state = {
   pairedSets: [],
   pairedAnalyses: [],
   comparisonCustomGroups: [],
+  replicateRows: [],
 };
 
 const blotState = {
@@ -74,12 +103,21 @@ function delay(ms) {
   return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
+function showUserMessage(message) {
+  window.alert(message);
+}
+
+function confirmUserAction(message) {
+  return window.confirm(message);
+}
+
 async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
   const headers = new Headers(fetchOptions.headers || {});
   headers.set("X-Blot-Session", activeSessionId);
   let timeoutId = null;
   let abortController = null;
   let removeAbortListener = null;
+  let timedOut = false;
   const requestOptions = { ...fetchOptions, headers };
 
   if (timeoutMs > 0) {
@@ -90,7 +128,10 @@ async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
       fetchOptions.signal.addEventListener("abort", abortFromSource, { once: true });
       removeAbortListener = () => fetchOptions.signal.removeEventListener("abort", abortFromSource);
     }
-    timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      abortController.abort();
+    }, timeoutMs);
     requestOptions.signal = abortController.signal;
   }
 
@@ -99,7 +140,7 @@ async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
       ...requestOptions,
     });
   } catch (error) {
-    if (abortController?.signal.aborted && timeoutMs > 0) {
+    if (timedOut) {
       throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
     }
     throw error;
@@ -158,9 +199,11 @@ async function apiJson(url, options = {}, fallback = "Request failed.") {
 
 async function runtimeConfig() {
   if (!runtimeConfigPromise) {
-    runtimeConfigPromise = CONFIG.USE_VERCEL_BLOB_UPLOADS
-      ? apiJson(apiUrl("/client-config"), { timeoutMs: SETUP_API_TIMEOUT_MS, retry: 1 }, "Could not load deployment config.")
-      : Promise.resolve({});
+    runtimeConfigPromise = apiJson(
+      apiUrl("/client-config"),
+      { timeoutMs: SETUP_API_TIMEOUT_MS, retry: 1 },
+      "Could not load deployment config.",
+    );
     runtimeConfigPromise = runtimeConfigPromise.catch(error => {
       runtimeConfigPromise = null;
       throw error;
@@ -231,6 +274,29 @@ const els = {
   addComparisonCustomGroupButton: document.querySelector("#addComparisonCustomGroupButton"),
   comparisonGroupSummary: document.querySelector("#comparisonGroupSummary"),
   comparisonGroupedCharts: document.querySelector("#comparisonGroupedCharts"),
+  replicatePanel: document.querySelector("#replicatePanel"),
+  enableReplicateStats: document.querySelector("#enableReplicateStats"),
+  replicateBody: document.querySelector("#replicateBody"),
+  replicateHint: document.querySelector("#replicateHint"),
+  replicateTableBody: document.querySelector("#replicateTableBody"),
+  replicateChart: document.querySelector("#replicateChart"),
+  replicateLaneA: document.querySelector("#replicateLaneA"),
+  replicateLaneB: document.querySelector("#replicateLaneB"),
+  replicateTestResult: document.querySelector("#replicateTestResult"),
+  downloadReplicateChartButton: document.querySelector("#downloadReplicateChartButton"),
+  downloadReplicateCsvButton: document.querySelector("#downloadReplicateCsvButton"),
+  linrangePanel: document.querySelector("#linrangePanel"),
+  linrangeLoadInputs: document.querySelector("#linrangeLoadInputs"),
+  linrangeR2: document.querySelector("#linrangeR2"),
+  checkLinrangeButton: document.querySelector("#checkLinrangeButton"),
+  linrangeResult: document.querySelector("#linrangeResult"),
+  linrangeChart: document.querySelector("#linrangeChart"),
+  linrangeSummary: document.querySelector("#linrangeSummary"),
+  downloadLinrangeChartButton: document.querySelector("#downloadLinrangeChartButton"),
+  linrangeBody: document.querySelector("#linrangeBody"),
+  linrangePlaceholder: document.querySelector("#linrangePlaceholder"),
+  linrangeSampleWrap: document.querySelector("#linrangeSampleWrap"),
+  linrangeSampleSelect: document.querySelector("#linrangeSampleSelect"),
 };
 
 let sharedSampleControls = [];
@@ -296,7 +362,18 @@ els.blockGraphs.addEventListener("click", downloadGeneratedChart);
 els.comparisonGroupedCharts.addEventListener("click", downloadGeneratedChart);
 document.addEventListener("click", handleDocumentClick);
 document.addEventListener("change", handleDocumentChange);
-document.querySelector("#generatePptxButton")?.addEventListener("click", generatePptx);
+
+// Feature 3 — replicate statistics panel.
+els.enableReplicateStats?.addEventListener("change", renderReplicatePanel);
+els.replicateLaneA?.addEventListener("change", renderReplicateTest);
+els.replicateLaneB?.addEventListener("change", renderReplicateTest);
+els.downloadReplicateChartButton?.addEventListener("click", () => downloadCanvasJpeg(els.replicateChart, "replicate-means.jpg"));
+els.downloadReplicateCsvButton?.addEventListener("click", downloadReplicateCsv);
+// Feature 5 — linear-range / dilution check (its own optional tab).
+els.linrangeSampleSelect?.addEventListener("change", handleLinrangeSampleChange);
+els.linrangeLoadInputs?.addEventListener("input", handleLinrangeLoadInput);
+els.checkLinrangeButton?.addEventListener("click", runLinrangeCheck);
+els.downloadLinrangeChartButton?.addEventListener("click", () => downloadCanvasJpeg(els.linrangeChart, "linear-range.jpg"));
 
 renderSharedSampleInputs(1);
 renderPairInputs(2);
@@ -319,6 +396,7 @@ function createAnalysisState(name, title, results, metadata = {}) {
     results,
     normalizationLane: metadata.normalizationLane || "",
     loadingControlAdjusted: metadata.loadingControlAdjusted !== false,
+    controlLabel: metadata.controlLabel || "",
     sources: Array.isArray(metadata.sources) ? metadata.sources : [],
     customGroups: createDefaultCustomGroups(results, analysisRowKey),
   };
@@ -1128,11 +1206,13 @@ function invalidateAnalyses() {
   els.downloadComparisonWorkbookButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
+  if (els.replicatePanel) els.replicatePanel.hidden = true;
+  renderLinrangePanel();
+  state.replicateRows = [];
   els.comparisonLabelPanel.hidden = true;
   els.comparisonChartPanel.hidden = true;
   els.comparisonGroupPanel.hidden = true;
   els.comparisonCustomGroupingPanel.hidden = true;
-  document.getElementById("pptxPanel").hidden = true;
 
   els.chartTitle.textContent = "Upload files to begin";
   els.comparisonChartTitle.textContent = "Comparison graph";
@@ -1218,6 +1298,9 @@ function renderCurrentGrouping() {
 
 function runSharedAnalysis() {
   try {
+    // The loading control is optional and drives normalization implicitly: load a
+    // control and each lane's target is divided by it (relative to the reference
+    // lane); load none and results are the raw target signal relative to reference.
     const controlSource = getSharedControlSource();
     const controlRows = controlSource ? buildSharedRows(controlSource, controlSource.label) : null;
     if (controlSource && !controlRows.length) throw new Error("The control needs readable lanes and signals.");
@@ -1344,6 +1427,7 @@ function buildSharedAnalysis(sampleDataset, index, controlSource, controlRows, n
     computeFoldChange(sampleRows, controlRows, normalizationLane, sampleSource.label, controlLabel),
     {
       normalizationLane,
+      controlLabel,
       loadingControlAdjusted: Boolean(controlSource),
       sources,
     },
@@ -1436,6 +1520,11 @@ function computeFoldChange(sampleRows, controlRows, normalizationLane, sampleLab
   const hasControlRows = Array.isArray(controlRows) && controlRows.length > 0;
   if (hasControlRows) assertUniqueLanes(controlRows, controlLabel);
 
+  // A loading control is optional and drives normalization implicitly: with one,
+  // foldChange = (S_i/L_i) / (S_ref/L_ref); without one, foldChange = S_i / S_ref.
+  // The control may be a housekeeping band (GAPDH, actin…) or a total-protein stain
+  // (REVERT/Ponceau/stain-free) — the math is identical, so which one it is is
+  // recorded via the control's name rather than as a separate mode.
   const sampleMap = new Map(sampleRows.map((row) => [row.lane, row]));
   const controlMap = hasControlRows ? new Map(controlRows.map((row) => [row.lane, row])) : new Map();
   const baselineSample = sampleMap.get(normalizationLane);
@@ -1517,11 +1606,12 @@ function renderActiveSharedAnalysis() {
   renderResultTable(analysis.results);
   renderLabelEditor(analysis.results);
   renderGroupedGraphs();
+  renderReplicatePanel();
+  renderLinrangePanel();
   els.downloadChartButton.disabled = false;
   els.downloadCsvButton.disabled = false;
   els.downloadWorkbookButton.disabled = false;
   els.labelPanel.hidden = false;
-  document.getElementById("pptxPanel").hidden = false;
   renderWorkflowState();
 }
 
@@ -1627,6 +1717,586 @@ function drawAngledLabel(ctx, text, x, y) {
   ctx.fillStyle = themeToken("--text-secondary");
   ctx.font = themeFont(600, 12);
   ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+// ─── Feature 3: replicate statistics (core math) ──────────────────────────────
+// Descriptive stats + an error-bar chart + a Welch t-test. The "Replicates"
+// grouping (renderReplicatePanel) pools same-target sample analyses via
+// buildReplicateRows() and renders drawBarChartWithError(). Descriptive-first:
+// the built-in Welch test is an in-app screen — the UI labels its p-value
+// "confirm in Prism/R" rather than treating it as final.
+function summarizeReplicates(values) {
+  const xs = values.filter((v) => Number.isFinite(v));
+  const n = xs.length;
+  if (!n) return { n: 0, mean: NaN, sd: 0, sem: 0, ci95: 0 };
+  const mean = xs.reduce((a, b) => a + b, 0) / n;
+  const variance = n > 1 ? xs.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0;
+  const sd = Math.sqrt(variance);
+  const sem = n > 1 ? sd / Math.sqrt(n) : 0;
+  return { n, mean, sd, sem, ci95: n > 1 ? tCritical95(n - 1) * sem : 0 };
+}
+
+const T_TABLE_95 = { 1: 12.71, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+  7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086,
+  30: 2.042, 60: 2.0, 120: 1.98 };
+// Two-tailed t critical value at 95%. For a df between tabulated points we linearly
+// interpolate between the two bracketing entries rather than snapping to the next
+// higher df (which biased the CI slightly too narrow — anti-conservative). Exact at
+// df 1-10; beyond the last row (120) it converges to the normal approximation.
+function tCritical95(df) {
+  if (df <= 0) return NaN;
+  const keys = Object.keys(T_TABLE_95).map(Number).sort((a, b) => a - b);
+  if (df <= keys[0]) return T_TABLE_95[keys[0]];
+  if (df >= keys[keys.length - 1]) return 1.96;
+  for (let i = 1; i < keys.length; i += 1) {
+    const hi = keys[i];
+    if (df <= hi) {
+      const lo = keys[i - 1];
+      if (df === hi) return T_TABLE_95[hi];
+      const frac = (df - lo) / (hi - lo);
+      return T_TABLE_95[lo] + frac * (T_TABLE_95[hi] - T_TABLE_95[lo]);
+    }
+  }
+  return 1.96;
+}
+
+// Group replicate analyses by lane label → per-lane mean/SD/SEM/CI over n reps.
+function buildReplicateRows(analyses) {
+  const maps = analyses.map((a) => new Map(a.results.map((r) => [r.displayLane || r.lane, r.foldChange])));
+  if (!maps.length) return [];
+  const labels = [...maps[0].keys()].filter((label) => maps.every((m) => m.has(label)));
+  return labels.map((label) => {
+    const values = maps.map((m) => m.get(label));
+    return { label, values, ...summarizeReplicates(values) };
+  });
+}
+
+function drawBarChartWithError(canvas, rows, title) {
+  const ctx = canvas.getContext("2d");
+  const padding = { top: 42, right: 32, bottom: 92, left: 72 };
+  const plotWidth = canvas.width - padding.left - padding.right;
+  const plotHeight = canvas.height - padding.top - padding.bottom;
+  const maxValue = Math.max(1.2, ...rows.map((r) => r.mean + (r.ci95 || 0))) * 1.16;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = themeToken("--surface");
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid(ctx, canvas, padding, plotHeight, maxValue);
+  const band = plotWidth / Math.max(rows.length, 1);
+  const barWidth = Math.min(56, band * 0.56);
+  rows.forEach((row, index) => {
+    const x = padding.left + band * index + (band - barWidth) / 2;
+    const cx = x + barWidth / 2;
+    const barHeight = (row.mean / maxValue) * plotHeight;
+    const yTop = padding.top + plotHeight - barHeight;
+    ctx.fillStyle = themeToken("--chart-series-1");
+    ctx.fillRect(x, yTop, barWidth, barHeight);
+    if (row.n > 1 && row.ci95) {
+      const hi = padding.top + plotHeight - ((row.mean + row.ci95) / maxValue) * plotHeight;
+      const lo = padding.top + plotHeight - ((row.mean - row.ci95) / maxValue) * plotHeight;
+      ctx.strokeStyle = themeToken("--text");
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(cx, hi); ctx.lineTo(cx, lo);
+      ctx.moveTo(cx - 5, hi); ctx.lineTo(cx + 5, hi);
+      ctx.moveTo(cx - 5, lo); ctx.lineTo(cx + 5, lo);
+      ctx.stroke();
+    }
+    drawValueLabel(ctx, row.mean, cx, yTop - 12);
+    drawAngledLabel(ctx, `${row.label} (n=${row.n})`, cx, padding.top + plotHeight + 18);
+  });
+  drawAxes(ctx, canvas, padding, plotHeight);
+  drawTitle(ctx, canvas, title);
+}
+
+// Welch's unequal-variance t-test (two-tailed p via the regularized incomplete
+// beta). Label any in-tool p-value "confirm in Prism/R" — see Feature 3 notes.
+function welchTTest(a, b) {
+  const A = a.filter(Number.isFinite), B = b.filter(Number.isFinite);
+  const na = A.length, nb = B.length;
+  if (na < 2 || nb < 2) return { t: NaN, df: NaN, p: NaN };
+  const ma = A.reduce((x, y) => x + y, 0) / na;
+  const mb = B.reduce((x, y) => x + y, 0) / nb;
+  const va = A.reduce((x, y) => x + (y - ma) ** 2, 0) / (na - 1);
+  const vb = B.reduce((x, y) => x + (y - mb) ** 2, 0) / (nb - 1);
+  const se = Math.sqrt(va / na + vb / nb);
+  if (se === 0) return { t: NaN, df: NaN, p: NaN };
+  const t = (ma - mb) / se;
+  const df = (va / na + vb / nb) ** 2 /
+    ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1));
+  return { t, df, p: betai(df / 2, 0.5, df / (df + t * t)) };
+}
+function betai(a, b, x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bt = Math.exp(gammaln(a + b) - gammaln(a) - gammaln(b) + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2)
+    ? bt * betacf(a, b, x) / a
+    : 1 - bt * betacf(b, a, 1 - x) / b;
+}
+function betacf(a, b, x) {
+  const MAXIT = 200, EPS = 3e-12, FPMIN = 1e-300;
+  const qab = a + b, qap = a + 1, qam = a - 1;
+  let c = 1, d = 1 - qab * x / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAXIT; m++) {
+    const m2 = 2 * m;
+    let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d; h *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d; const del = d * c; h *= del;
+    if (Math.abs(del - 1) < EPS) break;
+  }
+  return h;
+}
+function gammaln(x) {
+  const cof = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+    -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+  let y = x;
+  let tmp = x + 5.5;
+  tmp -= (x + 0.5) * Math.log(tmp);
+  let ser = 1.000000000190015;
+  for (let j = 0; j < 6; j++) ser += cof[j] / ++y;
+  return -tmp + Math.log(2.5066282746310005 * ser / x);
+}
+
+// ─── Feature 5: linear-range / dilution check (core math) ─────────────────────
+// Feed a dilution-series scan as points [{load, signal, saturatedPixels}]; this
+// reports the standard R² fit and the longest low-end span meeting r2Target that
+// contains no saturated lanes. (Standard regression — NOT LI-COR's proprietary
+// piecewise method.)
+function linearRegression(points) {
+  const n = points.length;
+  const sx = points.reduce((a, p) => a + p.load, 0);
+  const sy = points.reduce((a, p) => a + p.signal, 0);
+  const sxx = points.reduce((a, p) => a + p.load * p.load, 0);
+  const sxy = points.reduce((a, p) => a + p.load * p.signal, 0);
+  const syy = points.reduce((a, p) => a + p.signal * p.signal, 0);
+  const denom = n * sxx - sx * sx;
+  const slope = denom ? (n * sxy - sx * sy) / denom : NaN;
+  const rDen = Math.sqrt(denom * (n * syy - sy * sy));
+  const r = rDen ? (n * sxy - sx * sy) / rDen : NaN;
+  return { slope, intercept: (sy - slope * sx) / n, r2: r * r, n };
+}
+function linearRangeAnalysis(points, r2Target = 0.99) {
+  const sorted = [...points].sort((a, b) => a.load - b.load);
+  let linear = null;
+  for (let end = sorted.length; end >= 2; end--) {
+    const subset = sorted.slice(0, end);
+    if (subset.some((p) => (p.saturatedPixels || 0) > 0)) continue;
+    const fit = linearRegression(subset);
+    if (fit.r2 >= r2Target) {
+      linear = { ...fit, loadRange: [subset[0].load, subset[end - 1].load] };
+      break;
+    }
+  }
+  return { full: linearRegression(sorted), linear, saturatedCount: sorted.filter((p) => (p.saturatedPixels || 0) > 0).length };
+}
+
+// ─── Feature 3: replicate statistics UI ───────────────────────────────────────
+// Pools the loaded sample-file analyses (one replicate each) into per-lane
+// mean ± 95% CI, an error-bar chart, and an opt-in Welch t-test between two lanes.
+function setReplicateExportEnabled(enabled) {
+  if (els.downloadReplicateChartButton) els.downloadReplicateChartButton.disabled = !enabled;
+  if (els.downloadReplicateCsvButton) els.downloadReplicateCsvButton.disabled = !enabled;
+}
+
+function renderReplicatePanel() {
+  const panel = els.replicatePanel;
+  if (!panel) return;
+  const analyses = state.sharedAnalyses;
+  const canReplicate = state.mode === "shared" && analyses.length >= 2;
+  panel.hidden = !canReplicate;
+  if (!canReplicate) {
+    state.replicateRows = [];
+    return;
+  }
+
+  const enabled = els.enableReplicateStats.checked;
+  els.replicateBody.hidden = !enabled;
+  if (!enabled) {
+    els.replicateHint.textContent =
+      `${analyses.length} sample files are loaded. Enable this to pool them as replicates and show mean ± 95% CI per lane.`;
+    state.replicateRows = [];
+    setReplicateExportEnabled(false);
+    return;
+  }
+
+  const rows = buildReplicateRows(analyses);
+  state.replicateRows = rows;
+  if (!rows.length) {
+    els.replicateHint.textContent =
+      "No lane label is shared across every sample file, so replicates can't be pooled. Align lane names first.";
+    els.replicateTableBody.innerHTML = `<tr><td colspan="6">No shared lanes.</td></tr>`;
+    drawChartMessage(els.replicateChart, "No shared lanes across replicates");
+    populateReplicateLaneSelects([]);
+    els.replicateTestResult.textContent = "";
+    setReplicateExportEnabled(false);
+    return;
+  }
+
+  els.replicateHint.textContent =
+    `Pooled across ${analyses.length} replicates (each loaded sample file counts as one replicate). ` +
+    `Values are fold changes relative to lane "${analyses[0].normalizationLane}".`;
+  renderReplicateTable(rows);
+  drawBarChartWithError(els.replicateChart, rows, "Replicate mean fold change (95% CI)");
+  populateReplicateLaneSelects(rows);
+  renderReplicateTest();
+  setReplicateExportEnabled(true);
+}
+
+function renderReplicateTable(rows) {
+  els.replicateTableBody.innerHTML = rows
+    .map(
+      (row) => `
+        <tr>
+          <td>${escapeHtml(row.label)}</td>
+          <td>${row.n}</td>
+          <td><strong>${formatNumber(row.mean)}</strong></td>
+          <td>${formatNumber(row.sd)}</td>
+          <td>${formatNumber(row.sem)}</td>
+          <td>${row.n > 1 ? formatNumber(row.ci95) : "N/A"}</td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function populateReplicateLaneSelects(rows) {
+  const labels = rows.map((row) => row.label);
+  const options = labels
+    .map((label) => `<option value="${escapeHtml(label)}">${escapeHtml(label)}</option>`)
+    .join("");
+  [els.replicateLaneA, els.replicateLaneB].forEach((select, index) => {
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = options;
+    if (labels.includes(previous)) select.value = previous;
+    else if (labels.length > index) select.value = labels[index];
+  });
+}
+
+function renderReplicateTest() {
+  if (!els.replicateTestResult) return;
+  const rows = state.replicateRows;
+  if (!rows || rows.length < 2) {
+    els.replicateTestResult.textContent = "Load at least two lanes to compare.";
+    return;
+  }
+  const a = rows.find((row) => row.label === els.replicateLaneA.value);
+  const b = rows.find((row) => row.label === els.replicateLaneB.value);
+  if (!a || !b) {
+    els.replicateTestResult.textContent = "";
+    return;
+  }
+  if (a.label === b.label) {
+    els.replicateTestResult.textContent = "Pick two different lanes to compare.";
+    return;
+  }
+  const result = welchTTest(a.values, b.values);
+  if (!Number.isFinite(result.p)) {
+    els.replicateTestResult.textContent =
+      `Need at least 2 replicates with variance in both "${a.label}" and "${b.label}" to run a t-test.`;
+    return;
+  }
+  els.replicateTestResult.textContent =
+    `${a.label} vs ${b.label}: t(${result.df.toFixed(1)}) = ${result.t.toFixed(3)}, p = ${formatPValue(result.p)}.`;
+}
+
+function formatPValue(p) {
+  if (!Number.isFinite(p)) return "N/A";
+  if (p < 0.0001) return "< 0.0001";
+  return p.toFixed(4);
+}
+
+function downloadReplicateCsv() {
+  const rows = state.replicateRows;
+  if (!rows || !rows.length) return;
+  const maxReps = Math.max(...rows.map((row) => row.values.length));
+  const repHeaders = Array.from({ length: maxReps }, (_, i) => `Rep ${i + 1}`);
+  const header = ["Lane", "n", "Mean", "SD", "SEM", "95% CI", ...repHeaders].map(csvCell).join(",");
+  const lines = [
+    header,
+    ...rows.map((row) =>
+      [
+        row.label,
+        row.n,
+        formatNumber(row.mean),
+        formatNumber(row.sd),
+        formatNumber(row.sem),
+        row.n > 1 ? formatNumber(row.ci95) : "N/A",
+        ...row.values.map((v) => formatNumber(v)),
+      ]
+        .map(csvCell)
+        .join(","),
+    ),
+  ];
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "replicate-summary.csv";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── Feature 5: linear-range / dilution check UI ──────────────────────────────
+// Lets the user enter the load per lane for the active sample and checks whether
+// signal stays proportional to load (standard OLS R², saturated lanes excluded).
+function guessLoadFromLabel(label) {
+  const match = String(label).match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const value = Number(match[0]);
+  return Number.isFinite(value) ? value : null;
+}
+
+// Lives in its own optional "Linear range" tab. The panel itself stays visible
+// while that tab is open; an inner body/placeholder switch reflects whether the
+// selected sample has enough data to check, so it never clutters the main results.
+function renderLinrangePanel() {
+  const panel = els.linrangePanel;
+  if (!panel) return;
+
+  const analyses = state.mode === "shared" ? state.sharedAnalyses : [];
+  renderLinrangeSampleSelect(analyses);
+
+  const analysis = activeAnalysis();
+  const rows = (state.mode === "shared" && analysis?.results) || [];
+  const ready = rows.length >= 3;
+
+  if (els.linrangeBody) els.linrangeBody.hidden = !ready;
+  if (els.linrangePlaceholder) {
+    els.linrangePlaceholder.hidden = ready;
+    if (!ready) els.linrangePlaceholder.textContent = linrangePlaceholderText(analyses.length, rows.length);
+  }
+  if (!ready) {
+    els.linrangeResult.hidden = true;
+    els.downloadLinrangeChartButton.disabled = true;
+    return;
+  }
+
+  analysis.linrangeLoads = analysis.linrangeLoads || {};
+  els.linrangeLoadInputs.innerHTML = rows
+    .map((row) => {
+      const label = row.displayLane || row.lane;
+      const stored = analysis.linrangeLoads[label];
+      const guess = stored !== undefined ? stored : guessLoadFromLabel(label);
+      const value = guess === null || guess === undefined ? "" : escapeHtml(String(guess));
+      return `
+        <label class="linrange-load">
+          <span>${escapeHtml(label)}</span>
+          <input type="number" step="any" min="0" data-linrange-lane="${escapeHtml(label)}"
+            value="${value}" placeholder="load" />
+        </label>`;
+    })
+    .join("");
+
+  // A fresh sample selection starts with no result shown until the user re-checks.
+  els.linrangeResult.hidden = true;
+  els.downloadLinrangeChartButton.disabled = true;
+}
+
+// The check runs on one shared-mode sample; let the user pick which from inside
+// this tab (the Quantification sample tabs are not visible here). Choosing a
+// sample here also makes it the active sample everywhere, keeping one source of
+// truth. Hidden when there is nothing to choose between.
+function renderLinrangeSampleSelect(analyses) {
+  const wrap = els.linrangeSampleWrap;
+  const select = els.linrangeSampleSelect;
+  if (!wrap || !select) return;
+  if (analyses.length <= 1) {
+    wrap.hidden = true;
+    select.innerHTML = "";
+    return;
+  }
+  wrap.hidden = false;
+  select.innerHTML = analyses
+    .map((analysis, index) => `<option value="${index}">${escapeHtml(analysis.name)}</option>`)
+    .join("");
+  select.value = String(Math.min(state.activeSampleIndex, analyses.length - 1));
+}
+
+function linrangePlaceholderText(sampleCount, laneCount) {
+  if (state.mode !== "shared") {
+    return "The linear-range check runs on a “Multiple samples, optional control” analysis. Switch modes in the Quantification tab and run an analysis first.";
+  }
+  if (!sampleCount) {
+    return "Run an analysis in the Quantification tab first, then come back here to check whether a dilution series stays linear.";
+  }
+  return `This check needs at least 3 lanes in the selected sample (found ${laneCount}). Load a dilution series to test linearity.`;
+}
+
+function handleLinrangeSampleChange(event) {
+  const index = Number(event.target.value);
+  if (!Number.isInteger(index) || index < 0 || index >= state.sharedAnalyses.length) return;
+  state.activeSampleIndex = index;
+  // Keep the Quantification sample tabs in sync; renderActiveSharedAnalysis then
+  // refreshes this panel via renderLinrangePanel.
+  renderSampleTabs();
+  renderActiveSharedAnalysis();
+}
+
+function handleLinrangeLoadInput(event) {
+  const input = event.target.closest("[data-linrange-lane]");
+  if (!input) return;
+  const analysis = activeAnalysis();
+  if (!analysis) return;
+  analysis.linrangeLoads = analysis.linrangeLoads || {};
+  const raw = input.value.trim();
+  if (raw === "") delete analysis.linrangeLoads[input.dataset.linrangeLane];
+  else analysis.linrangeLoads[input.dataset.linrangeLane] = raw;
+}
+
+function runLinrangeCheck() {
+  const analysis = activeAnalysis();
+  if (!analysis) return;
+  const r2Target = clampNumber(Number(els.linrangeR2.value), 0.5, 0.9999, 0.99);
+  els.linrangeR2.value = r2Target;
+
+  const points = [];
+  const skipped = [];
+  (analysis.results || []).forEach((row) => {
+    const label = row.displayLane || row.lane;
+    const loadRaw = (analysis.linrangeLoads || {})[label];
+    const load = Number(loadRaw);
+    if (loadRaw === undefined || loadRaw === "" || !Number.isFinite(load)) {
+      skipped.push(label);
+      return;
+    }
+    points.push({ label, load, signal: row.sampleSignal, saturatedPixels: Number(row.saturatedPixels) || 0 });
+  });
+
+  els.linrangeResult.hidden = false;
+  if (points.length < 3) {
+    els.linrangeSummary.innerHTML =
+      `<p class="linrange-warning">Enter a numeric load for at least 3 lanes (found ${points.length}).</p>`;
+    drawChartMessage(els.linrangeChart, "Need ≥ 3 lanes with a load value");
+    els.downloadLinrangeChartButton.disabled = true;
+    return;
+  }
+
+  const result = linearRangeAnalysis(points, r2Target);
+  renderLinrangeSummary(result, points, skipped, r2Target);
+  drawLinearRangeChart(els.linrangeChart, points, result);
+  els.downloadLinrangeChartButton.disabled = false;
+}
+
+function renderLinrangeSummary(result, points, skipped, r2Target) {
+  const { full, linear, saturatedCount } = result;
+  const parts = [
+    `<p><strong>All ${points.length} points:</strong> R² = ${formatNumber(full.r2)}, slope = ${formatNumber(full.slope)}.</p>`,
+  ];
+  if (linear) {
+    const [lo, hi] = linear.loadRange;
+    parts.push(
+      `<p class="linrange-ok"><strong>Linear range:</strong> load ${formatNumber(lo)}–${formatNumber(hi)} ` +
+        `(${linear.n} points), R² = ${formatNumber(linear.r2)} ≥ ${formatNumber(r2Target)}.</p>`,
+    );
+    if (linear.n === 2) {
+      parts.push(
+        `<p class="linrange-warning">Only 2 points define this range, so R² = 1 is trivial. ` +
+          "Add more load values to confirm linearity.</p>",
+      );
+    }
+  } else {
+    parts.push(
+      `<p class="linrange-warning">No span of unsaturated points reaches R² ≥ ${formatNumber(r2Target)}. ` +
+        "Signal may be outside its linear range — reduce load or exposure.</p>",
+    );
+  }
+  if (saturatedCount > 0) {
+    parts.push(
+      `<p class="linrange-warning">${saturatedCount} saturated lane${saturatedCount === 1 ? "" : "s"} excluded from the fit.</p>`,
+    );
+  }
+  if (skipped.length) {
+    parts.push(`<p class="muted-text">No load entered for: ${skipped.map(escapeHtml).join(", ")}.</p>`);
+  }
+  els.linrangeSummary.innerHTML = parts.join("");
+}
+
+function drawLinearRangeChart(canvas, points, result) {
+  const ctx = canvas.getContext("2d");
+  const padding = { top: 42, right: 32, bottom: 64, left: 84 };
+  const plotWidth = canvas.width - padding.left - padding.right;
+  const plotHeight = canvas.height - padding.top - padding.bottom;
+  const maxLoad = Math.max(...points.map((p) => p.load), 1) * 1.08;
+  const maxSignal = Math.max(...points.map((p) => p.signal), 1) * 1.12;
+  const xOf = (load) => padding.left + (load / maxLoad) * plotWidth;
+  const yOf = (signal) => padding.top + plotHeight - (signal / maxSignal) * plotHeight;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = themeToken("--surface");
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = themeToken("--border");
+  ctx.lineWidth = 1;
+  ctx.fillStyle = themeToken("--text-muted");
+  ctx.font = themeFont(500, 12, "--font-mono");
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i <= 5; i += 1) {
+    const value = (maxSignal / 5) * i;
+    const y = yOf(value);
+    ctx.beginPath();
+    ctx.moveTo(padding.left, y);
+    ctx.lineTo(canvas.width - padding.right, y);
+    ctx.stroke();
+    ctx.fillText(value.toLocaleString(undefined, { maximumFractionDigits: 0 }), padding.left - 10, y);
+  }
+
+  const fit = result.linear || result.full;
+  if (fit && Number.isFinite(fit.slope)) {
+    ctx.strokeStyle = themeToken("--chart-series-2") || themeToken("--primary");
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(xOf(0), yOf(fit.intercept));
+    ctx.lineTo(xOf(maxLoad), yOf(fit.intercept + fit.slope * maxLoad));
+    ctx.stroke();
+  }
+
+  const linearRange = result.linear?.loadRange;
+  points.forEach((p) => {
+    const inLinear = linearRange && p.load >= linearRange[0] && p.load <= linearRange[1] && !p.saturatedPixels;
+    ctx.fillStyle = p.saturatedPixels > 0
+      ? themeToken("--danger")
+      : inLinear
+        ? themeToken("--chart-series-1")
+        : themeToken("--text-muted");
+    ctx.beginPath();
+    ctx.arc(xOf(p.load), yOf(p.signal), 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  ctx.strokeStyle = themeToken("--text");
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padding.left, padding.top);
+  ctx.lineTo(padding.left, padding.top + plotHeight);
+  ctx.lineTo(canvas.width - padding.right, padding.top + plotHeight);
+  ctx.stroke();
+
+  ctx.fillStyle = themeToken("--text-secondary");
+  ctx.font = themeFont(600, 12);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  points.forEach((p) => ctx.fillText(String(p.load), xOf(p.load), padding.top + plotHeight + 8));
+
+  drawTitle(ctx, canvas, "Signal vs load");
+  ctx.fillStyle = themeToken("--text-muted");
+  ctx.font = themeFont(600, 12);
+  ctx.textAlign = "center";
+  ctx.fillText("Load", padding.left + plotWidth / 2, canvas.height - 18);
+  ctx.save();
+  ctx.translate(22, padding.top + plotHeight / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("Signal", 0, 0);
   ctx.restore();
 }
 
@@ -2215,42 +2885,34 @@ function downloadSharedCsv() {
 function downloadSharedWorkbook() {
   if (!state.sharedAnalyses.length || !ensureWorkbookExporter()) return;
   if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.sharedAnalyses))) return;
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Summary", sharedWorkbookSummaryRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Fold changes", sharedWorkbookResultRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", sharedWorkbookInputRows());
-
-    const groupRows = sharedWorkbookGroupRows();
-    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
-
-    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.sharedAnalyses));
-    downloadWorkbookFile(workbook, "western-blot-shared-analysis.xlsx");
-  } catch (error) {
-    alert(`Workbook export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: "western-blot-shared-analysis.xlsx",
+    sheets: [
+      { name: "Summary", rows: sharedWorkbookSummaryRows() },
+      { name: "Fold changes", rows: sharedWorkbookResultRows() },
+      { name: "Input signals", rows: sharedWorkbookInputRows() },
+      { name: "Grouped values", rows: sharedWorkbookGroupRows(), optional: true },
+    ],
+    scanRefs: scanRefsForAnalyses(state.sharedAnalyses),
+    errorPrefix: "Workbook export failed",
+  });
 }
 
 function downloadComparisonWorkbook() {
   if (!state.pairedAnalyses.length || !ensureWorkbookExporter()) return;
   if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.pairedAnalyses))) return;
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Summary", comparisonWorkbookSummaryRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Common lanes", comparisonWorkbookCommonRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Pair fold changes", comparisonWorkbookPairRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", comparisonWorkbookInputRows());
-
-    const groupRows = comparisonWorkbookGroupRows();
-    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
-
-    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.pairedAnalyses));
-    downloadWorkbookFile(workbook, "western-blot-comparison-analysis.xlsx");
-  } catch (error) {
-    alert(`Workbook export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: "western-blot-comparison-analysis.xlsx",
+    sheets: [
+      { name: "Summary", rows: comparisonWorkbookSummaryRows() },
+      { name: "Common lanes", rows: comparisonWorkbookCommonRows() },
+      { name: "Pair fold changes", rows: comparisonWorkbookPairRows() },
+      { name: "Input signals", rows: comparisonWorkbookInputRows() },
+      { name: "Grouped values", rows: comparisonWorkbookGroupRows(), optional: true },
+    ],
+    scanRefs: scanRefsForAnalyses(state.pairedAnalyses),
+    errorPrefix: "Workbook export failed",
+  });
 }
 
 function downloadScanAuditWorkbook(blotId, scanIndex) {
@@ -2259,27 +2921,41 @@ function downloadScanAuditWorkbook(blotId, scanIndex) {
   const scan = scansForBlot(blotId)[scanIndex];
   if (!blot || !scan) return;
 
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Scan metadata", scanMetadataRows({ blotId, scanId: scan.id }));
-    appendWorkbookSheet(workbook, usedSheetNames, "Extraction audit", scanAuditRows({ blotId, scanId: scan.id }));
-    downloadWorkbookFile(workbook, `${filenameSafe(blot.name)}-${filenameSafe(scan.proteinName)}-audit.xlsx`);
-  } catch (error) {
-    alert(`Audit export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: `${filenameSafe(blot.name)}-${filenameSafe(scan.proteinName)}-audit.xlsx`,
+    sheets: [
+      { name: "Scan metadata", rows: scanMetadataRows({ blotId, scanId: scan.id }) },
+      { name: "Extraction audit", rows: scanAuditRows({ blotId, scanId: scan.id }) },
+    ],
+    errorPrefix: "Audit export failed",
+  });
 }
 
 function ensureWorkbookExporter() {
   if (window.XLSX?.utils?.book_new && window.XLSX?.writeFile) return true;
-  alert("The Excel exporter has not loaded yet. Check the network connection and retry.");
+  showUserMessage("The Excel exporter has not loaded yet. Check the network connection and retry.");
   return false;
 }
 
 function ensureWorkbookRowBudget(rowCount) {
   if (rowCount <= MAX_WORKBOOK_EXPORT_ROWS) return true;
-  alert(`Workbook export is too large (${rowCount.toLocaleString()} rows). Reduce inputs or export smaller pieces before trying again.`);
+  showUserMessage(`Workbook export is too large (${rowCount.toLocaleString()} rows). Reduce inputs or export smaller pieces before trying again.`);
   return false;
+}
+
+function downloadWorkbookSheets({ filename, sheets, scanRefs = [], errorPrefix = "Workbook export failed" }) {
+  try {
+    const workbook = XLSX.utils.book_new();
+    const usedSheetNames = new Set();
+    sheets.forEach(({ name, rows, optional = false }) => {
+      if (optional && !rows.length) return;
+      appendWorkbookSheet(workbook, usedSheetNames, name, rows);
+    });
+    if (scanRefs.length) appendScanSheets(workbook, usedSheetNames, scanRefs);
+    downloadWorkbookFile(workbook, filename);
+  } catch (error) {
+    showUserMessage(`${errorPrefix}: ${error.message}`);
+  }
 }
 
 function estimateWorkbookRows(analyses) {
@@ -2339,11 +3015,13 @@ function sharedWorkbookSummaryRows() {
   const loadingControlModes = [...new Set(state.sharedAnalyses.map((analysis) =>
     analysis.loadingControlAdjusted ? "Applied" : "Skipped",
   ))];
+  const controlLabels = [...new Set(state.sharedAnalyses.map((analysis) => analysis.controlLabel).filter(Boolean))];
   return [
     { Setting: "Generated at", Value: new Date().toISOString() },
     { Setting: "Mode", Value: "Multiple samples, optional control" },
     { Setting: "Normalization lane", Value: normalizationLanes.join(", ") },
     { Setting: "Loading control adjustment", Value: loadingControlModes.join(", ") },
+    { Setting: "Loading control", Value: controlLabels.join(", ") || "None" },
     { Setting: "Analyses", Value: state.sharedAnalyses.length },
     { Setting: "Active analysis", Value: activeAnalysis()?.name || "" },
     { Setting: "Grouped graphs", Value: els.enableGroupedGraphs.checked ? "Enabled" : "Disabled" },
@@ -2540,7 +3218,9 @@ function scanMetadataRows(filters = {}) {
     "Scan ID": scan.id,
     "Saved at": scan.createdAt || "",
     Channel: `${scan.channel}nm`,
-    Background: scan.backgroundAxis,
+    Background: scan.backgroundSides ?? scan.backgroundAxis,
+    "Border px": scan.borderWidth ?? 3,
+    "Background stat": scan.backgroundStat ?? "median",
     Lanes: scan.lanes.length,
     "Color mode": scan.settings?.colorMode || "",
     "Brightness 700": scan.settings?.brightness700 ?? "",
@@ -2562,12 +3242,18 @@ function scanAuditRows(filters = {}) {
       "Scan ID": scan.id,
       "Saved at": scan.createdAt || "",
       Channel: `${scan.channel}nm`,
-      Background: scan.backgroundAxis,
+      Background: scan.backgroundSides ?? scan.backgroundAxis,
+      "Border px": scan.borderWidth ?? 3,
+      "Background stat": scan.backgroundStat ?? "median",
       "Lane #": laneIndex + 1,
       Lane: lane.name,
       "Adjusted signal": lane.adjustedSignal ?? lane.signal,
       "Raw signal": lane.rawSignal ?? "",
       "Background signal": lane.backgroundSignal ?? "",
+      "Background per px": lane.backgroundPerPixel ?? "",
+      "Saturated px": lane.saturatedPixels ?? 0,
+      "Saturated fraction": lane.saturatedFraction ?? 0,
+      "Max pixel": lane.maxPixel ?? "",
       X: lane.x ?? "",
       Y: lane.y ?? "",
       W: lane.w ?? "",
@@ -2613,7 +3299,8 @@ function showSharedError(message) {
   els.downloadWorkbookButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
-  document.getElementById("pptxPanel").hidden = true;
+  if (els.replicatePanel) els.replicatePanel.hidden = true;
+  renderLinrangePanel();
 }
 
 function downloadGeneratedChart(event) {
@@ -2730,9 +3417,12 @@ document.querySelectorAll(".main-tab-button").forEach(button => {
     const tab = button.dataset.mainTab;
     document.getElementById("tabQuantification").hidden = tab !== "quantification";
     document.getElementById("tabBlotBrowser").hidden = tab !== "blot-browser";
+    document.getElementById("tabLinearRange").hidden = tab !== "linear-range";
 
     // Loaded blots should be the first thing shown when entering the browser.
     if (tab === "blot-browser") setBlotAnalysisTab("loaded");
+    // Refresh the linear-range check against the current analysis when entering.
+    if (tab === "linear-range") renderLinrangePanel();
   });
 });
 
@@ -2766,6 +3456,7 @@ function toggleTheme() {
   const next = activeTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   try { window.localStorage.setItem("blot-theme", next); } catch (_error) { /* ignore */ }
+  themeTokenCache.clear();  // tokens differ per theme; drop the stale cache
   syncThemeToggle();
   redrawThemedViews();
 }
@@ -2788,6 +3479,8 @@ function createCanvasState() {
     isDrawing: false,
     startX: 0,
     startY: 0,
+    drawCurrentX: 0,
+    drawCurrentY: 0,
     lastPanX: 0,
     lastPanY: 0,
     selectedBoxIndex: null,
@@ -2801,29 +3494,68 @@ let canvasState = createCanvasState();
 let canvasReloadTimer = null;
 let canvasImageController = null;
 let canvasImageRequestId = 0;
+let canvasResizeObserver = null;
 const signalExtractionControllers = new Set();
 const blotListElement = document.querySelector("#blotList");
 const blotScrollUpButton = document.querySelector("#blotScrollUp");
 const blotScrollDownButton = document.querySelector("#blotScrollDown");
+const cancelZipUploadButton = document.querySelector("#cancelZipUploadButton");
+let activeZipUploadController = null;
+let zipUploadQueueItems = [];
 
 document.querySelector("#zipFileInput")?.addEventListener("change", async (event) => {
   const files = Array.from(event.target.files);
-  for (const file of files) {
-    await uploadZip(file);
+  zipUploadQueueItems = files.map(file => ({ file, status: "Queued", error: "" }));
+  renderZipUploadQueue();
+  for (const item of zipUploadQueueItems) {
+    const controller = new AbortController();
+    activeZipUploadController = controller;
+    cancelZipUploadButton.hidden = false;
+    item.status = "Processing";
+    renderZipUploadQueue();
+    const result = await uploadZip(item.file, controller.signal);
+    item.status = result.ok ? "Imported" : (result.cancelled ? "Cancelled" : "Failed");
+    item.error = result.error || "";
+    renderZipUploadQueue();
   }
+  activeZipUploadController = null;
+  cancelZipUploadButton.hidden = true;
+  const imported = zipUploadQueueItems.filter(item => item.status === "Imported").length;
+  const failed = zipUploadQueueItems.length - imported;
+  setZipUploadStatus(
+    failed ? `${imported} ZIP file(s) imported; ${failed} not imported.` : `${imported} ZIP file(s) imported.`,
+    failed === 0,
+  );
   event.target.value = "";
 });
 
-document.querySelector("#blotList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-blot-index]");
-  if (!button) return;
-  selectBlot(Number(button.dataset.blotIndex));
-});
+cancelZipUploadButton?.addEventListener("click", () => activeZipUploadController?.abort());
+
+function renderZipUploadQueue() {
+  const list = document.querySelector("#zipUploadQueue");
+  if (!list) return;
+  list.replaceChildren(...zipUploadQueueItems.map(item => {
+    const row = document.createElement("li");
+    row.className = `upload-queue-item status-${item.status.toLowerCase()}`;
+    const name = document.createElement("span");
+    name.textContent = item.file.name;
+    const stateLabel = document.createElement("span");
+    stateLabel.textContent = item.error ? `${item.status}: ${item.error}` : item.status;
+    row.append(name, stateLabel);
+    return row;
+  }));
+  list.hidden = zipUploadQueueItems.length === 0;
+}
 
 document.querySelector("#blotList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-blot-delete]");
-  if (!button) return;
-  deleteBlot(Number(button.dataset.blotDelete), button);
+  const deleteButton = event.target.closest("[data-blot-delete]");
+  if (deleteButton) {
+    deleteBlot(Number(deleteButton.dataset.blotDelete), deleteButton);
+    return;
+  }
+
+  const selectButton = event.target.closest("[data-blot-index]");
+  if (selectButton) selectBlot(Number(selectButton.dataset.blotIndex));
 });
 
 blotScrollUpButton?.addEventListener("click", () => scrollBlotList(-1));
@@ -2834,10 +3566,24 @@ if (window.ResizeObserver && blotListElement) {
 }
 document.querySelectorAll("[data-blot-analysis-tab]").forEach(button => {
   button.addEventListener("click", () => setBlotAnalysisTab(button.dataset.blotAnalysisTab));
+  button.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = Array.from(document.querySelectorAll("[data-blot-analysis-tab]"));
+    const current = tabs.indexOf(event.currentTarget);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const next = tabs[nextIndex];
+    setBlotAnalysisTab(next.dataset.blotAnalysisTab);
+    next.focus();
+  });
 });
 
 function clientId(prefix) {
-  return `${prefix}-${window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+  return `${prefix}-${secureClientId()}`;
 }
 
 function normalizeBlot(blot) {
@@ -2960,7 +3706,7 @@ function ensureActiveBlotVisible() {
 
 async function deleteBlot(index, button) {
   const blot = blotState.blots[index];
-  if (!blot || !window.confirm(`Remove “${blot.name}” and its session scans? This cannot be undone.`)) return;
+  if (!blot || !confirmUserAction(`Remove “${blot.name}” and its session scans? This cannot be undone.`)) return;
 
   button.disabled = true;
   button.textContent = "Deleting…";
@@ -3101,6 +3847,10 @@ function normalizeScan(scan) {
         adjustedSignal: signal,
         rawSignal: finiteNumberOrNull(lane.rawSignal),
         backgroundSignal: finiteNumberOrNull(lane.backgroundSignal),
+        backgroundPerPixel: finiteNumberOrNull(lane.backgroundPerPixel),
+        saturatedPixels: finiteNumberOrNull(lane.saturatedPixels) ?? 0,
+        saturatedFraction: finiteNumberOrNull(lane.saturatedFraction) ?? 0,
+        maxPixel: finiteNumberOrNull(lane.maxPixel),
         x,
         y,
         w,
@@ -3112,7 +3862,12 @@ function normalizeScan(scan) {
   if (!lanes.length) return null;
   const id = typeof scan.id === "string" && scan.id.trim() ? scan.id.trim() : clientId("scan");
   const channel = ["700", "800"].includes(String(scan.channel)) ? String(scan.channel) : "700";
-  const backgroundAxis = ["leftright", "topbottom"].includes(String(scan.backgroundAxis)) ? String(scan.backgroundAxis) : "leftright";
+  const backgroundSides = ["leftright", "topbottom", "allsides"].includes(String(scan.backgroundSides))
+    ? String(scan.backgroundSides)
+    : (["leftright", "topbottom", "allsides"].includes(String(scan.backgroundAxis)) ? String(scan.backgroundAxis) : "leftright");
+  const backgroundAxis = ["leftright", "topbottom"].includes(backgroundSides) ? backgroundSides : "leftright";
+  const borderWidth = Math.max(1, Math.min(5, Number(scan.borderWidth) || 3));
+  const backgroundStat = ["median", "mean"].includes(String(scan.backgroundStat)) ? String(scan.backgroundStat) : "median";
   const createdAt = typeof scan.createdAt === "string" ? scan.createdAt : "";
   const settings = scan.settings && typeof scan.settings === "object" && !Array.isArray(scan.settings)
     ? scan.settings
@@ -3123,6 +3878,9 @@ function normalizeScan(scan) {
     proteinName: String(scan.proteinName ?? "Untitled scan").trim() || "Untitled scan",
     channel,
     backgroundAxis,
+    backgroundSides,
+    borderWidth,
+    backgroundStat,
     createdAt,
     settings,
     lanes,
@@ -3197,21 +3955,28 @@ function refreshScanDropdown(role, index) {
   refreshNormalizationLanes();
 }
 
-async function uploadZip(file) {
-  const maxBytes = Number(CONFIG.MAX_ZIP_UPLOAD_BYTES || DEFAULT_ZIP_UPLOAD_BYTES);
+async function uploadZip(file, signal) {
+  let deploymentConfig;
+  try {
+    deploymentConfig = await runtimeConfig();
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  const configuredMax = CONFIG.USE_VERCEL_BLOB_UPLOADS
+    ? deploymentConfig.maxZipUploadBytes
+    : deploymentConfig.maxDirectUploadBytes;
+  const maxBytes = Number(configuredMax || CONFIG.MAX_ZIP_UPLOAD_BYTES || DEFAULT_ZIP_UPLOAD_BYTES);
   const mimeType = String(file.type || "").toLowerCase();
   if (!file.name.toLowerCase().endsWith(".zip") || !ALLOWED_ZIP_MIME_TYPES.has(mimeType)) {
-    alert("Please select a ZIP file.");
-    return;
+    return { ok: false, error: "Please select a ZIP file." };
   }
   if (file.size > maxBytes) {
-    alert(`ZIP is too large. Maximum size is ${Math.floor(maxBytes / 1024 / 1024)} MB.`);
-    return;
+    return { ok: false, error: `ZIP is too large. Maximum size is ${Math.floor(maxBytes / 1024 / 1024)} MB.` };
   }
 
   try {
     setZipUploadStatus(`Processing ${file.name}...`);
-    const data = await processZipFile(file);
+    const data = await processZipFile(file, signal);
 
     mergeBlots(data.blots || []);
     if (data.scans) {
@@ -3223,22 +3988,24 @@ async function uploadZip(file) {
     refreshBlotDependentControls();
     saveWorkspace();
     setZipUploadStatus(`${file.name} imported.`, true);
+    return { ok: true };
   } catch (error) {
-    setZipUploadStatus("");
-    alert(`Failed to load ZIP: ${error.message}`);
+    const cancelled = signal?.aborted || error.name === "AbortError" || /cancelled/i.test(error.message);
+    return { ok: false, cancelled, error: cancelled ? "Cancelled by user." : error.message };
   }
 }
 
-async function processZipFile(file) {
+async function processZipFile(file, signal) {
   if (CONFIG.USE_VERCEL_BLOB_UPLOADS) {
     setZipUploadStatus(`Uploading ${file.name}...`);
-    const blob = await uploadZipToVercelBlob(file);
+    const blob = await uploadZipToVercelBlob(file, signal);
     setZipUploadStatus(`Processing ${file.name}...`);
     return apiJson(apiUrl("/process-upload"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: activeSessionId, upload: blob }),
       timeoutMs: ZIP_PROCESSING_TIMEOUT_MS,
+      signal,
     }, "ZIP processing failed.");
   }
 
@@ -3249,19 +4016,22 @@ async function processZipFile(file) {
     method: "POST",
     body: form,
     timeoutMs: ZIP_PROCESSING_TIMEOUT_MS,
+    signal,
   }, "ZIP processing failed.");
 }
 
-async function uploadZipToVercelBlob(file) {
+async function uploadZipToVercelBlob(file, sourceSignal) {
   const [config, uploadStatus] = await Promise.all([
     runtimeConfig(),
     blobUploadStatus(),
   ]);
-  const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const uploadId = secureClientId();
   const configuredAccess = uploadStatus.blobAccess || config.blobAccess || CONFIG.BLOB_ACCESS;
   const blobAccess = configuredAccess === "public" ? "public" : "private";
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), BLOB_UPLOAD_TIMEOUT_MS);
+  const abortFromSource = () => controller.abort();
+  sourceSignal?.addEventListener("abort", abortFromSource, { once: true });
 
   try {
     return await manualPresignedUpload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
@@ -3270,11 +4040,14 @@ async function uploadZipToVercelBlob(file) {
     });
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new Error("Blob upload timed out before Vercel returned a stored file reference.");
+      throw new Error(sourceSignal?.aborted
+        ? "Blob upload was cancelled."
+        : "Blob upload timed out before Vercel returned a stored file reference.");
     }
     throw error;
   } finally {
     window.clearTimeout(timeoutId);
+    sourceSignal?.removeEventListener("abort", abortFromSource);
   }
 }
 
@@ -3405,7 +4178,7 @@ function uploadFileWithProgress(url, file, options) {
     xhr.setRequestHeader("x-content-type", options.contentType);
     xhr.setRequestHeader("x-vercel-blob-access", options.access);
     xhr.setRequestHeader("x-vercel-blob-store-id", options.storeId);
-    xhr.setRequestHeader("x-api-blob-request-id", `${options.storeId}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
+    xhr.setRequestHeader("x-api-blob-request-id", `${options.storeId}:${Date.now()}:${secureClientId()}`);
     xhr.setRequestHeader("x-api-blob-request-attempt", "0");
     xhr.send(file);
   });
@@ -3479,7 +4252,8 @@ function blotViewerHtml() {
   return `
     <div class="blot-viewer">
       <div class="blot-canvas-wrap">
-        <canvas id="blotCanvas" role="img" aria-label="Blot image viewer. Draw boxes over lanes to quantify them; drawn boxes and their signals are listed in the Drawn boxes tab."></canvas>
+        <p class="visually-hidden" id="blotCanvasInstructions">Use pointer drag to pan or draw. Keyboard users can press A to add a centered box, arrow keys to move the selected box, plus or minus to zoom, and Delete to remove it.</p>
+        <canvas id="blotCanvas" tabindex="0" aria-describedby="blotCanvasInstructions" aria-label="Interactive blot image viewer"></canvas>
       </div>
     </div>
   `;
@@ -3541,6 +4315,7 @@ function setBlotAnalysisTab(tabName) {
     const isActive = button.dataset.blotAnalysisTab === nextTab;
     button.classList.toggle("active", isActive);
     button.setAttribute("aria-selected", String(isActive));
+    button.tabIndex = isActive ? 0 : -1;
   });
   document.querySelectorAll("[data-blot-analysis-panel]").forEach(panel => {
     panel.hidden = panel.dataset.blotAnalysisPanel !== nextTab;
@@ -3584,6 +4359,22 @@ function blotModeControlsHtml() {
         <select id="backgroundAxis">
           <option value="leftright">Left & Right</option>
           <option value="topbottom">Top & Bottom</option>
+          <option value="allsides">All sides</option>
+        </select>
+      </label>
+      <label>Border px
+        <select id="backgroundBorderWidth">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3" selected>3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+        </select>
+      </label>
+      <label>Background stat
+        <select id="backgroundStat">
+          <option value="median" selected>Median</option>
+          <option value="mean">Mean</option>
         </select>
       </label>
     </div>
@@ -3616,6 +4407,7 @@ function boxToolControlsHtml() {
           <button class="mode-button" id="modeDraw" type="button">Draw</button>
         </div>
       </label>
+      <button class="ghost-button" id="addCenteredBoxButton" type="button">Add centered box</button>
       <button class="ghost-button" id="extractSignalsButton" type="button">Refresh signals</button>
       <button class="ghost-button" id="clearBoxesButton" type="button">Clear all</button>
     </div>
@@ -3670,20 +4462,22 @@ function boxLayoutControlsHtml() {
 
 function bindBlotViewerControls(blotId) {
   ["brightness700", "contrast700", "gamma700", "brightness800", "contrast800", "gamma800", "colorMode"].forEach(id => {
-    document.getElementById(id)?.addEventListener("input", () => {
-      scheduleCanvasImageReload(blotId);
-    });
     document.getElementById(id)?.addEventListener("change", () => {
       scheduleCanvasImageReload(blotId, true);
     });
   });
   // Switching the background axis changes which flanking strips are sampled, so
   // redraw the dotted overlay to match. No image reload is needed.
-  document.getElementById("backgroundAxis")?.addEventListener("change", () => {
-    if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
+  // Background axis / border width / statistic all change which flanking strips
+  // are sampled, so redraw the dotted overlay to match. No image reload needed.
+  ["backgroundAxis", "backgroundBorderWidth", "backgroundStat"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", () => {
+      if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
+    });
   });
   document.getElementById("duplicateBoxButton")?.addEventListener("click", () => duplicateSelectedBox(blotId));
   document.getElementById("matchBoxSizeButton")?.addEventListener("click", () => matchBoxesToSelectedSize(blotId));
+  document.getElementById("addCenteredBoxButton")?.addEventListener("click", () => addCenteredBox(blotId));
   document.querySelectorAll("[data-box-align]").forEach(button => {
     button.addEventListener("click", () => alignBoxesToSelected(button.dataset.boxAlign, blotId));
   });
@@ -3713,6 +4507,16 @@ function initCanvas(blotId) {
   const wrap = canvas.parentElement;
   canvas.width = wrap.clientWidth || 800;
   canvas.height = 520;
+  if (window.ResizeObserver) {
+    canvasResizeObserver?.disconnect();
+    canvasResizeObserver = new ResizeObserver(() => {
+      const nextWidth = Math.max(320, Math.round(wrap.clientWidth || 800));
+      if (canvas.width === nextWidth) return;
+      canvas.width = nextWidth;
+      renderCanvas();
+    });
+    canvasResizeObserver.observe(wrap);
+  }
 
   // Load composite image onto canvas
   loadCanvasImage(blotId);
@@ -3729,18 +4533,19 @@ function initCanvas(blotId) {
   document.getElementById("extractSignalsButton")?.addEventListener("click", () => extractSignals(blotId));
   renderBoxList(blotId);
 
-  // Mouse events
-  canvas.addEventListener("mousedown", onMouseDown);
-  canvas.addEventListener("mousemove", onMouseMove);
-  canvas.addEventListener("mouseup", onMouseUp);
-  canvas.addEventListener("mouseleave", onMouseUp);
+  // Pointer events cover mouse, pen, and touch with one coordinate path.
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onMouseMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", cancelPointerInteraction);
   canvas.addEventListener("wheel", onWheel, { passive: false });
+  canvas.addEventListener("keydown", onCanvasKeyDown);
 }
 
 function setCanvasMode(mode) {
   canvasState.mode = mode;
   const canvas = document.getElementById("blotCanvas");
-  if (canvas) canvas.style.cursor = mode === "draw" ? "crosshair" : "grab";
+  canvas?.classList.toggle("draw-mode", mode === "draw");
   document.getElementById("modePan")?.classList.toggle("active", mode === "pan");
   document.getElementById("modeDraw")?.classList.toggle("active", mode === "draw");
 }
@@ -3775,6 +4580,8 @@ function disposeCanvasResources() {
     canvasState.image.onerror = null;
     canvasState.image.src = "";
   }
+  canvasResizeObserver?.disconnect();
+  canvasResizeObserver = null;
   canvasState = createCanvasState();
 }
 
@@ -3903,17 +4710,25 @@ async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
 
 // Width, in image pixels, of the strips sampled next to each box to estimate
 // local background. Must match `border` in the backend extract_box_signal().
+// Note: the backend applies this border in the target channel's NATIVE pixel grid,
+// while this overlay draws it in COMPOSITE pixels. They coincide whenever the 700
+// and 800 channels share dimensions (the normal case); when they differ, the dotted
+// strip width shown here is a hint — the measured strip is border px in native space.
+// This affects only the visual strip width, never the reported signal.
 const BACKGROUND_BORDER = 3;
 
-function currentBackgroundAxis() {
-  return document.getElementById("backgroundAxis")?.value === "topbottom"
-    ? "topbottom"
-    : "leftright";
+function currentBackgroundConfig() {
+  const sides = document.getElementById("backgroundAxis")?.value;
+  return {
+    sides: ["leftright", "topbottom", "allsides"].includes(sides) ? sides : "leftright",
+    borderWidth: Math.max(1, Math.min(5, Number(document.getElementById("backgroundBorderWidth")?.value) || BACKGROUND_BORDER)),
+    stat: document.getElementById("backgroundStat")?.value === "mean" ? "mean" : "median",
+  };
 }
 
 // The background-reference strips flanking a box, clamped to the image bounds so
 // the dotted overlay matches exactly what the backend measures.
-function backgroundRegionsForBox(box, axis) {
+function backgroundRegionsForBox(box, sides, border = BACKGROUND_BORDER) {
   const imgW = canvasState.imageWidth || canvasState.image?.naturalWidth || 0;
   const imgH = canvasState.imageHeight || canvasState.image?.naturalHeight || 0;
   const x = Math.max(0, box.x);
@@ -3922,19 +4737,32 @@ function backgroundRegionsForBox(box, axis) {
   const y2 = imgH ? Math.min(box.y + box.h, imgH) : box.y + box.h;
   const regions = [];
 
-  if (axis === "topbottom") {
-    const top = Math.max(0, y - BACKGROUND_BORDER);
+  if (sides === "topbottom" || sides === "allsides") {
+    const top = Math.max(0, y - border);
     if (y > top) regions.push({ x, y: top, w: x2 - x, h: y - top });
-    const bottom = imgH ? Math.min(imgH, y2 + BACKGROUND_BORDER) : y2 + BACKGROUND_BORDER;
+    const bottom = imgH ? Math.min(imgH, y2 + border) : y2 + border;
     if (bottom > y2) regions.push({ x, y: y2, w: x2 - x, h: bottom - y2 });
-  } else {
-    const left = Math.max(0, x - BACKGROUND_BORDER);
+  }
+  if (sides === "leftright" || sides === "allsides") {
+    const left = Math.max(0, x - border);
     if (x > left) regions.push({ x: left, y, w: x - left, h: y2 - y });
-    const right = imgW ? Math.min(imgW, x2 + BACKGROUND_BORDER) : x2 + BACKGROUND_BORDER;
+    const right = imgW ? Math.min(imgW, x2 + border) : x2 + border;
     if (right > x2) regions.push({ x: x2, y, w: right - x2, h: y2 - y });
   }
 
   return regions.filter(r => r.w > 0 && r.h > 0);
+}
+
+// Pointer/wheel events can fire several times per frame; coalesce redraws so
+// renderCanvas() runs at most once per animation frame during pan/zoom/draw.
+let renderCanvasScheduled = false;
+function requestRender() {
+  if (renderCanvasScheduled) return;
+  renderCanvasScheduled = true;
+  window.requestAnimationFrame(() => {
+    renderCanvasScheduled = false;
+    renderCanvas();
+  });
 }
 
 function renderCanvas() {
@@ -3954,7 +4782,7 @@ function renderCanvas() {
     ctx.scale(canvasState.zoom, canvasState.zoom);
     ctx.drawImage(canvasState.image, 0, 0);
 
-    const backgroundAxis = currentBackgroundAxis();
+    const backgroundConfig = currentBackgroundConfig();
 
     // Draw boxes in image space
     canvasState.boxes.forEach((box, index) => {
@@ -3968,7 +4796,7 @@ function renderCanvas() {
       ctx.strokeRect(box.x, box.y, box.w, box.h);
 
       // Dotted outlines of the background regions sampled for this box.
-      const bgRegions = backgroundRegionsForBox(box, backgroundAxis);
+      const bgRegions = backgroundRegionsForBox(box, backgroundConfig.sides, backgroundConfig.borderWidth);
       if (bgRegions.length) {
         ctx.save();
         ctx.setLineDash([4 / canvasState.zoom, 3 / canvasState.zoom]);
@@ -3983,6 +4811,22 @@ function renderCanvas() {
       ctx.font = themeFont(600, 14 / canvasState.zoom, "--font-mono");
       ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
     });
+
+    // Live dashed preview of the box being drawn (updated coords live in
+    // canvasState so this render can be coalesced via requestRender()).
+    if (canvasState.isDrawing) {
+      ctx.save();
+      ctx.strokeStyle = themeToken("--annotation");
+      ctx.lineWidth = 2 / canvasState.zoom;
+      ctx.setLineDash([4 / canvasState.zoom, 4 / canvasState.zoom]);
+      ctx.strokeRect(
+        canvasState.startX,
+        canvasState.startY,
+        canvasState.drawCurrentX - canvasState.startX,
+        canvasState.drawCurrentY - canvasState.startY,
+      );
+      ctx.restore();
+    }
 
     ctx.restore();
   }
@@ -4016,18 +4860,106 @@ function getImageCoords(canvas, clientX, clientY) {
   };
 }
 
+function onPointerDown(event) {
+  if (event.button !== 0) return;
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  event.currentTarget.focus({ preventScroll: true });
+  onMouseDown(event);
+}
+
+function onPointerUp(event) {
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  onMouseUp(event);
+}
+
+function cancelPointerInteraction(event) {
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  canvasState.isPanning = false;
+  canvasState.isDrawing = false;
+  event.currentTarget.classList.remove("is-grabbing");
+  renderCanvas();
+}
+
+function addCenteredBox(blotId = canvasState.currentBlotId) {
+  if (!canvasState.imageWidth || !canvasState.imageHeight) return;
+  if (remainingBoxSlots() <= 0) {
+    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    return;
+  }
+  const width = Math.max(8, Math.min(160, canvasState.imageWidth * 0.12));
+  const height = Math.max(8, Math.min(80, canvasState.imageHeight * 0.08));
+  const box = createCanvasBox({
+    x: (canvasState.imageWidth - width) / 2,
+    y: (canvasState.imageHeight - height) / 2,
+    w: width,
+    h: height,
+  });
+  canvasState.boxes.push(box);
+  canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+  renderCanvas();
+  renderBoxList(blotId);
+  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+}
+
+function onCanvasKeyDown(event) {
+  const blotId = canvasState.currentBlotId;
+  if (!blotId) return;
+  if (event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    addCenteredBox(blotId);
+    return;
+  }
+  if ((event.key === "Delete" || event.key === "Backspace") && selectedBox()) {
+    event.preventDefault();
+    deleteBox(canvasState.selectedBoxIndex, blotId);
+    return;
+  }
+  if (event.key === "+" || event.key === "=" || event.key === "-") {
+    event.preventDefault();
+    const factor = event.key === "-" ? 0.9 : 1.1;
+    const canvas = event.currentTarget;
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    const newZoom = Math.min(20, Math.max(0.1, canvasState.zoom * factor));
+    canvasState.panX = centerX - (centerX - canvasState.panX) * (newZoom / canvasState.zoom);
+    canvasState.panY = centerY - (centerY - canvasState.panY) * (newZoom / canvasState.zoom);
+    canvasState.zoom = newZoom;
+    requestRender();
+    return;
+  }
+  const directions = {
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+  };
+  const direction = directions[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  if (selectedBox()) {
+    nudgeSelectedBox(direction[0], direction[1], blotId);
+  } else {
+    const step = event.shiftKey ? 40 : 12;
+    canvasState.panX += direction[0] * step;
+    canvasState.panY += direction[1] * step;
+    requestRender();
+  }
+}
+
 function onMouseDown(event) {
   const canvas = event.target;
   if (canvasState.mode === "pan") {
     canvasState.isPanning = true;
     canvasState.lastPanX = event.clientX;
     canvasState.lastPanY = event.clientY;
-    canvas.style.cursor = "grabbing";
+    canvas.classList.add("is-grabbing");
   } else if (canvasState.mode === "draw") {
     canvasState.isDrawing = true;
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
     canvasState.startX = coords.x;
     canvasState.startY = coords.y;
+    canvasState.drawCurrentX = coords.x;
+    canvasState.drawCurrentY = coords.y;
   }
 }
 
@@ -4038,25 +4970,12 @@ function onMouseMove(event) {
     canvasState.panY += event.clientY - canvasState.lastPanY;
     canvasState.lastPanX = event.clientX;
     canvasState.lastPanY = event.clientY;
-    renderCanvas();
+    requestRender();
   } else if (canvasState.isDrawing) {
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
-    // Draw preview box
-    renderCanvas();
-    const ctx = canvas.getContext("2d");
-    ctx.save();
-    ctx.translate(canvasState.panX, canvasState.panY);
-    ctx.scale(canvasState.zoom, canvasState.zoom);
-    ctx.strokeStyle = themeToken("--annotation");
-    ctx.lineWidth = 2 / canvasState.zoom;
-    ctx.setLineDash([4 / canvasState.zoom, 4 / canvasState.zoom]);
-    ctx.strokeRect(
-      canvasState.startX,
-      canvasState.startY,
-      coords.x - canvasState.startX,
-      coords.y - canvasState.startY
-    );
-    ctx.restore();
+    canvasState.drawCurrentX = coords.x;
+    canvasState.drawCurrentY = coords.y;
+    requestRender();  // renderCanvas draws the dashed preview from these coords
   }
 }
 
@@ -4064,7 +4983,7 @@ function onMouseUp(event) {
   const canvas = document.getElementById("blotCanvas");
   if (canvasState.isPanning) {
     canvasState.isPanning = false;
-    if (canvas) canvas.style.cursor = "grab";
+    canvas?.classList.remove("is-grabbing");
   } else if (canvasState.isDrawing) {
     canvasState.isDrawing = false;
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
@@ -4074,7 +4993,7 @@ function onMouseUp(event) {
     // Only reject clicks with no drag at all
     if (Math.abs(w) > 0.5 && Math.abs(h) > 0.5) {
       if (remainingBoxSlots() <= 0) {
-        alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+        showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
         return;
       }
       const box = createCanvasBox({
@@ -4107,7 +5026,7 @@ function onWheel(event) {
   canvasState.panX = mouseX - (mouseX - canvasState.panX) * (newZoom / canvasState.zoom);
   canvasState.panY = mouseY - (mouseY - canvasState.panY) * (newZoom / canvasState.zoom);
   canvasState.zoom = newZoom;
-  renderCanvas();
+  requestRender();
 }
 
 // ─── Box list ─────────────────────────────────────────────────────────────────
@@ -4116,6 +5035,12 @@ function renderBoxList(blotId) {
   const container = document.getElementById("blotBoxList");
   if (!container) return;
   normalizeSelectedBoxIndex();
+  if (canvasState.boxes.length) {
+    setWorkspaceRecoveryStatus(
+      "Drawn boxes are a draft and are not restored after reload. Save the scan before leaving.",
+      true,
+    );
+  }
 
   if (!canvasState.boxes.length) {
     container.innerHTML = emptyBoxListHtml(blotId);
@@ -4182,10 +5107,18 @@ function boxSignalHtml(box) {
     return `<span class="box-signal error-text" title="${escapeHtml(box.signalError || "Signal extraction failed")}">Extraction failed</span>`;
   }
   if (box.signal !== null) {
+    const sat = Number(box.signal.saturatedPixels) || 0;
+    const satHtml = sat > 0
+      ? `<span class="box-signal-warning" title="${sat.toLocaleString()} saturated pixel${sat === 1 ? "" : "s"} in this box. Saturated bands cannot be accurately quantified — the signal is underestimated. Re-image at a shorter exposure.">⚠ ${sat.toLocaleString()} saturated px</span>`
+      : "";
+    const unevenHtml = box.signal.backgroundUneven
+      ? `<span class="box-signal-warning" title="The background strips on opposite sides differ by more than 2×, which usually means one overlaps a neighbouring band. Move the box or switch the background sides.">⚠ uneven background</span>`
+      : "";
     return `
       <span class="box-signal">
         <strong>${box.signal.adjustedSignal.toLocaleString()}</strong>
         <span class="muted-text">(raw: ${box.signal.rawSignal.toLocaleString()})</span>
+        ${satHtml}${unevenHtml}
       </span>
     `;
   }
@@ -4213,16 +5146,16 @@ function bindBoxListInputs(container, blotId) {
 
 function renderSavedScans(blotId) {
   const scans = scansForBlot(blotId);
-  if (!scans.length) return `<p class="blot-empty-state" style="margin-top:12px;">No session scans yet.</p>`;
+  if (!scans.length) return `<p class="blot-empty-state saved-scans-empty">No session scans yet.</p>`;
 
   return `
     <div class="saved-scans">
-      <p class="eyebrow" style="margin: 12px 0 8px;">Session scans</p>
+      <p class="eyebrow">Session scans</p>
       ${scans.map((scan, index) => `
         <div class="saved-scan-item">
           <div class="saved-scan-main">
             <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
-            <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundAxis}${scan.createdAt ? ` · ${escapeHtml(formatTimestamp(scan.createdAt))}` : ""}</span>
+            <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundSides ?? scan.backgroundAxis}${scan.createdAt ? ` · ${escapeHtml(formatTimestamp(scan.createdAt))}` : ""}</span>
             <button class="ghost-button box-button danger" type="button"
               data-scan-delete="${index}">Delete</button>
           </div>
@@ -4284,7 +5217,7 @@ function scanAuditLaneRowHtml(lane) {
 function scanAuditSummary(scan) {
   const settings = scan.settings || {};
   const colorMode = settings.colorMode ? `${settings.colorMode} view` : "viewer settings";
-  return `${scan.channel}nm, ${scan.backgroundAxis}, ${colorMode}`;
+  return `${scan.channel}nm, ${scan.backgroundSides ?? scan.backgroundAxis}, ${colorMode}`;
 }
 
 function formatBoxArea(box) {
@@ -4408,7 +5341,7 @@ function duplicateSelectedBox(blotId) {
 
   const remainingSlots = remainingBoxSlots();
   if (remainingSlots <= 0) {
-    alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
     return;
   }
   const count = Math.min(
@@ -4503,29 +5436,38 @@ function nudgeSelectedBox(dx, dy, blotId) {
 async function saveScan(blotId) {
   const proteinName = document.getElementById("scanProteinName")?.value.trim();
   if (!proteinName) {
-    alert("Please enter a protein name before saving.");
+    showUserMessage("Please enter a protein name before saving.");
     return;
   }
 
   const hasSignals = canvasState.boxes.every(box => box.signal !== null);
   if (!hasSignals) {
     const isExtracting = canvasState.boxes.some(box => box.signalStatus === "loading");
-    alert(isExtracting
+    showUserMessage(isExtracting
       ? "Please wait for signal extraction to finish before saving."
       : "One or more signals could not be extracted. Use Refresh signals and try again."
     );
     return;
   }
 
+  const saturatedBoxes = canvasState.boxes.filter((b) => (b.signal?.saturatedPixels || 0) > 0);
+  if (saturatedBoxes.length &&
+      !confirmUserAction(`${saturatedBoxes.length} box(es) contain saturated pixels, which cannot be accurately quantified (signal is underestimated). Save anyway?`)) {
+    return;
+  }
+
   const channel = document.getElementById("quantChannel")?.value ?? "700";
-  const backgroundAxis = document.getElementById("backgroundAxis")?.value ?? "leftright";
+  const backgroundConfig = currentBackgroundConfig();
 
   const scan = {
     id: clientId("scan"),
     proteinName,
     createdAt: new Date().toISOString(),
     channel,
-    backgroundAxis,
+    backgroundAxis: backgroundConfig.sides,
+    backgroundSides: backgroundConfig.sides,
+    borderWidth: backgroundConfig.borderWidth,
+    backgroundStat: backgroundConfig.stat,
     settings: {
       colorMode: document.getElementById("colorMode")?.value ?? "color",
       brightness700: Number(document.getElementById("brightness700")?.value ?? 1),
@@ -4545,6 +5487,10 @@ async function saveScan(blotId) {
         adjustedSignal: signal.adjustedSignal,
         rawSignal: signal.rawSignal,
         backgroundSignal: signal.backgroundSignal,
+        backgroundPerPixel: finiteNumberOrNull(signal.backgroundPerPixel),
+        saturatedPixels: finiteNumberOrNull(signal.saturatedPixels) ?? 0,
+        saturatedFraction: finiteNumberOrNull(signal.saturatedFraction) ?? 0,
+        maxPixel: finiteNumberOrNull(signal.maxPixel),
         x: finiteNumberOrNull(signal.x) ?? box.x,
         y: finiteNumberOrNull(signal.y) ?? box.y,
         w,
@@ -4604,7 +5550,7 @@ function deleteBox(index, blotId) {
 
 async function extractSignals(blotId) {
   if (!canvasState.boxes.length) {
-    alert("Draw some boxes first.");
+    showUserMessage("Draw some boxes first.");
     return;
   }
 
@@ -4617,7 +5563,7 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
   const controller = new AbortController();
   signalExtractionControllers.add(controller);
   const channel = document.getElementById("quantChannel")?.value ?? "700";
-  const backgroundAxis = document.getElementById("backgroundAxis")?.value ?? "leftright";
+  const backgroundConfig = currentBackgroundConfig();
   const requests = boxes.map((box) => {
     const requestId = (box.signalRequestId || 0) + 1;
     box.signalRequestId = requestId;
@@ -4641,7 +5587,16 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
           blot: blotById(blotId),
           boxes: requestChunk.map(({ box }) => ({ x: box.x, y: box.y, w: box.w, h: box.h })),
           channel,
-          backgroundAxis,
+          backgroundSides: backgroundConfig.sides,
+          borderWidth: backgroundConfig.borderWidth,
+          backgroundStat: backgroundConfig.stat,
+          backgroundAxis: backgroundConfig.sides, // legacy key for older backends
+          // Natural size of the composite these boxes were drawn on. Lets the
+          // backend scale coordinates into a channel's native grid without
+          // re-reading the other channel's TIF header (JSON.stringify drops these
+          // when the image has not loaded yet, so the backend falls back safely).
+          compositeWidth: canvasState.imageWidth || undefined,
+          compositeHeight: canvasState.imageHeight || undefined,
         }),
       }, "Signal extraction failed.");
 
@@ -4674,7 +5629,7 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
       box.signalError = error.message;
     });
     renderBoxList(blotId);
-    if (alertOnError) alert(`Signal extraction failed: ${error.message}`);
+    if (alertOnError) showUserMessage(`Signal extraction failed: ${error.message}`);
   } finally {
     signalExtractionControllers.delete(controller);
   }
@@ -4704,155 +5659,6 @@ function scanToDataset(blotId, scanRef) {
   };
 }
 
-// ─── PowerPoint export ────────────────────────────────────────────────────────
-
-function canvasToImageDataUrl(canvas) {
-  return canvas.toDataURL(JPEG_MIME_TYPE, PPTX_JPEG_QUALITY);
-}
-
-async function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function compositeToImageDataUrl(blotId, defaultColorMode = "grayscale") {
-  return blobToDataUrl(await renderCompositeBlob(blotId, defaultColorMode));
-}
-
-async function generatePptx() {
-  if (!state.sharedAnalyses.length) {
-    alert("Please run an analysis first.");
-    return;
-  }
-
-  const button = document.getElementById("generatePptxButton");
-  if (button) {
-    button.textContent = "Generating...";
-    button.disabled = true;
-  }
-
-  try {
-    const slides = await buildPptxSlides();
-    const blob = await requestPptxBlob(slides);
-    downloadBlob(blob, "western-blot-analysis.pptx");
-  } catch (error) {
-    alert(`PowerPoint generation failed: ${error.message}`);
-  } finally {
-    if (button) {
-      button.textContent = "Export PowerPoint";
-      button.disabled = false;
-    }
-  }
-}
-
-async function buildPptxSlides() {
-  const slides = [];
-  const imageSlide = await buildPptxImageSlide();
-  if (imageSlide.images.length) slides.push(imageSlide);
-  state.sharedAnalyses.forEach((analysis, index) => {
-    slides.push(buildPptxGraphSlide(analysis, index));
-  });
-  return slides;
-}
-
-async function buildPptxImageSlide() {
-  const imageSlide = { type: PPTX_IMAGE_SLIDE_TYPE, images: [] };
-  for (let index = 0; index < state.sharedAnalyses.length; index += 1) {
-    const image = await sampleBlotPptxImage(index);
-    if (image) imageSlide.images.push(image);
-  }
-  const controlImage = await controlBlotPptxImage();
-  if (controlImage) imageSlide.images.push(controlImage);
-  return imageSlide;
-}
-
-async function sampleBlotPptxImage(index) {
-  const blotSelect = document.querySelector(`[data-blot-source-blot="sample-${index}"]`);
-  const usingBlot = blotSelect && !document.getElementById(`sampleBlot${index}`)?.hidden;
-  if (!usingBlot || !blotSelect?.value) return null;
-
-  return {
-    image: await compositeToImageDataUrl(blotSelect.value, "grayscale"),
-    label: `anti-${state.sharedAnalyses[index].name}`,
-  };
-}
-
-async function controlBlotPptxImage() {
-  const blotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
-  const usingBlot = blotSelect && !document.getElementById("controlBlot0")?.hidden;
-  if (!usingBlot || !blotSelect?.value) return null;
-
-  const scanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
-  const scan = findScanByRef(blotSelect.value, scanSelect?.value);
-  return {
-    image: await compositeToImageDataUrl(blotSelect.value, "grayscale"),
-    label: `anti-${scan?.proteinName || "Loading control"}`,
-  };
-}
-
-function buildPptxGraphSlide(analysis, index) {
-  return {
-    type: PPTX_GRAPH_SLIDE_TYPE,
-    title: analysis.title,
-    graphs: buildPptxGraphImages(analysis, index),
-  };
-}
-
-function buildPptxGraphImages(analysis, index) {
-  const graphs = [
-    renderChartDataUrl(960, 520, (canvas) => drawBarChart(canvas, analysis.results, analysis.title)),
-  ];
-
-  if (els.enableGroupedGraphs.checked) {
-    const previousActiveSampleIndex = state.activeSampleIndex;
-    state.activeSampleIndex = index;
-    const groups = buildGroupedRows(analysis);
-    state.activeSampleIndex = previousActiveSampleIndex;
-
-    groups.forEach((group) => {
-      const normalizedRows = normalizedGroupRows(group);
-      if (!normalizedRows) throw new Error(groupBaselineError(group));
-      graphs.push(renderChartDataUrl(640, 360, (canvas) => drawBarChart(canvas, normalizedRows, group.name)));
-    });
-  }
-
-  return graphs;
-}
-
-function renderChartDataUrl(width, height, draw) {
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  draw(canvas);
-  return canvasToImageDataUrl(canvas);
-}
-
-async function requestPptxBlob(slides) {
-  const response = await apiFetch(apiUrl("/generate-pptx"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ slides }),
-    timeoutMs: PPTX_EXPORT_TIMEOUT_MS,
-  });
-  if (!response.ok) {
-    throw new Error(await apiErrorMessage(response, "Failed to generate PowerPoint"));
-  }
-  return response.blob();
-}
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
 // ─── Workspace persistence (survive accidental reloads) ───────────────────────
 // The loaded blots, their extracted scans, and the active selection are mirrored
 // into sessionStorage so a same-tab reload restores the workspace instead of
@@ -4865,6 +5671,13 @@ function downloadBlob(blob, filename) {
 
 function hasUnsavedWork() {
   return blotState.blots.length > 0;
+}
+
+function setWorkspaceRecoveryStatus(message, isError = false) {
+  const status = document.getElementById("workspaceRecoveryStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
 }
 
 function serializeWorkspace() {
@@ -4885,11 +5698,24 @@ function saveWorkspace() {
   try {
     if (!hasUnsavedWork()) {
       window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
-      return;
+      setWorkspaceRecoveryStatus(sessionStartupWarning);
+      return true;
     }
     window.sessionStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(serializeWorkspace()));
+    sessionRecoveryAvailable = true;
+    setWorkspaceRecoveryStatus(
+      canvasState.boxes.length
+        ? "Tab recovery saved. Drawn boxes become recoverable after you save the scan."
+        : "Tab recovery saved. Export results before closing this tab.",
+    );
+    return true;
   } catch (_error) {
-    /* sessionStorage may be unavailable or full — persistence is best-effort. */
+    sessionRecoveryAvailable = false;
+    setWorkspaceRecoveryStatus(
+      "Tab recovery is unavailable or full. Export results before leaving this page.",
+      true,
+    );
+    return false;
   }
 }
 
@@ -4911,9 +5737,9 @@ function syncClearWorkspaceButton() {
 // instead of waiting for the TTL sweep, and we drop the saved snapshot too.
 async function clearWorkspace() {
   if (!blotState.blots.length) return;
-  if (!window.confirm("Clear all loaded blots and their scans from this session? This cannot be undone.")) return;
+  if (!confirmUserAction("Clear all loaded blots and their scans from this session? This cannot be undone.")) return;
 
-  void cleanupBlots(blotState.blots.slice());
+  await cleanupBlots(blotState.blots.slice());
   clearSavedWorkspace();
   disposeCanvasResources();
 
@@ -4927,6 +5753,7 @@ async function clearWorkspace() {
   renderBlotAnalysisEmpty("Select a blot to adjust channels and draw boxes.");
   renderBlotList();
   refreshBlotDependentControls();
+  setWorkspaceRecoveryStatus(sessionStartupWarning || "Work is temporary. Export results before closing this tab.", Boolean(sessionStartupWarning));
   setZipUploadStatus("Workspace cleared.", true);
 }
 
@@ -4998,6 +5825,7 @@ function restoreWorkspace() {
     // still present because we no longer delete it on reload.
     void selectBlot(activeIndex);
   }
+  setWorkspaceRecoveryStatus("Workspace restored for this tab. Export results before closing it.");
   return true;
 }
 
@@ -5030,5 +5858,6 @@ if (window.__WESTERN_BLOT_TEST__) {
     syncClearWorkspaceButton,
   };
 } else {
-  restoreWorkspace();
+  const restored = restoreWorkspace();
+  if (!restored) setWorkspaceRecoveryStatus(sessionStartupWarning || "Work is temporary. Export results before closing this tab.", Boolean(sessionStartupWarning));
 }
