@@ -55,6 +55,21 @@ def make_licor_pyramid_tif():
     return image.getvalue(), full_resolution
 
 
+def make_multilane_tif(h=600, w=800, n_lanes=6):
+    """Deterministic synthetic bright-bands-on-dark blot: n_lanes columns with a few
+    Gaussian bands each. Used to exercise /detect-bands end to end. No random noise, so
+    detection results are reproducible across runs."""
+    img = np.full((h, w), 300.0)
+    yy, xx = np.mgrid[0:h, 0:w]
+    for i, cx in enumerate(np.linspace(w * 0.11, w * 0.9, n_lanes)):
+        for cy, amp in [(150, 9000), (300, max(400, 4000 - i * 400)), (460, 1500)]:
+            img += amp * np.exp(-(((xx - cx) ** 2) / (2 * 26 ** 2) + ((yy - cy) ** 2) / (2 * 16 ** 2)))
+    img = np.clip(img, 0, 65535).astype(np.uint16)
+    buf = io.BytesIO()
+    tifffile.imwrite(buf, img)
+    return buf.getvalue(), img
+
+
 class StatelessSessionBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -233,6 +248,66 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertIn("backgroundSignal", signal)
         self.assertIn("adjustedSignal", signal)
         self.assertNotIn("raw_signal", signal)
+
+    def store_multilane_blot(self, blot_id="detect-blot"):
+        tif_bytes, _img = make_multilane_tif()
+        descriptor = backend.store_temp_file(SESSION_ID, blot_id, "700.tif", tif_bytes, "image/tiff")
+        return {"id": blot_id, "files": {"700": descriptor}}
+
+    def test_detect_bands_returns_composite_space_candidates(self):
+        blot = self.store_multilane_blot()
+        response = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID,
+                "blot": blot,
+                "channel": "700",
+                "compositeWidth": 800,
+                "compositeHeight": 600,
+                "sensitivities": ["conservative", "balanced", "aggressive"],
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body["imageWidth"], 800)
+        self.assertEqual(body["imageHeight"], 600)
+        self.assertEqual(body["channel"], "700")
+        # Deskew is gated off in v1, so the boxes stay in the unrotated composite frame
+        # that /extract consumes unchanged.
+        self.assertEqual(body["rotationDeg"], 0.0)
+        self.assertEqual([c["id"] for c in body["candidates"]], ["conservative", "balanced", "aggressive"])
+        self.assertIsInstance(body["laneProfile"], list)
+
+        balanced = next(c for c in body["candidates"] if c["id"] == "balanced")
+        self.assertGreaterEqual(balanced["laneCount"], 2)   # the six lanes must not merge
+        self.assertGreaterEqual(balanced["bandCount"], 2)
+        self.assertEqual(balanced["bandCount"], len(balanced["boxes"]))
+        for box in balanced["boxes"]:
+            self.assertGreater(box["w"], 0)
+            self.assertGreater(box["h"], 0)
+            self.assertGreaterEqual(box["x"], 0)
+            self.assertGreaterEqual(box["y"], 0)
+            self.assertLessEqual(box["x"] + box["w"], body["imageWidth"] + 1)
+            self.assertLessEqual(box["y"] + box["h"], body["imageHeight"] + 1)
+
+    def test_detect_bands_rejects_invalid_channel(self):
+        blot = self.store_multilane_blot("detect-blot-badchan")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": SESSION_ID, "blot": blot, "channel": "999"},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_detect_bands_enforces_session_scoping(self):
+        blot = self.store_multilane_blot("detect-blot-session")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": "someone-else", "blot": blot, "channel": "700"},
+            headers={"X-Blot-Session": "someone-else"},
+        )
+        self.assertEqual(response.status_code, 403)
 
     def test_session_id_must_match_temp_descriptors(self):
         blot = self.upload_blot()
