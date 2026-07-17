@@ -3487,6 +3487,12 @@ function createCanvasState() {
     currentBlotId: null,
     imageWidth: 0,
     imageHeight: 0,
+    // Automatic band detection (/detect-bands). All coordinates below live in the same
+    // composite space as `boxes`, so previews and committed boxes need no remapping.
+    detection: null,          // { laneProfile, imageWidth, candidates, activeId } after a detect call
+    detectionPreview: null,   // composite-space boxes drawn dashed before the user commits
+    lanePreview: null,        // [{x, w}] full-height lane columns for the live lane-split slider
+    laneThreshold: null,      // last lane-threshold slider value (0..1)
   };
 }
 
@@ -3494,6 +3500,7 @@ let canvasState = createCanvasState();
 let canvasReloadTimer = null;
 let canvasImageController = null;
 let canvasImageRequestId = 0;
+let detectionRequestId = 0;
 let canvasResizeObserver = null;
 const signalExtractionControllers = new Set();
 const blotListElement = document.querySelector("#blotList");
@@ -4272,6 +4279,7 @@ function renderBlotAnalysis(blotId) {
           { hint: "view only" },
         )}
         ${analysisSectionHtml("Boxes", boxToolControlsHtml(), { open: true })}
+        ${analysisSectionHtml("Detect bands", detectionControlsHtml(), { hint: "auto", id: "detectionSection" })}
         ${analysisSectionHtml("Selected box", boxLayoutControlsHtml(), {
           id: "selectedBoxSection",
           open: true,
@@ -4414,6 +4422,23 @@ function boxToolControlsHtml() {
   `;
 }
 
+function detectionControlsHtml() {
+  return `
+    <div class="blot-control-group detection-tools">
+      <p class="detection-hint">Find candidate band boxes automatically, preview a set on the image, then add them. Detection runs on the current <strong>Quantify channel</strong>.</p>
+      <div class="detection-actions">
+        <button class="primary-button" id="detectBandsButton" type="button">Detect bands</button>
+        <label class="detection-replace">
+          <input type="checkbox" id="detectionReplace" checked />
+          Replace existing boxes
+        </label>
+      </div>
+      <p class="detection-status" id="detectionStatus" role="status" aria-live="polite"></p>
+      <div class="detection-results" id="detectionResults" hidden></div>
+    </div>
+  `;
+}
+
 function boxLayoutControlsHtml() {
   return `
     <div class="blot-control-group box-layout-tools">
@@ -4487,6 +4512,13 @@ function bindBlotViewerControls(blotId) {
       nudgeSelectedBox(dx, dy, blotId);
     });
   });
+  // Band detection: one delegated handler covers the Detect button plus the candidate
+  // chooser / accept / cancel / re-detect controls that renderDetectionResults() injects.
+  const detectionSection = document.getElementById("detectionSection");
+  detectionSection?.addEventListener("click", (event) => handleDetectionClick(event, blotId));
+  detectionSection?.addEventListener("input", (event) => {
+    if (event.target?.id === "laneThresholdSlider") onLaneThresholdInput(event);
+  });
   updateBoxToolState();
 }
 
@@ -4499,6 +4531,11 @@ function initCanvas(blotId) {
   canvasState.panY = 0;
   canvasState.mode = "pan";
   canvasState.currentBlotId = blotId;
+  // Drop any band-detection results/previews from the previously viewed blot.
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
 
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
@@ -4765,6 +4802,289 @@ function requestRender() {
   });
 }
 
+// ─── Automatic band detection (frontend for /detect-bands) ──────────────────────
+//
+// Boxes come back from the backend in COMPOSITE coordinates (canvasState.imageWidth/
+// Height space) — the same space the user draws in — so a detected box drops straight
+// into createCanvasBox() with no remapping, and committed boxes flow through the exact
+// extractSignalsForBoxes() path a hand-drawn box uses. The chooser lets the user pick
+// among sensitivity sets (conservative/balanced/aggressive) and preview one before
+// committing; an advanced lane-split slider re-thresholds lanes live from the returned
+// laneProfile (no round-trip) and can re-detect bands at the chosen split.
+
+function setDetectionStatus(message, isError = false) {
+  const status = document.getElementById("detectionStatus");
+  if (!status) return;
+  status.textContent = message || "";
+  status.classList.toggle("is-error", Boolean(isError && message));
+}
+
+async function detectBands(blotId, { sensitivities, laneThreshold } = {}) {
+  const blot = blotById(blotId);
+  if (!blot) throw new Error("Blot is no longer loaded.");
+  const channel = document.getElementById("quantChannel")?.value ?? "700";
+  return apiJson(apiUrl("/detect-bands"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    timeoutMs: SIGNAL_EXTRACTION_TIMEOUT_MS,
+    body: JSON.stringify({
+      sessionId: activeSessionId,
+      blot,
+      channel,
+      // Same coordinate contract as /extract: report the composite size so the backend
+      // emits boxes in the space we draw in. Dropped by JSON.stringify when unset, and
+      // the backend falls back safely.
+      compositeWidth: canvasState.imageWidth || undefined,
+      compositeHeight: canvasState.imageHeight || undefined,
+      sensitivities,   // optional; omit for all three sets
+      laneThreshold,   // optional; the value tuned live via the lane-split slider
+    }),
+  }, "Band detection failed.");
+}
+
+async function onDetectBandsClick(blotId) {
+  if (!canvasState.image || !canvasState.imageWidth) {
+    showUserMessage("Load a blot image before detecting bands.");
+    return;
+  }
+  const button = document.getElementById("detectBandsButton");
+  const requestId = ++detectionRequestId;
+  if (button) { button.disabled = true; button.textContent = "Detecting…"; }
+  setDetectionStatus("Detecting bands…");
+  try {
+    const result = await detectBands(blotId);
+    if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
+    applyDetectionResult(result, blotId);
+  } catch (error) {
+    if (requestId === detectionRequestId) setDetectionStatus(error.message || "Band detection failed.", true);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = "Detect bands"; }
+  }
+}
+
+async function redetectBandsAtLaneThreshold(blotId) {
+  const requestId = ++detectionRequestId;
+  const button = document.getElementById("redetectBandsButton");
+  if (button) button.disabled = true;
+  setDetectionStatus("Re-detecting bands at this lane split…");
+  try {
+    const result = await detectBands(blotId, { laneThreshold: canvasState.laneThreshold ?? undefined });
+    if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
+    applyDetectionResult(result, blotId);
+  } catch (error) {
+    if (requestId === detectionRequestId) setDetectionStatus(error.message || "Band detection failed.", true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function applyDetectionResult(result, blotId) {
+  const candidates = Array.isArray(result?.candidates)
+    ? result.candidates.filter(c => c && Array.isArray(c.boxes))
+    : [];
+  canvasState.detection = {
+    laneProfile: Array.isArray(result?.laneProfile) ? result.laneProfile : [],
+    imageWidth: result?.imageWidth || canvasState.imageWidth,
+    candidates,
+    activeId: null,
+  };
+  canvasState.laneThreshold = null;
+  canvasState.lanePreview = null;
+
+  if (!candidates.length) {
+    canvasState.detectionPreview = null;
+    renderCanvas();
+    renderDetectionResults(blotId);
+    setDetectionStatus("No bands detected. Try raising brightness/contrast, lowering gamma, or the lane split.");
+    return;
+  }
+
+  // Preview the balanced set by default (fall back to the first returned set).
+  const preferred = candidates.find(c => c.id === "balanced") || candidates[0];
+  canvasState.detection.activeId = preferred.id;
+  renderDetectionResults(blotId);
+  previewDetectionCandidate(preferred);
+  setDetectionStatus(`Found ${candidates.length} set${candidates.length === 1 ? "" : "s"}. Previewing “${preferred.label}”. Pick one, then Add boxes.`);
+}
+
+function renderDetectionResults(blotId) {
+  const container = document.getElementById("detectionResults");
+  if (!container) return;
+  const detection = canvasState.detection;
+  if (!detection || !detection.candidates.length) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+
+  // Labels/ids are backend-derived enums, but escape defensively — this is innerHTML.
+  const candidateButtons = detection.candidates.map(candidate => {
+    const isActive = candidate.id === detection.activeId;
+    const lanes = `${candidate.laneCount} lane${candidate.laneCount === 1 ? "" : "s"}`;
+    const bands = `${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}`;
+    const meta = `${lanes} · ${bands}${candidate.truncated ? " · capped" : ""}`;
+    return `
+      <button type="button" class="detection-candidate${isActive ? " active" : ""}"
+              data-candidate-id="${escapeHtml(String(candidate.id))}" aria-pressed="${isActive}">
+        <span class="detection-candidate-name">${escapeHtml(String(candidate.label || candidate.id))}</span>
+        <span class="detection-candidate-meta">${escapeHtml(meta)}</span>
+      </button>`;
+  }).join("");
+
+  const hasProfile = detection.laneProfile.length > 0;
+  const sliderValue = canvasState.laneThreshold ?? 0.15;
+  container.innerHTML = `
+    <div class="detection-candidates" role="group" aria-label="Detected band sets">${candidateButtons}</div>
+    ${hasProfile ? `
+    <details class="detection-advanced">
+      <summary>Lane split (advanced)</summary>
+      <label class="detection-slider">Lane threshold
+        <input type="range" id="laneThresholdSlider" min="0" max="1" step="0.01" value="${sliderValue}" />
+      </label>
+      <p class="control-hint">Drag to preview lane columns on the image, then re-detect bands at that split.</p>
+      <button type="button" class="ghost-button" id="redetectBandsButton">Re-detect at this split</button>
+    </details>` : ""}
+    <div class="detection-commit">
+      <button type="button" class="primary-button" id="acceptDetectionButton">Add boxes</button>
+      <button type="button" class="ghost-button" id="cancelDetectionButton">Cancel</button>
+    </div>
+  `;
+  container.hidden = false;
+}
+
+function activeDetectionCandidate() {
+  const detection = canvasState.detection;
+  if (!detection) return null;
+  return detection.candidates.find(c => c.id === detection.activeId) || null;
+}
+
+function selectDetectionCandidate(id, blotId) {
+  const detection = canvasState.detection;
+  if (!detection) return;
+  const candidate = detection.candidates.find(c => c.id === id);
+  if (!candidate) return;
+  detection.activeId = id;
+  renderDetectionResults(blotId);
+  previewDetectionCandidate(candidate);
+  setDetectionStatus(`Previewing “${candidate.label}” — ${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}.`);
+}
+
+function previewDetectionCandidate(candidate) {
+  canvasState.detectionPreview = candidate ? candidate.boxes : null;
+  canvasState.lanePreview = null;   // a candidate preview supersedes the lane-column preview
+  renderCanvas();
+}
+
+function acceptDetectedCandidate(candidate, blotId, { replace = true } = {}) {
+  if (!candidate || !candidate.boxes.length) return;
+  if (replace) {
+    canvasState.boxes = [];
+    canvasState.selectedBoxIndex = null;
+  }
+  const slots = remainingBoxSlots();
+  if (slots <= 0) {
+    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    return;
+  }
+  const chosen = candidate.boxes.slice(0, slots);
+  const newBoxes = chosen.map(box => createCanvasBox({   // clamps to image, adds signal fields
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    laneName: Number.isInteger(box.lane) ? `Lane ${box.lane + 1}` : "",
+  }));
+
+  canvasState.boxes.push(...newBoxes);
+  canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+
+  renderCanvas();
+  renderBoxList(blotId);
+
+  const dropped = candidate.boxes.length - chosen.length;
+  setDetectionStatus(dropped > 0 || candidate.truncated
+    ? `Added ${chosen.length} boxes (strongest kept; max ${MAX_CANVAS_BOXES} per scan).`
+    : `Added ${chosen.length} boxes.`);
+
+  void extractSignalsForBoxes(blotId, newBoxes, { alertOnError: false });
+}
+
+function cancelDetection(blotId) {
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
+  renderCanvas();
+  renderDetectionResults(blotId);
+  setDetectionStatus("");
+}
+
+// Port of backend _detect_lanes operating on the returned 1-D laneProfile, so the client
+// and server agree on where lanes fall. Re-thresholds LANES only; re-detecting bands at a
+// chosen split needs the 2-D pixels and so goes back to the backend.
+function lanesFromProfile(thresholdFrac) {
+  const detection = canvasState.detection;
+  if (!detection || !detection.laneProfile.length) return [];
+  const profile = detection.laneProfile;
+  const n = profile.length;
+  const imageWidth = detection.imageWidth || canvasState.imageWidth || n;
+  const pxPerSample = imageWidth / n;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const value of profile) { if (value < lo) lo = value; if (value > hi) hi = value; }
+  if (hi <= lo) return [{ x: 0, w: imageWidth }];
+  const cut = lo + thresholdFrac * (hi - lo);
+
+  const minWidthSamples = Math.max(1, Math.round(n * 0.01));
+  const lanes = [];
+  let start = null;
+  for (let i = 0; i <= n; i++) {
+    const above = i < n && profile[i] >= cut;
+    if (above && start === null) {
+      start = i;
+    } else if (!above && start !== null) {
+      if (i - start >= minWidthSamples) lanes.push({ x: start * pxPerSample, w: (i - start) * pxPerSample });
+      start = null;
+    }
+  }
+  return lanes.length ? lanes : [{ x: 0, w: imageWidth }];
+}
+
+function onLaneThresholdInput(event) {
+  const thresholdFrac = Number(event.target.value);
+  canvasState.laneThreshold = Number.isFinite(thresholdFrac) ? thresholdFrac : 0.15;
+  canvasState.detectionPreview = null;   // show lane columns, not candidate boxes, while tuning
+  canvasState.lanePreview = lanesFromProfile(canvasState.laneThreshold);
+  renderCanvas();
+}
+
+function handleDetectionClick(event, blotId) {
+  const candidateButton = event.target.closest("[data-candidate-id]");
+  if (candidateButton) {
+    selectDetectionCandidate(candidateButton.dataset.candidateId, blotId);
+    return;
+  }
+  const button = event.target.closest("button");
+  if (!button) return;
+  switch (button.id) {
+    case "detectBandsButton":
+      void onDetectBandsClick(blotId);
+      break;
+    case "acceptDetectionButton":
+      acceptDetectedCandidate(activeDetectionCandidate(), blotId, {
+        replace: document.getElementById("detectionReplace")?.checked ?? true,
+      });
+      break;
+    case "cancelDetectionButton":
+      cancelDetection(blotId);
+      break;
+    case "redetectBandsButton":
+      void redetectBandsAtLaneThreshold(blotId);
+      break;
+    default:
+      break;
+  }
+}
+
 function renderCanvas() {
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
@@ -4825,6 +5145,28 @@ function renderCanvas() {
         canvasState.drawCurrentX - canvasState.startX,
         canvasState.drawCurrentY - canvasState.startY,
       );
+      ctx.restore();
+    }
+
+    // Live lane columns previewed while dragging the lane-split slider — a client-side
+    // re-threshold of the detector's returned laneProfile, drawn full image height.
+    if (canvasState.lanePreview && canvasState.lanePreview.length) {
+      ctx.save();
+      ctx.strokeStyle = themeToken("--annotation-preview") || themeToken("--primary");
+      ctx.setLineDash([2 / canvasState.zoom, 4 / canvasState.zoom]);
+      ctx.lineWidth = 1 / canvasState.zoom;
+      const laneHeight = canvasState.imageHeight || canvasState.image?.naturalHeight || 0;
+      canvasState.lanePreview.forEach(lane => ctx.strokeRect(lane.x, 0, lane.w, laneHeight));
+      ctx.restore();
+    }
+
+    // Dashed, non-destructive preview of a detection candidate's boxes before commit.
+    if (canvasState.detectionPreview && canvasState.detectionPreview.length) {
+      ctx.save();
+      ctx.strokeStyle = themeToken("--annotation-preview") || themeToken("--primary");
+      ctx.setLineDash([6 / canvasState.zoom, 4 / canvasState.zoom]);
+      ctx.lineWidth = 1.5 / canvasState.zoom;
+      canvasState.detectionPreview.forEach(box => ctx.strokeRect(box.x, box.y, box.w, box.h));
       ctx.restore();
     }
 

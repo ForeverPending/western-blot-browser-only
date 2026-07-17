@@ -75,6 +75,7 @@
   --chart-average: #b9cce6;
   --annotation: #f4c542;
   --annotation-selected: #ffffff;
+  --annotation-preview: #0ea5e9;
   --image-canvas: #111827;
 
   /* Compatibility aliases used throughout the existing UI. */
@@ -161,6 +162,7 @@
   --chart-average: #2b4064;
   --annotation: #fbbf24;
   --annotation-selected: #ffffff;
+  --annotation-preview: #38bdf8;
   --image-canvas: #05080f;
 
   --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
@@ -883,6 +885,139 @@ input[type="range"]:focus-visible {
   background: var(--surface);
   color: var(--primary);
   box-shadow: var(--shadow-xs);
+}
+
+/* ── Automatic band detection ──────────────────────────────────────────────── */
+
+.detection-tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.detection-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.detection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.detection-replace {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.detection-replace input {
+  margin: 0;
+}
+
+.detection-status {
+  margin: 0;
+  min-height: 1em;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.detection-status.is-error {
+  color: var(--danger);
+}
+
+.detection-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.detection-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detection-candidate {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), box-shadow var(--transition);
+}
+
+.detection-candidate:hover {
+  border-color: var(--border-interactive);
+  background: var(--surface-subtle);
+}
+
+.detection-candidate.active {
+  border-color: var(--primary-border-strong);
+  background: var(--primary-soft);
+  box-shadow: var(--shadow-xs);
+}
+
+.detection-candidate-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.detection-candidate.active .detection-candidate-name {
+  color: var(--primary);
+}
+
+.detection-candidate-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono), monospace;
+}
+
+.detection-advanced {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-subtle);
+}
+
+.detection-advanced > summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.detection-slider {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: var(--space-2);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.detection-slider input[type="range"] {
+  width: 100%;
+}
+
+.detection-commit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
 }
 
 /* ── Results, data, and charts ─────────────────────────────────────────────── */
