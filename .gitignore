@@ -192,3 +192,7 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local test data (real blot ZIPs — not for distribution)
+test_blots/
+test-blots/
