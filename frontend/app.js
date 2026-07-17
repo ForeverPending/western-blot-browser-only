@@ -4519,6 +4519,11 @@ function bindBlotViewerControls(blotId) {
   detectionSection?.addEventListener("input", (event) => {
     if (event.target?.id === "laneThresholdSlider") onLaneThresholdInput(event);
   });
+  // Detection is channel-specific; a stale chooser (counts/preview for the old channel)
+  // would be misleading, so clear it when the Quantify channel changes.
+  document.getElementById("quantChannel")?.addEventListener("change", () => {
+    if (canvasState.detection && canvasState.currentBlotId === blotId) cancelDetection(blotId);
+  });
   updateBoxToolState();
 }
 
@@ -4849,6 +4854,7 @@ async function onDetectBandsClick(blotId) {
   }
   const button = document.getElementById("detectBandsButton");
   const requestId = ++detectionRequestId;
+  canvasState.laneThreshold = null;   // a fresh detect uses the default lane split
   if (button) { button.disabled = true; button.textContent = "Detecting…"; }
   setDetectionStatus("Detecting bands…");
   try {
@@ -4856,7 +4862,9 @@ async function onDetectBandsClick(blotId) {
     if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
     applyDetectionResult(result, blotId);
   } catch (error) {
-    if (requestId === detectionRequestId) setDetectionStatus(error.message || "Band detection failed.", true);
+    if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
+      setDetectionStatus(error.message || "Band detection failed.", true);
+    }
   } finally {
     if (button) { button.disabled = false; button.textContent = "Detect bands"; }
   }
@@ -4872,7 +4880,9 @@ async function redetectBandsAtLaneThreshold(blotId) {
     if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
     applyDetectionResult(result, blotId);
   } catch (error) {
-    if (requestId === detectionRequestId) setDetectionStatus(error.message || "Band detection failed.", true);
+    if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
+      setDetectionStatus(error.message || "Band detection failed.", true);
+    }
   } finally {
     if (button) button.disabled = false;
   }
@@ -4888,7 +4898,8 @@ function applyDetectionResult(result, blotId) {
     candidates,
     activeId: null,
   };
-  canvasState.laneThreshold = null;
+  // laneThreshold is preserved here so re-detecting at a slider value keeps that value;
+  // a fresh detect resets it in onDetectBandsClick.
   canvasState.lanePreview = null;
 
   if (!candidates.length) {
@@ -4958,15 +4969,26 @@ function activeDetectionCandidate() {
   return detection.candidates.find(c => c.id === detection.activeId) || null;
 }
 
-function selectDetectionCandidate(id, blotId) {
+function selectDetectionCandidate(id) {
   const detection = canvasState.detection;
   if (!detection) return;
   const candidate = detection.candidates.find(c => c.id === id);
   if (!candidate) return;
   detection.activeId = id;
-  renderDetectionResults(blotId);
+  // Toggle active state in place rather than rebuilding the results DOM — cheaper, and
+  // it preserves the open "Lane split (advanced)" panel / slider while switching sets.
+  updateActiveCandidateButtons();
   previewDetectionCandidate(candidate);
   setDetectionStatus(`Previewing “${candidate.label}” — ${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}.`);
+}
+
+function updateActiveCandidateButtons() {
+  const activeId = canvasState.detection?.activeId;
+  document.querySelectorAll("#detectionResults [data-candidate-id]").forEach(button => {
+    const isActive = button.dataset.candidateId === activeId;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  });
 }
 
 function previewDetectionCandidate(candidate) {
@@ -4994,13 +5016,22 @@ function acceptDetectedCandidate(candidate, blotId, { replace = true } = {}) {
 
   canvasState.boxes.push(...newBoxes);
   canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+
+  const dropped = candidate.boxes.length - chosen.length;
+
+  // Commit is terminal: clear the chooser/preview and invalidate any in-flight re-detect
+  // so a late result (or a re-clicked candidate) can't draw a dashed preview back over
+  // the now-committed boxes. Re-detecting is one click on the Detect button.
+  detectionRequestId++;
+  canvasState.detection = null;
   canvasState.detectionPreview = null;
   canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
 
   renderCanvas();
   renderBoxList(blotId);
+  renderDetectionResults(blotId);   // detection is null -> hides the chooser
 
-  const dropped = candidate.boxes.length - chosen.length;
   setDetectionStatus(dropped > 0 || candidate.truncated
     ? `Added ${chosen.length} boxes (strongest kept; max ${MAX_CANVAS_BOXES} per scan).`
     : `Added ${chosen.length} boxes.`);
@@ -5009,6 +5040,7 @@ function acceptDetectedCandidate(candidate, blotId, { replace = true } = {}) {
 }
 
 function cancelDetection(blotId) {
+  detectionRequestId++;   // invalidate any in-flight detect/re-detect so it can't repopulate
   canvasState.detection = null;
   canvasState.detectionPreview = null;
   canvasState.lanePreview = null;
@@ -5054,13 +5086,13 @@ function onLaneThresholdInput(event) {
   canvasState.laneThreshold = Number.isFinite(thresholdFrac) ? thresholdFrac : 0.15;
   canvasState.detectionPreview = null;   // show lane columns, not candidate boxes, while tuning
   canvasState.lanePreview = lanesFromProfile(canvasState.laneThreshold);
-  renderCanvas();
+  requestRender();   // slider input fires many times per drag; coalesce to one redraw/frame
 }
 
 function handleDetectionClick(event, blotId) {
   const candidateButton = event.target.closest("[data-candidate-id]");
   if (candidateButton) {
-    selectDetectionCandidate(candidateButton.dataset.candidateId, blotId);
+    selectDetectionCandidate(candidateButton.dataset.candidateId);
     return;
   }
   const button = event.target.closest("button");

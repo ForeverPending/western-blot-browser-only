@@ -617,6 +617,7 @@ input[type="range"]:focus-visible {
 .main-tab-button:focus-visible,
 .blot-list-item:focus-visible,
 .box-number:focus-visible,
+.detection-candidate:focus-visible,
 .file-drop:focus-within {
   outline: none;
   box-shadow: 0 0 0 3px var(--focus-ring);

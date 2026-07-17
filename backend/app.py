@@ -2002,8 +2002,8 @@ def _normalize_for_detect(arr):
     """Robust 0..1 normalization using percentiles, so a few saturated pixels or a dark
     floor don't dominate. Computed locally for detection only."""
     a = arr.astype(np.float64, copy=False)
-    lo = float(np.percentile(a, 5.0))
-    hi = float(np.percentile(a, 99.5))
+    # One percentile call partitions once for both cut points (vs two full partitions).
+    lo, hi = (float(v) for v in np.percentile(a, [5.0, 99.5]))
     if hi <= lo:
         return np.zeros_like(a)
     return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
@@ -2080,19 +2080,17 @@ def _estimate_skew(norm, max_deg=MAX_SKEW_DEG, step=SKEW_STEP_DEG):
     return best_angle
 
 
-def _find_peaks(y, min_prominence, min_distance):
-    """Local maxima whose topographic prominence >= min_prominence, spaced at least
-    min_distance apart (greedy by prominence when they crowd). Prominence proxy: walk
-    outward from each peak until a higher sample, tracking the lowest valley on each side;
-    prominence = peak - max(left_valley, right_valley). Returns (index, prominence) pairs
-    sorted by index — the per-peak prominence is what _peak_extent needs for a correct
-    half-prominence descent, so it is carried out rather than recomputed from a threshold."""
+def _all_peaks(y):
+    """All interior local maxima with their topographic prominence, unfiltered, sorted by
+    index. Prominence proxy: walk outward from each peak until a higher sample, tracking
+    the lowest valley on each side; prominence = peak - max(left_valley, right_valley).
+    This walk depends only on `y`, so splitting it from the per-level prominence/spacing
+    filter (_select_peaks) lets the three sensitivity sets share one pass over each lane."""
     n = len(y)
     if n < 3:
         return []
     # Candidate local maxima (>= on the right handles flat-topped plateaus).
     cand = np.flatnonzero((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:])) + 1
-
     scored = []
     for i in cand:
         peak = y[i]
@@ -2104,11 +2102,16 @@ def _find_peaks(y, min_prominence, min_distance):
         j = i + 1
         while j < n and y[j] < peak:
             right_valley = min(right_valley, y[j]); j += 1
-        prominence = peak - max(left_valley, right_valley)
-        if prominence >= min_prominence:
-            scored.append((int(i), float(prominence)))
+        scored.append((int(i), float(peak - max(left_valley, right_valley))))
+    return scored
 
-    # Enforce spacing: keep the most prominent, drop peaks too close to a kept one.
+
+def _select_peaks(peaks, min_prominence, min_distance):
+    """From precomputed (index, prominence) peaks, keep those with prominence >=
+    min_prominence, spaced at least min_distance apart (greedy by prominence when they
+    crowd). Returns kept (index, prominence) pairs sorted by index. The per-peak
+    prominence is carried through for _peak_extent's half-prominence descent."""
+    scored = [pair for pair in peaks if pair[1] >= min_prominence]
     scored.sort(key=lambda t: t[1], reverse=True)
     kept = []
     for i, prom in scored:
@@ -2133,50 +2136,54 @@ def _peak_extent(y, i, prominence):
     return a, b + 1
 
 
-def _detect_lanes(norm, lane_threshold):
-    """Vertical projection (mean per column) -> lanes are contiguous spans above a
-    fraction of the profile's dynamic range. Returns list of (x0, x1) half-open."""
-    h, w = norm.shape
-    prof = _smooth_profile(norm.mean(axis=0), max(3, int(w * 0.01)))
-    lo, hi = float(prof.min()), float(prof.max())
+def _column_profile(norm):
+    """Smoothed vertical projection (mean per column) = the lane axis. Shared by lane
+    detection and the returned laneProfile, so it is computed once."""
+    return _smooth_profile(norm.mean(axis=0), max(3, int(norm.shape[1] * 0.01)))
+
+
+def _lanes_from_profile(column_profile, lane_threshold):
+    """Lanes are contiguous spans of the (already smoothed) column projection above a
+    fraction of its dynamic range. Returns list of (x0, x1) half-open."""
+    w = len(column_profile)
+    lo, hi = float(column_profile.min()), float(column_profile.max())
     if hi <= lo:
         return [(0, w)]
-    above = prof >= (lo + lane_threshold * (hi - lo))
+    above = column_profile >= (lo + lane_threshold * (hi - lo))
     min_width = max(2, int(w * 0.01))
     lanes = [(int(a), int(b)) for a, b in _bool_runs(above) if (b - a) >= min_width]
     return lanes or [(0, w)]
 
 
-def _detect_bands(norm, lane, prominence, min_distance_frac):
-    """Horizontal projection within a lane's columns -> bands are peaks along the
-    migration axis. Returns list of (y0, y1, score)."""
-    h, _w = norm.shape
-    x0, x1 = lane
-    prof = _smooth_profile(norm[:, x0:x1].mean(axis=1), max(3, int(h * 0.01)))
-    peaks = _find_peaks(prof, prominence, min_distance=max(2, int(h * min_distance_frac)))
-    out = []
-    for p, prom in peaks:
-        # Use this peak's ACTUAL prominence for the half-prominence descent, not the
-        # level threshold — otherwise a tall band descends only a threshold-sized sliver
-        # and its box (hence integrated ROI) is under-sized relative to a faint band.
-        y0, y1 = _peak_extent(prof, p, prom)
-        out.append((y0, y1, float(prof[p])))
-    return out
+def _prepare_lanes(norm, lane_threshold):
+    """Level-INDEPENDENT detection work, computed once and shared across the sensitivity
+    sets: the column profile, the lane spans, and each lane's smoothed migration-axis
+    profile with all its peak candidates. The sets differ only in the prominence/spacing
+    filter applied later (_candidate_boxes), so doing this once instead of once per level
+    avoids ~3x redundant column/lane means, convolutions, and prominence walks. Returns
+    (column_profile, lanes, prepared) with prepared = [(x0, x1, profile, peaks), ...]."""
+    column_profile = _column_profile(norm)
+    lanes = _lanes_from_profile(column_profile, lane_threshold)
+    window = max(3, int(norm.shape[0] * 0.01))
+    prepared = []
+    for (x0, x1) in lanes:
+        profile = _smooth_profile(norm[:, x0:x1].mean(axis=1), window)
+        prepared.append((x0, x1, profile, _all_peaks(profile)))
+    return column_profile, lanes, prepared
 
 
-def _detect_candidate(norm, level, scale_x, scale_y, lane_threshold=None):
-    """Run one sensitivity level over all lanes; emit boxes in COMPOSITE coordinates.
-    lane_threshold overrides the level default — used when the client tuned lanes live
-    via the laneProfile slider and re-detects at that value. Returns
-    (boxes, lane_count, truncated)."""
+def _candidate_boxes(prepared, level, scale_x, scale_y):
+    """Assemble one sensitivity set's boxes (COMPOSITE coords) from the shared prepared
+    lanes: apply this level's prominence/spacing filter, then a per-peak half-prominence
+    extent. Returns (boxes, truncated)."""
     boxes = []
-    lanes = _detect_lanes(
-        norm, level["lane_threshold"] if lane_threshold is None else lane_threshold
-    )
-    for li, (x0, x1) in enumerate(lanes):
-        for bi, (y0, y1, score) in enumerate(
-            _detect_bands(norm, (x0, x1), level["prominence"], level["min_distance_frac"])
-        ):
+    for li, (x0, x1, profile, peaks) in enumerate(prepared):
+        min_distance = max(2, int(len(profile) * level["min_distance_frac"]))
+        for bi, (p, prom) in enumerate(_select_peaks(peaks, level["prominence"], min_distance)):
+            # This peak's ACTUAL prominence sizes the extent, not the level threshold —
+            # otherwise a tall band descends only a threshold-sized sliver and its box
+            # (hence integrated ROI) is under-sized relative to a faint band.
+            y0, y1 = _peak_extent(profile, p, prom)
             boxes.append({
                 "x": round(x0 * scale_x, 2),
                 "y": round(y0 * scale_y, 2),
@@ -2184,14 +2191,14 @@ def _detect_candidate(norm, level, scale_x, scale_y, lane_threshold=None):
                 "h": round((y1 - y0) * scale_y, 2),
                 "lane": li,
                 "band": bi,
-                "score": round(score, 4),
+                "score": round(float(profile[p]), 4),
             })
     truncated = False
     if len(boxes) > MAX_DETECT_BOXES:
         boxes.sort(key=lambda b: b["score"], reverse=True)   # keep strongest bands
         boxes = boxes[:MAX_DETECT_BOXES]
         truncated = True
-    return boxes, len(lanes), truncated
+    return boxes, truncated
 
 
 @app.route("/detect-bands", methods=["POST"])
@@ -2209,7 +2216,8 @@ def detect_bands():
         levels = data.get("sensitivities") or DEFAULT_LEVELS
         if not isinstance(levels, list):
             return jsonify({"error": "sensitivities must be a list."}), 400
-        levels = [name for name in levels if name in SENSITIVITY_LEVELS][:3] or ["balanced"]
+        # Keep known levels, de-duplicated (dict preserves order), capped at 3.
+        levels = list(dict.fromkeys(n for n in levels if n in SENSITIVITY_LEVELS))[:3] or ["balanced"]
 
         # Optional lane-threshold override from the client's live laneProfile slider (0..1).
         lane_threshold = data.get("laneThreshold")
@@ -2261,30 +2269,36 @@ def detect_bands():
         else:
             angle = 0.0
 
+        # Lane spans, per-lane profiles, and peak candidates are level-independent
+        # (lane_threshold is held constant across levels), so compute them ONCE and let
+        # each sensitivity set differ only by its prominence/spacing filter.
+        effective_lane_threshold = (
+            lane_threshold if lane_threshold is not None
+            else SENSITIVITY_LEVELS[levels[0]]["lane_threshold"]
+        )
+        column_profile, lanes, prepared = _prepare_lanes(norm, effective_lane_threshold)
+
         candidates = []
         for name in levels:
-            boxes, lane_count, truncated = _detect_candidate(
-                norm, SENSITIVITY_LEVELS[name], scale_x, scale_y, lane_threshold=lane_threshold
-            )
+            boxes, truncated = _candidate_boxes(prepared, SENSITIVITY_LEVELS[name], scale_x, scale_y)
             candidates.append({
                 "id": name,
                 "label": name.capitalize(),
-                "laneCount": lane_count,
+                "laneCount": len(lanes),
                 "bandCount": len(boxes),
                 "truncated": truncated,   # frontend surfaces this ("showing strongest 200")
                 "boxes": boxes,
             })
 
-        # Coarse lane profile so the client can re-threshold lanes live without a round-trip.
-        lane_profile = _smooth_profile(norm.mean(axis=0), max(3, int(work_w * 0.01)))
-
+        # Reuse the column projection already computed for lane detection so the client can
+        # re-threshold lanes live without a round-trip (no extra full-image mean/convolve).
         return jsonify({
             "imageWidth": composite_w,       # coordinate space the boxes are in
             "imageHeight": composite_h,
             "channel": channel,
             "rotationDeg": round(angle, 2),  # apply to display + /extract to match
             "candidates": candidates,
-            "laneProfile": _downsample_profile(lane_profile, PROFILE_SAMPLES).round(4).tolist(),
+            "laneProfile": _downsample_profile(column_profile, PROFILE_SAMPLES).round(4).tolist(),
         })
     except PublicError as error:
         return error_response(error, "Band detection failed.")
