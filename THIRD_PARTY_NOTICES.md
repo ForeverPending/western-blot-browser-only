@@ -17,6 +17,12 @@ license. This file is provided as attribution and convenience.
 - **Source:** https://github.com/SheetJS/sheetjs
 - **Bundled from:** `https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js`
   as `frontend/vendor/xlsx.full.min.js`
+- **Version:** 0.20.3
+- **Integrity (SHA-384):** `sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT`
+  Verify with:
+  `openssl dgst -sha384 -binary frontend/vendor/xlsx.full.min.js | openssl base64`
+  This is the same digest the CDN copy was previously pinned to via SRI; re-verify
+  and update this line whenever the vendored file is bumped.
 - **License:** Apache License, Version 2.0 — https://www.apache.org/licenses/LICENSE-2.0
 - **Copyright:** Copyright (C) 2012-present SheetJS LLC
 
