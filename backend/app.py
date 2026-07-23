@@ -3,6 +3,7 @@ import io
 import json
 import re
 import hashlib
+import hmac
 import random
 import shutil
 import tempfile
@@ -21,11 +22,6 @@ from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import HTTPException
 from PIL import Image
 import tifffile
-from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-import base64
 
 app = Flask(__name__)
 
@@ -38,6 +34,7 @@ FRONTEND_FILES = {
     "privacy.html",
     "terms.html",
     "accessibility.html",
+    "vendor/xlsx.full.min.js",
 }
 FRONTEND_CONNECT_SOURCES = (
     "'self'",
@@ -97,9 +94,9 @@ def frontend_csp():
         connect_sources.extend(LOCAL_FRONTEND_CONNECT_SOURCES)
     return (
         "default-src 'self'; "
-        "script-src 'self' https://cdn.sheetjs.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com; "
+        "script-src 'self'; "
+        "style-src 'self'; "
+        "font-src 'self'; "
         "img-src 'self' blob: data:; "
         f"connect-src {' '.join(connect_sources)}; "
         "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
@@ -162,15 +159,20 @@ CORS(
 
 # ─── Rate limiting ─────────────────────────────────────────────────────────────
 def client_ip_key():
-    # Behind Vercel's proxy, request.remote_addr is the proxy address, so every
-    # client would share one bucket. Vercel populates X-Forwarded-For with the
-    # real client IP, so prefer it (falling back to the peer address locally).
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
+    # Vercel documents x-vercel-forwarded-for as the platform-owned client IP
+    # header. Only trust proxy headers when the function is actually running on
+    # Vercel; a directly exposed local Flask server must use its peer address.
+    if os.environ.get("VERCEL") == "1":
+        forwarded = (
+            request.headers.get("X-Vercel-Forwarded-For")
+            or request.headers.get("X-Forwarded-For")
+            or request.headers.get("X-Real-IP")
+            or ""
+        )
         client = forwarded.split(",")[0].strip()
         if client:
             return client
-    return request.headers.get("X-Real-IP") or get_remote_address()
+    return get_remote_address()
 
 
 # Wire RATELIMIT_ENABLED into Flask config; flask-limiter reads app.config, not
@@ -178,6 +180,21 @@ def client_ip_key():
 app.config["RATELIMIT_ENABLED"] = (
     os.environ.get("RATELIMIT_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 )
+RATE_LIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", "memory://")
+ALLOW_IN_MEMORY_RATE_LIMITS = (
+    os.environ.get("ALLOW_IN_MEMORY_RATE_LIMITS", "false").strip().lower()
+    in ("true", "1", "yes")
+)
+if (
+    os.environ.get("VERCEL_ENV") == "production"
+    and app.config["RATELIMIT_ENABLED"]
+    and RATE_LIMIT_STORAGE_URI.startswith("memory://")
+    and not ALLOW_IN_MEMORY_RATE_LIMITS
+):
+    raise RuntimeError(
+        "Production rate limits require a shared RATELIMIT_STORAGE_URI. "
+        "Set ALLOW_IN_MEMORY_RATE_LIMITS=true only when equivalent edge limits are configured."
+    )
 
 # RATELIMIT_STORAGE_URI defaults to in-process memory, which does NOT persist or
 # share across serverless invocations. Set it to a shared backend (e.g. Redis /
@@ -186,7 +203,7 @@ limiter = Limiter(
     client_ip_key,
     app=app,
     default_limits=["200 per day", "50 per hour"],
-    storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
+    storage_uri=RATE_LIMIT_STORAGE_URI,
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -199,26 +216,14 @@ MAX_IMAGE_PIXELS = 80_000_000
 # Rendering a composite decodes two channels to float32 and makes several resize
 # copies, so cap the per-channel size lower than the extraction limit to bound
 # peak memory on small serverless functions.
-MAX_RENDER_PIXELS = int(os.environ.get("MAX_RENDER_PIXELS", 40_000_000))
+MAX_RENDER_PIXELS = int(os.environ.get("MAX_RENDER_PIXELS", 16_000_000))
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_JPEG_BYTES = 50 * 1024 * 1024
 MAX_NAME_LENGTH = 200
 MAX_TIF_PAGES = 16
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 16 * 1024 * 1024))
-MAX_PPTX_SLIDES = 40
-MAX_PPTX_IMAGES = 40
-MAX_PPTX_GRAPHS = 120
-MAX_PPTX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_PPTX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
-PPTX_IMAGE_SLIDE_TYPE = "images"
-PPTX_GRAPH_SLIDE_TYPE = "graphs"
-PPTX_SLIDE_TYPES = {PPTX_IMAGE_SLIDE_TYPE, PPTX_GRAPH_SLIDE_TYPE}
-PPTX_GRAPHS_PER_SLIDE = 4
-PPTX_MIMETYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-PPTX_DOWNLOAD_NAME = "western-blot-analysis.pptx"
 JPEG_MIMETYPE = "image/jpeg"
 TIFF_MIMETYPE = "image/tiff"
-PPTX_DATA_URL_PATTERN = re.compile(r"^data:image/(jpeg|jpg|png);base64,", re.IGNORECASE)
 BLOT_TIMEZONE_OFFSETS = {
     "UTC": 0,
     "GMT": 0,
@@ -266,12 +271,20 @@ LOCAL_TEMP_DIR = os.environ.get("BLOT_TEMP_DIR") or os.path.join(
 )
 USE_VERCEL_BLOB = TEMP_STORAGE_BACKEND == "vercel-blob"
 
+
+def env_flag(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes")
+
 # Client cleanup only runs while a tab is open, so temp files from sessions whose
-# tab was closed are orphaned. On each upload we best-effort reclaim session files
-# older than this TTL. Set TEMP_FILE_TTL_SECONDS=0 to disable the sweep.
+# tab was closed are orphaned. Local development sweeps on upload; Vercel uses a
+# daily authenticated cron by default so cold instances do not each LIST storage.
 TEMP_FILE_TTL_SECONDS = int(os.environ.get("TEMP_FILE_TTL_SECONDS", 24 * 60 * 60))
 TEMP_SWEEP_MAX_DELETES = int(os.environ.get("TEMP_SWEEP_MAX_DELETES", 500))
 TEMP_SWEEP_MAX_PAGES = int(os.environ.get("TEMP_SWEEP_MAX_PAGES", 10))
+TEMP_SWEEP_ON_UPLOAD = env_flag("TEMP_SWEEP_ON_UPLOAD", default=not USE_VERCEL_BLOB)
 # The sweep fires on every upload; a full LIST+DELETE scan per request amplifies
 # Blob API cost under load. Run it at most once per interval per process — ample
 # for a multi-hour TTL. Set to 0 to sweep on every upload (previous behavior).
@@ -372,6 +385,11 @@ def log_temp_path(path):
     if len(parts) >= 3 and parts[0] == "uploads":
         return f"uploads/{log_token(parts[1])}/{log_token(parts[2])}"
     return ""
+
+
+def log_blob_url_path(parsed_url):
+    redacted = log_temp_path(unquote((parsed_url.path or "").lstrip("/")))
+    return f"/{redacted}" if redacted else parsed_url.path
 
 
 def request_session_id(data=None):
@@ -510,14 +528,25 @@ def log_vercel_blob_retry(method, url, attempt, retries, reason):
             "attempt": attempt + 1,
             "maxAttempts": retries + 1,
             "urlHost": parsed.hostname,
-            "urlPath": parsed.path,
+            "urlPath": log_blob_url_path(parsed),
             "reason": reason,
         }),
         flush=True,
     )
 
 
-def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_response_bytes=None, api_request=False, retries=0, retry_delay=0.5):
+def vercel_blob_request(
+    method,
+    url,
+    body=None,
+    headers=None,
+    timeout=60,
+    max_response_bytes=None,
+    api_request=False,
+    retries=0,
+    retry_delay=0.5,
+    output_file=None,
+):
     if api_request:
         validate_vercel_blob_api_url(url)
     else:
@@ -535,10 +564,25 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
     retry_statuses = {429, 500, 502, 503, 504}
 
     for attempt in range(retries + 1):
+        if output_file is not None:
+            output_file.seek(0)
+            output_file.truncate()
         request = Request(url, data=body, headers=request_headers, method=method)
         try:
             with urlopen(request, timeout=timeout) as response:
-                if max_response_bytes is None:
+                if output_file is not None:
+                    response_size = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        response_size += len(chunk)
+                        if max_response_bytes is not None and response_size > max_response_bytes:
+                            raise PublicError("Temporary file exceeds the configured size limit.", 413)
+                        output_file.write(chunk)
+                    output_file.flush()
+                    response_body = None
+                elif max_response_bytes is None:
                     response_body = response.read()
                 else:
                     response_body = response.read(max_response_bytes + 1)
@@ -559,7 +603,7 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
                     "status": error.code,
                     "reason": error.reason,
                     "urlHost": parsed.hostname,
-                    "urlPath": parsed.path,
+                    "urlPath": log_blob_url_path(parsed),
                     "response": error_body[:500],
                 }),
                 flush=True,
@@ -579,7 +623,7 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
                     "event": "vercel_blob_request_error",
                     "method": method,
                     "urlHost": parsed.hostname,
-                    "urlPath": parsed.path,
+                    "urlPath": log_blob_url_path(parsed),
                     "error": str(error),
                 }),
                 flush=True,
@@ -591,6 +635,8 @@ def vercel_blob_request(method, url, body=None, headers=None, timeout=60, max_re
                 time.sleep(vercel_blob_retry_delay(retry_delay, attempt))
                 continue
             raise public_error from error
+        if output_file is not None:
+            return response_size
         if not response_body:
             return None
         if "application/json" in content_type:
@@ -651,6 +697,18 @@ def vercel_blob_read(descriptor, path, max_bytes=None):
     return vercel_blob_request("GET", url, max_response_bytes=max_bytes, retries=2)
 
 
+def vercel_blob_read_to_file(descriptor, path, output_file, max_bytes=None):
+    url = descriptor.get("downloadUrl") or descriptor.get("url")
+    validate_vercel_blob_url(url, path)
+    return vercel_blob_request(
+        "GET",
+        url,
+        max_response_bytes=max_bytes,
+        retries=2,
+        output_file=output_file,
+    )
+
+
 def vercel_blob_delete(descriptor_paths):
     urls = []
     for descriptor, path in descriptor_paths:
@@ -709,6 +767,31 @@ def read_temp_file(descriptor, session_id=None, allow_uploads=False, max_bytes=N
     if len(file_bytes) > max_bytes:
         raise PublicError("Temporary file exceeds the configured size limit.", 413)
     return file_bytes
+
+
+def copy_temp_file_to_handle(
+    descriptor,
+    output_file,
+    session_id=None,
+    allow_uploads=False,
+    max_bytes=None,
+):
+    """Stream a temporary object into a seekable file without retaining the
+    complete object in process memory. Returns the copied byte count."""
+    path = descriptor_path(descriptor, session_id, allow_uploads=allow_uploads)
+    if USE_VERCEL_BLOB:
+        return vercel_blob_read_to_file(descriptor, path, output_file, max_bytes=max_bytes)
+
+    full_path = local_temp_file_path(path)
+    if not os.path.exists(full_path):
+        raise PublicError("Temporary file was not found.", 404)
+    size = os.path.getsize(full_path)
+    if max_bytes is not None and size > max_bytes:
+        raise PublicError("Temporary file exceeds the configured size limit.", 413)
+    with open(full_path, "rb") as source:
+        shutil.copyfileobj(source, output_file, length=1024 * 1024)
+    output_file.flush()
+    return size
 
 
 def delete_temp_files(descriptors, session_id=None, allow_uploads=False):
@@ -898,20 +981,24 @@ def sweep_expired_vercel_blobs(cutoff_epoch, exclude_session_id, max_deletes):
 _last_temp_sweep_monotonic = None
 
 
-def sweep_expired_temp_files(exclude_session_id=None, max_age_seconds=None, max_deletes=None):
+def sweep_expired_temp_files(
+    exclude_session_id=None,
+    max_age_seconds=None,
+    max_deletes=None,
+    force=False,
+):
     """Best-effort reclamation of orphaned session temp files. Never raises."""
     if max_age_seconds is None:
         max_age_seconds = TEMP_FILE_TTL_SECONDS
     if max_age_seconds <= 0:
         return 0
-    # Throttle to at most one scan per interval per process to bound the Blob
-    # LIST+DELETE amplification when uploads arrive in bursts. Per-process only:
-    # each serverless instance keeps its own timer, which is fine for best-effort
-    # reclamation of a multi-hour-TTL orphan.
+    # Local upload-triggered sweeps are throttled per process. The authenticated
+    # scheduled sweep passes force=True so it runs exactly when invoked.
     global _last_temp_sweep_monotonic
     now = time.monotonic()
     if (
-        TEMP_SWEEP_MIN_INTERVAL_SECONDS > 0
+        not force
+        and TEMP_SWEEP_MIN_INTERVAL_SECONDS > 0
         and _last_temp_sweep_monotonic is not None
         and now - _last_temp_sweep_monotonic < TEMP_SWEEP_MIN_INTERVAL_SECONDS
     ):
@@ -973,13 +1060,33 @@ init_storage()
 @app.route("/health")
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "sharedRateLimits": not RATE_LIMIT_STORAGE_URI.startswith("memory://"),
+        "tempStorage": TEMP_STORAGE_BACKEND,
+    })
 
 
 @app.route("/client-config")
 @app.route("/api/client-config")
 def client_config():
-    return jsonify({"blobAccess": BLOB_ACCESS})
+    return jsonify({
+        "blobAccess": BLOB_ACCESS,
+        "maxDirectUploadBytes": min(MAX_REQUEST_BYTES, MAX_ZIP_BYTES),
+        "maxZipUploadBytes": MAX_ZIP_BYTES,
+    })
+
+
+@app.route("/cron-cleanup", methods=["GET"])
+@app.route("/api/cron-cleanup", methods=["GET"])
+@limiter.exempt
+def cron_cleanup():
+    secret = os.environ.get("CRON_SECRET", "")
+    supplied = request.headers.get("Authorization", "")
+    if len(secret) < 16 or not hmac.compare_digest(supplied, f"Bearer {secret}"):
+        return jsonify({"error": "Unauthorized"}), 401
+    removed = sweep_expired_temp_files(max_deletes=TEMP_SWEEP_MAX_DELETES, force=True)
+    return jsonify({"status": "ok", "removed": removed})
 
 # ─── ZIP upload & parsing ─────────────────────────────────────────────────────
 
@@ -994,24 +1101,24 @@ def upload_zip():
     if not file.filename.lower().endswith(".zip"):
         return jsonify({"error": "File must be a .zip"}), 400
 
-    # Check content length before reading
+    # Reject oversized multipart requests before inspecting the seekable upload.
     if request.content_length and request.content_length > MAX_ZIP_BYTES:
         return jsonify({"error": "File is too large for direct API upload. Use Storage upload instead."}), 413
 
-    file_bytes = file.read()
-
-    # Check actual file size after reading
-    if len(file_bytes) > MAX_ZIP_BYTES:
+    file.stream.seek(0, os.SEEK_END)
+    file_size = file.stream.tell()
+    file.stream.seek(0)
+    if file_size > MAX_ZIP_BYTES:
         return jsonify({"error": "File is too large for direct API upload. Use Storage upload instead."}), 413
 
-    # Validate ZIP magic bytes
-    if not is_valid_zip(file_bytes):
+    if not is_valid_zip(file.stream):
         return jsonify({"error": "Invalid ZIP file."}), 400
 
     try:
         session_id = request_session_id()
-        blots = parse_zip(file_bytes, session_id)
-        sweep_expired_temp_files(exclude_session_id=session_id)
+        blots = parse_zip(file.stream, session_id)
+        if TEMP_SWEEP_ON_UPLOAD:
+            sweep_expired_temp_files(exclude_session_id=session_id)
         return jsonify({"blots": blots})
     except PublicError as error:
         return error_response(error, "ZIP import failed.")
@@ -1038,20 +1145,29 @@ def process_storage_upload():
         flush=True,
     )
     try:
-        file_bytes = read_temp_file(upload_descriptor, session_id, allow_uploads=True, max_bytes=MAX_ZIP_BYTES)
-        print(
-            json.dumps({
-                "event": "process_upload_blob_read",
-                "sessionHash": log_token(session_id),
-                "bytes": len(file_bytes),
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }),
-            flush=True,
-        )
-        if not is_valid_zip(file_bytes):
-            raise PublicError("Stored object is not a valid ZIP file.")
-        blots = parse_zip(file_bytes, session_id)
-        sweep_expired_temp_files(exclude_session_id=session_id)
+        with tempfile.NamedTemporaryFile(prefix="western-blot-upload-", suffix=".zip") as upload_file:
+            copied_bytes = copy_temp_file_to_handle(
+                upload_descriptor,
+                upload_file,
+                session_id,
+                allow_uploads=True,
+                max_bytes=MAX_ZIP_BYTES,
+            )
+            upload_file.seek(0)
+            print(
+                json.dumps({
+                    "event": "process_upload_blob_read",
+                    "sessionHash": log_token(session_id),
+                    "bytes": copied_bytes,
+                    "elapsedSeconds": round(time.monotonic() - started, 3),
+                }),
+                flush=True,
+            )
+            if not is_valid_zip(upload_file):
+                raise PublicError("Stored object is not a valid ZIP file.")
+            blots = parse_zip(upload_file, session_id)
+        if TEMP_SWEEP_ON_UPLOAD:
+            sweep_expired_temp_files(exclude_session_id=session_id)
         print(
             json.dumps({
                 "event": "process_upload_zip_parsed",
@@ -1102,8 +1218,17 @@ def process_storage_upload():
             )
 
 
-def is_valid_zip(file_bytes):
-    return len(file_bytes) >= 4 and zipfile.is_zipfile(io.BytesIO(file_bytes))
+def is_valid_zip(zip_source):
+    if isinstance(zip_source, (bytes, bytearray)):
+        return len(zip_source) >= 4 and zipfile.is_zipfile(io.BytesIO(zip_source))
+    try:
+        original_position = zip_source.tell()
+        zip_source.seek(0)
+        valid = zipfile.is_zipfile(zip_source)
+        zip_source.seek(original_position)
+        return valid
+    except (AttributeError, OSError):
+        return False
 
 
 def enforce_zip_member_size(zf, filename, limit, message):
@@ -1191,31 +1316,33 @@ def enforce_blot_member_sizes(zf, members):
     enforce_zip_member_size(zf, members["jpg"], MAX_JPEG_BYTES, "Blot preview image is too large.")
 
 
-def read_blot_member_bytes(zf, members):
-    jpg_bytes = zf.read(members["jpg"]) if members["jpg"] else None
-    tif_700_bytes = zf.read(members["700"]) if members["700"] else None
-    tif_800_bytes = zf.read(members["800"]) if members["800"] else None
-    validate_tif_pixels(tif_700_bytes, "700nm TIF")
-    validate_tif_pixels(tif_800_bytes, "800nm TIF")
-    return {
-        "jpg": jpg_bytes,
-        "700": tif_700_bytes,
-        "800": tif_800_bytes,
-    }
-
-
-def store_blot_files(session_id, blot_id, file_bytes):
+def store_blot_archive_members(zf, members, session_id, blot_id):
+    """Validate and store one archive member at a time so a large preview and
+    both TIF channels are never retained in memory together."""
     files = {}
     try:
-        jpg = store_temp_file(session_id, blot_id, "preview.jpg", file_bytes["jpg"], JPEG_MIMETYPE)
-        if jpg:
-            files["jpg"] = jpg
-        tif_700 = store_temp_file(session_id, blot_id, "700.tif", file_bytes["700"], TIFF_MIMETYPE)
-        if tif_700:
-            files["700"] = tif_700
-        tif_800 = store_temp_file(session_id, blot_id, "800.tif", file_bytes["800"], TIFF_MIMETYPE)
-        if tif_800:
-            files["800"] = tif_800
+        member_settings = (
+            ("jpg", "preview.jpg", JPEG_MIMETYPE, None),
+            ("700", "700.tif", TIFF_MIMETYPE, "700nm TIF"),
+            ("800", "800.tif", TIFF_MIMETYPE, "800nm TIF"),
+        )
+        for kind, filename, content_type, tif_label in member_settings:
+            archive_name = members[kind]
+            if not archive_name:
+                continue
+            member_bytes = zf.read(archive_name)
+            if tif_label:
+                validate_tif_pixels(member_bytes, tif_label)
+            descriptor = store_temp_file(
+                session_id,
+                blot_id,
+                filename,
+                member_bytes,
+                content_type,
+            )
+            if descriptor:
+                files[kind] = descriptor
+            del member_bytes
         return files
     except Exception:
         delete_temp_files_safely(
@@ -1250,14 +1377,16 @@ def parse_zip_folder(zf, folder, folder_index, files, session_id):
     txt_content = zf.read(members["txt"]).decode("utf-8", errors="ignore")
     blot_name, created_at = parse_blot_metadata(txt_content, folder)
     blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
-    stored_files = store_blot_files(session_id, blot_id, read_blot_member_bytes(zf, members))
+    stored_files = store_blot_archive_members(zf, members, session_id, blot_id)
     return blot_record(blot_id, blot_name, created_at, members, stored_files)
 
 
-def parse_zip(file_bytes, session_id):
+def parse_zip(zip_source, session_id):
     blots = []
     try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        source = io.BytesIO(zip_source) if isinstance(zip_source, (bytes, bytearray)) else zip_source
+        source.seek(0)
+        with zipfile.ZipFile(source) as zf:
             validate_zip_archive(zf)
             folders = zip_folders(zf)
             for folder_index, folder in enumerate(sorted(folders), start=1):
@@ -1323,7 +1452,7 @@ def validate_tif_pixels(tif_bytes, label):
     decode_validated_tif(tif_bytes, label)
 
 
-def decode_validated_tif(tif_bytes, label):
+def decode_validated_tif(tif_bytes, label, return_saturation=False):
     try:
         with tifffile.TiffFile(io.BytesIO(tif_bytes)) as tif:
             pages = list(tif.pages)
@@ -1367,7 +1496,46 @@ def decode_validated_tif(tif_bytes, label):
             image = primary_page.asarray()
             if image.shape != primary_shape:
                 raise PublicError(f"{label} contains invalid pixel data.")
-            return sanitize_tif_pixels(image, label)
+            sanitized = sanitize_tif_pixels(image, label)
+            if return_saturation:
+                # Hand back the pre-sanitize pixels rather than a whole-image
+                # saturation mask: the extract path only measures small ROIs, so
+                # saturation is counted per-ROI in extract_box_signal instead of
+                # allocating a boolean mask the size of the full image.
+                return sanitized, image
+            return sanitized
+    except PublicError:
+        raise
+    except Exception as error:
+        raise PublicError(f"{label} could not be read.") from error
+
+
+def read_tif_dimensions(tif_bytes, label):
+    """(height, width) of the primary full-resolution page, WITHOUT decoding the
+    pixels. Mirrors decode_validated_tif's page selection so the shape matches what
+    read_raw_channel would decode. Used to size the composite grid for coordinate
+    scaling without paying to fully decode the second channel.
+
+    This is intentionally lighter than decode_validated_tif (no dtype / pixel-cap /
+    reduced-page checks) because it only reads header geometry. Full validation still
+    runs when the channel is actually decoded, and boxes only exist after a composite
+    render decoded both channels — so a file that passes here but would fail a full
+    decode never produces a wrong measurement (composite_dimensions also falls back
+    to the native grid on any read failure)."""
+    try:
+        with tifffile.TiffFile(io.BytesIO(tif_bytes)) as tif:
+            pages = list(tif.pages)
+            if not pages or len(pages) > MAX_TIF_PAGES:
+                raise PublicError(f"{label} has an unsupported number of image pages.")
+            full_resolution_pages = [page for page in pages if not page.is_reduced]
+            if len(full_resolution_pages) != 1:
+                raise PublicError(f"{label} must contain one full-resolution image.")
+            shape = full_resolution_pages[0].shape
+            if len(shape) != 2:
+                raise PublicError(f"{label} must be a two-dimensional grayscale image.")
+            if int(np.prod(shape)) > MAX_IMAGE_PIXELS:
+                raise PublicError(f"{label} is too large. Maximum is {MAX_IMAGE_PIXELS:,} pixels.")
+            return int(shape[0]), int(shape[1])
     except PublicError:
         raise
     except Exception as error:
@@ -1396,6 +1564,19 @@ def sanitize_tif_pixels(image, label):
     )
     limit = np.finfo(np.float16).max
     return np.nan_to_num(image, copy=True, nan=0.0, posinf=limit, neginf=-limit)
+
+
+def tif_saturation_mask(image):
+    """Boolean mask of detector-saturated pixels, computed from the ORIGINAL
+    (pre-sanitize) pixels. LI-COR float scans encode saturation as +Inf; integer
+    scans saturate at the dtype ceiling (65535 for uint16). Saturated bands cannot
+    be accurately quantified — the summed signal underestimates the true amount."""
+    arr = np.asarray(image)
+    if arr.dtype == np.dtype("float16"):
+        return np.isposinf(arr.astype(np.float32))
+    if np.issubdtype(arr.dtype, np.integer):
+        return arr >= np.iinfo(arr.dtype).max
+    return np.isposinf(arr.astype(np.float32))
 
 
 # ─── TIF composite rendering ──────────────────────────────────────────────────
@@ -1525,12 +1706,22 @@ def extract_payload_signals():
         blot = load_payload_blot(data.get("blot"), (), session_id)
         boxes = data.get("boxes", [])
         channel = data.get("channel", "700")
-        background_axis = data.get("backgroundAxis", "leftright")
+        # backgroundSides supersedes the legacy backgroundAxis key; keep the old
+        # one working for clients that have not been updated yet.
+        background_sides = data.get("backgroundSides") or data.get("backgroundAxis", "leftright")
+        background_stat = data.get("backgroundStat", "median")
+        border_width = data.get("borderWidth", 3)
 
         if channel not in ("700", "800"):
             return jsonify({"error": "Invalid channel"}), 400
-        if background_axis not in ("leftright", "topbottom"):
+        if background_sides not in ("leftright", "topbottom", "allsides"):
             return jsonify({"error": "Invalid background mode"}), 400
+        if background_stat not in ("median", "mean"):
+            return jsonify({"error": "Invalid background statistic"}), 400
+        try:
+            border_width = max(1, min(5, int(border_width)))
+        except (TypeError, ValueError):
+            border_width = 3
         if not isinstance(boxes, list):
             return jsonify({"error": "Boxes must be a list."}), 400
         if len(boxes) > 200:
@@ -1542,8 +1733,27 @@ def extract_payload_signals():
         if not descriptor:
             return jsonify({"error": f"No {channel}nm TIF found"}), 404
         tif_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel])
-        arr = read_raw_channel(tif_bytes)
-        results = [extract_box_signal(arr, box, background_axis) for box in boxes]
+        arr, raw_pixels = read_raw_channel(tif_bytes, return_saturation=True)
+
+        # Boxes arrive in COMPOSITE image space (the frontend draws on the
+        # max(700,800) composite from build_composite). When the two channels have
+        # different native dimensions this channel is smaller than the composite, so
+        # rescale each box into this channel's native pixel grid before measuring —
+        # otherwise boxes toward the far edge would read the wrong, edge-clamped
+        # pixels. A no-op (scale 1.0) whenever the composite equals this channel.
+        native_h, native_w = arr.shape
+        composite_h, composite_w = resolve_composite_dimensions(
+            data, blot, channel, session_id, native_h, native_w
+        )
+        scale_x = native_w / composite_w if composite_w else 1.0
+        scale_y = native_h / composite_h if composite_h else 1.0
+        results = [
+            extract_box_signal(
+                arr, scale_box(box, scale_x, scale_y),
+                background_sides, border_width, background_stat, raw_arr=raw_pixels,
+            )
+            for box in boxes
+        ]
         return jsonify({"results": results})
     except PublicError as error:
         return error_response(error, "Signal extraction failed.")
@@ -1552,15 +1762,88 @@ def extract_payload_signals():
         return error_response(error, "Signal extraction failed.")
 
 
-def read_raw_channel(tif_bytes):
-    return read_validated_tif(tif_bytes).astype(np.float32)
+def composite_dimensions(blot, channel, session_id, native_h, native_w):
+    """Dimensions of the composite the frontend drew its boxes on = the element-wise
+    max of both channels' native shapes (exactly what build_composite resizes to).
+    Falls back to this channel's own native dimensions when the other channel is
+    absent or unreadable — which reproduces the pre-scaling behaviour and means a
+    single-channel blot never scales."""
+    other = "800" if channel == "700" else "700"
+    descriptor = blot["files"].get(other)
+    if not descriptor:
+        return native_h, native_w
+    try:
+        other_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[other])
+        other_h, other_w = read_tif_dimensions(other_bytes, f"{other}nm TIF")
+    except Exception:
+        app.logger.info(
+            "Could not read %snm dimensions for coordinate scaling; using native grid.", other
+        )
+        return native_h, native_w
+    return max(native_h, other_h), max(native_w, other_w)
+
+
+def valid_composite_dimension(value, minimum):
+    """Coerce a client-supplied composite dimension to an int, rejecting anything
+    below this channel's native size. The composite the frontend drew its boxes on is
+    the element-wise max of both channels, so a legitimate value is never smaller than
+    the native grid; returns None for a missing or implausible value."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < minimum:
+        return None
+    return number
+
+
+def resolve_composite_dimensions(data, blot, channel, session_id, native_h, native_w):
+    """Dimensions the frontend's boxes were drawn on. Prefer the natural size the
+    client reports for the rendered composite (compositeWidth / compositeHeight): the
+    composite is max(700, 800) per axis, so a valid report is at least this channel's
+    native size and within the decode cap. Using it avoids re-downloading and header-
+    parsing the OTHER channel on every /extract — which, when both channels share
+    dimensions (the common case), only ever yields a no-op 1.0 scale anyway. Falls back
+    to composite_dimensions (which reads the other channel) when the client sends
+    nothing usable, e.g. an older client or before the composite image has loaded."""
+    width = valid_composite_dimension(data.get("compositeWidth"), native_w)
+    height = valid_composite_dimension(data.get("compositeHeight"), native_h)
+    if width and height and width * height <= MAX_IMAGE_PIXELS:
+        return height, width
+    return composite_dimensions(blot, channel, session_id, native_h, native_w)
+
+
+def scale_box(box, scale_x, scale_y):
+    """Map a box from composite space into a channel's native pixel grid. Returns the
+    box unchanged when there is no scaling, so equal-dimension blots are untouched."""
+    if scale_x == 1.0 and scale_y == 1.0:
+        return box
+    return {
+        "x": box["x"] * scale_x,
+        "y": box["y"] * scale_y,
+        "w": box["w"] * scale_x,
+        "h": box["h"] * scale_y,
+    }
+
+
+def read_raw_channel(tif_bytes, return_saturation=False):
+    result = decode_validated_tif(tif_bytes, "Stored TIF", return_saturation=return_saturation)
+    if return_saturation:
+        # Extract path: keep the channel in its native dtype (uint16/float16) instead
+        # of allocating a float32 copy of the whole image — only small ROIs are read,
+        # and their sums upcast to float64 locally in extract_box_signal. The second
+        # array is the pre-sanitize pixels used for per-ROI saturation counts.
+        sanitized, raw_pixels = result
+        return sanitized, raw_pixels
+    # Render path normalizes the full array, so float32 keeps the intermediates small.
+    return result.astype(np.float32)
 
 
 def read_validated_tif(tif_bytes):
     return decode_validated_tif(tif_bytes, "Stored TIF")
 
 
-def extract_box_signal(arr, box, background_axis):
+def extract_box_signal(arr, box, background_sides="leftright", border_width=3, background_stat="median", raw_arr=None):
     raw_x = int(round(box["x"]))
     raw_y = int(round(box["y"]))
     w = max(1, int(round(box["w"])))
@@ -1575,44 +1858,70 @@ def extract_box_signal(arr, box, background_axis):
         raise PublicError("A selected box is outside the image bounds.")
 
     roi        = arr[y:y2, x:x2]
-    raw_signal = float(np.sum(roi))
+    # Accumulate in float64 on the slice: the channel is kept in its native
+    # dtype (uint16/float16), so a float64 accumulator avoids the precision loss
+    # a float32 sum would incur over a large ROI.
+    raw_signal = float(np.sum(roi, dtype=np.float64))
+    n_pixels   = (y2 - y) * (x2 - x)
 
-    border     = 3
-    bg_pixels  = []
+    # Local-background strips flanking the box. Mirrors LI-COR Image Studio's
+    # Median method: Signal = Total - (Bkgnd x Area), where Bkgnd is the median
+    # (or mean) per-pixel intensity of a 1-5 px border. "allsides" averages a
+    # gradient better; left-right / top-bottom sample only one axis.
+    border    = max(1, min(5, int(border_width)))
+    strips    = []
 
-    if background_axis == "leftright":
-        lx1 = max(0, x - border)
-        lx2 = x
+    if background_sides in ("leftright", "allsides"):
+        lx1, lx2 = max(0, x - border), x
         if lx2 > lx1:
-            bg_pixels.append(arr[y:y2, lx1:lx2].flatten())
-        rx1 = x2
-        rx2 = min(img_w, x2 + border)
+            strips.append(arr[y:y2, lx1:lx2].flatten())
+        rx1, rx2 = x2, min(img_w, x2 + border)
         if rx2 > rx1:
-            bg_pixels.append(arr[y:y2, rx1:rx2].flatten())
-    else:
-        ty1 = max(0, y - border)
-        ty2 = y
+            strips.append(arr[y:y2, rx1:rx2].flatten())
+    if background_sides in ("topbottom", "allsides"):
+        ty1, ty2 = max(0, y - border), y
         if ty2 > ty1:
-            bg_pixels.append(arr[ty1:ty2, x:x2].flatten())
-        by1 = y2
-        by2 = min(img_h, y2 + border)
+            strips.append(arr[ty1:ty2, x:x2].flatten())
+        by1, by2 = y2, min(img_h, y2 + border)
         if by2 > by1:
-            bg_pixels.append(arr[by1:by2, x:x2].flatten())
+            strips.append(arr[by1:by2, x:x2].flatten())
 
-    if bg_pixels:
-        all_bg     = np.concatenate(bg_pixels)
-        bg_median  = float(np.median(all_bg))
-        n_pixels   = (y2 - y) * (x2 - x)
-        background_signal = bg_median * n_pixels
-    else:
-        background_signal = 0.0
+    background_per_pixel = 0.0
+    background_uneven = False
+    if strips:
+        # Compute background stats in float64. The channel is kept in its native
+        # dtype now, and np.median / np.mean of a float16 array would otherwise round
+        # the result back to the float16 grid; widening first keeps the estimate at
+        # least as accurate as the previous float32 path.
+        all_bg = np.concatenate(strips).astype(np.float64, copy=False)
+        background_per_pixel = (
+            float(np.mean(all_bg)) if background_stat == "mean" else float(np.median(all_bg))
+        )
+        # If opposite strips differ by >2x, one likely overlaps a neighbouring
+        # band — the background estimate (and the subtraction) is unreliable.
+        side_medians = [float(np.median(s.astype(np.float64, copy=False))) for s in strips if s.size]
+        if len(side_medians) >= 2 and min(side_medians) > 0 and max(side_medians) / min(side_medians) > 2.0:
+            background_uneven = True
 
+    background_signal = background_per_pixel * n_pixels
     adjusted_signal = max(0.0, raw_signal - background_signal)
+
+    # Count detector-saturated pixels on the ROI slice of the pre-sanitize pixels,
+    # reusing tif_saturation_mask's per-dtype logic — no whole-image mask needed.
+    saturated_pixels = (
+        int(np.count_nonzero(tif_saturation_mask(raw_arr[y:y2, x:x2])))
+        if raw_arr is not None else 0
+    )
 
     return {
         "rawSignal": round(raw_signal, 2),
         "backgroundSignal": round(background_signal, 2),
         "adjustedSignal": round(adjusted_signal, 2),
+        "backgroundPerPixel": round(background_per_pixel, 4),
+        "backgroundUneven": background_uneven,
+        "saturatedPixels": saturated_pixels,
+        "saturatedFraction": round(saturated_pixels / n_pixels, 6) if n_pixels else 0.0,
+        "maxPixel": round(float(roi.max()), 2),
         "x": x, "y": y, "w": x2 - x, "h": y2 - y,
     }
 
@@ -1630,6 +1939,374 @@ def validate_box(box):
         raise PublicError("A selected box is too large.")
 
 
+# ─── Automatic band detection (/detect-bands) ───────────────────────────────────
+#
+# Detection runs HERE, on the backend, on the native validated pixels from
+# read_raw_channel() — the same array extract_box_signal() quantifies from — not the
+# lossy 8-bit tone-mapped JPEG composite the browser holds. It emits boxes in COMPOSITE
+# coordinate space, so a detected box is indistinguishable from a hand-drawn one and
+# flows through the untouched extraction / normalization / fold-change pipeline
+# (/extract still rescales composite -> native at measure time via scale_box).
+#
+# Projection-profile method, numpy only (no scipy — peak finding is hand-rolled).
+
+# Cap detected boxes per candidate to match the frontend's MAX_CANVAS_BOXES (app.js:17).
+MAX_DETECT_BOXES = 200
+
+# Detect on a copy downsampled to this max long-axis size: projection profiles don't
+# need full resolution, and this bounds cost/memory independent of image size (a native
+# TIF may be up to MAX_IMAGE_PIXELS). Boxes scale back to composite space at the end, so
+# downsampling never affects the emitted coordinates.
+DETECT_MAX_DIM = 1600
+
+# Longer axis of the returned laneProfile (for optional live client-side re-thresholding).
+PROFILE_SAMPLES = 512
+
+# Deskew search: try angles in [-MAX_SKEW_DEG, +MAX_SKEW_DEG] at this step and keep the
+# one that makes the lane (column) projection sharpest. 0 disables auto-deskew.
+MAX_SKEW_DEG = 5.0
+SKEW_STEP_DEG = 0.5
+
+# Rotation is GATED OFF in v1. The box model is axis-aligned {x, y, w, h}, so a box found
+# in a rotated frame is a *tilted* rectangle in the original composite — unrepresentable.
+# Rotation therefore only works as ONE angle applied identically to detection + canvas
+# DISPLAY + /extract (which must rotate the native array before slicing). /extract does
+# not do that yet, so applying any angle here would emit boxes that /extract measures
+# against the UNROTATED pixels — silent wrong signals. Detect in the unrotated composite
+# frame (boxes flow through /extract unchanged) until rotation is plumbed end to end; then
+# flip this flag. See DETECT_BANDS_DESIGN.md ("Rotation / deskew — the one real catch").
+DETECT_ENABLE_DESKEW = False
+
+# The "sets of bands to choose between" = one detection per sensitivity level. Lower
+# `prominence` => more (fainter) bands captured; that is the knob that varies across
+# levels. `lane_threshold` is deliberately HELD CONSTANT: lowering it with sensitivity
+# merges adjacent lanes into one (verified visually during calibration), which is never
+# wanted. Values are in normalized (0..1) profile units — tune against real blots.
+SENSITIVITY_LEVELS = {
+    "conservative": {"prominence": 0.20, "lane_threshold": 0.15, "min_distance_frac": 0.030},
+    "balanced":     {"prominence": 0.10, "lane_threshold": 0.15, "min_distance_frac": 0.020},
+    "aggressive":   {"prominence": 0.05, "lane_threshold": 0.15, "min_distance_frac": 0.012},
+}
+DEFAULT_LEVELS = ["conservative", "balanced", "aggressive"]
+
+
+def _working_image(arr):
+    """Stride-downsample so the longer axis is <= DETECT_MAX_DIM. Striding is cheap and
+    fine for projection profiles. Returns (work, step)."""
+    h, w = arr.shape
+    step = max(1, int(np.ceil(max(h, w) / DETECT_MAX_DIM)))
+    return arr[::step, ::step], step
+
+
+def _normalize_for_detect(arr):
+    """Robust 0..1 normalization using percentiles, so a few saturated pixels or a dark
+    floor don't dominate. Computed locally for detection only."""
+    a = arr.astype(np.float64, copy=False)
+    # One percentile call partitions once for both cut points (vs two full partitions).
+    lo, hi = (float(v) for v in np.percentile(a, [5.0, 99.5]))
+    if hi <= lo:
+        return np.zeros_like(a)
+    return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _orient_polarity(norm):
+    """LI-COR Odyssey scans are signal-bright-on-dark, so high intensity = band. If the
+    frame is mostly bright (median > 0.5) it's a dark-band-on-light capture — invert so
+    bands are always the high values downstream."""
+    if float(np.median(norm)) > 0.5:
+        return 1.0 - norm
+    return norm
+
+
+def _smooth_profile(profile, window):
+    """Moving-average smoothing via convolution (mode='same' keeps length)."""
+    if window <= 1:
+        return profile
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.convolve(profile, kernel, mode="same")
+
+
+def _bool_runs(mask):
+    """Contiguous True runs in a 1-D boolean array -> list of (start, end) half-open."""
+    idx = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
+    return list(zip(idx[0::2], idx[1::2]))
+
+
+def _downsample_profile(profile, target):
+    n = len(profile)
+    if n <= target:
+        return profile
+    return profile[np.linspace(0, n - 1, target).astype(int)]
+
+
+# Rotation / deskew. The box model is AXIS-ALIGNED {x, y, w, h}, so a box found in a
+# rotated frame is a *tilted* rectangle back in the original composite, which the model
+# can't represent. Rotation therefore can't be a detection-only trick: the returned
+# rotationDeg must be applied identically to the canvas DISPLAY and to /extract (which
+# would rotate the native array before slicing) so the measured pixels match the view.
+# The functions below cover only the detection side and the angle estimate.
+
+def _rotate_array(arr, angle_deg):
+    """Rotate a 2-D float array about its center by angle_deg (CCW), keeping the same
+    shape (corners cropped). Bilinear resample. Returns arr unchanged at ~0 deg."""
+    if abs(angle_deg) < 1e-3:
+        return arr
+    img = Image.fromarray(arr.astype(np.float32, copy=False), mode="F")
+    rotated = img.rotate(angle_deg, resample=Image.BILINEAR, expand=False, fillcolor=0.0)
+    return np.asarray(rotated, dtype=np.float32)
+
+
+def _lane_sharpness(norm):
+    """How 'peaky' the lane (column) projection is. Sharp, well-separated lanes give a
+    high-variance profile; a smeared/tilted blot flattens it. Deskew objective."""
+    prof = _smooth_profile(norm.mean(axis=0), max(3, int(norm.shape[1] * 0.01)))
+    return float(np.var(prof))
+
+
+def _estimate_skew(norm, max_deg=MAX_SKEW_DEG, step=SKEW_STEP_DEG):
+    """Pick the small rotation that maximizes lane sharpness (a coarse projection deskew).
+    Prefers no rotation: angle 0 is the baseline and only a strictly sharper angle beats
+    it, so a flat/degenerate frame returns 0.0 rather than the first angle tried. Returns
+    degrees; 0.0 when deskew is disabled."""
+    if max_deg <= 0:
+        return 0.0
+    best_angle, best_score = 0.0, _lane_sharpness(norm)
+    for angle in np.arange(-max_deg, max_deg + step / 2, step):
+        if abs(float(angle)) < 1e-9:   # 0.0 already scored as the baseline
+            continue
+        score = _lane_sharpness(_rotate_array(norm, float(angle)))
+        if score > best_score:
+            best_score, best_angle = score, float(angle)
+    return best_angle
+
+
+def _all_peaks(y):
+    """All interior local maxima with their topographic prominence, unfiltered, sorted by
+    index. Prominence proxy: walk outward from each peak until a higher sample, tracking
+    the lowest valley on each side; prominence = peak - max(left_valley, right_valley).
+    This walk depends only on `y`, so splitting it from the per-level prominence/spacing
+    filter (_select_peaks) lets the three sensitivity sets share one pass over each lane."""
+    n = len(y)
+    if n < 3:
+        return []
+    # Candidate local maxima (>= on the right handles flat-topped plateaus).
+    cand = np.flatnonzero((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:])) + 1
+    scored = []
+    for i in cand:
+        peak = y[i]
+        left_valley = peak
+        j = i - 1
+        while j >= 0 and y[j] < peak:
+            left_valley = min(left_valley, y[j]); j -= 1
+        right_valley = peak
+        j = i + 1
+        while j < n and y[j] < peak:
+            right_valley = min(right_valley, y[j]); j += 1
+        scored.append((int(i), float(peak - max(left_valley, right_valley))))
+    return scored
+
+
+def _select_peaks(peaks, min_prominence, min_distance):
+    """From precomputed (index, prominence) peaks, keep those with prominence >=
+    min_prominence, spaced at least min_distance apart (greedy by prominence when they
+    crowd). Returns kept (index, prominence) pairs sorted by index. The per-peak
+    prominence is carried through for _peak_extent's half-prominence descent."""
+    scored = [pair for pair in peaks if pair[1] >= min_prominence]
+    scored.sort(key=lambda t: t[1], reverse=True)
+    kept = []
+    for i, prom in scored:
+        if all(abs(i - k) >= min_distance for k, _ in kept):
+            kept.append((i, prom))
+    kept.sort(key=lambda t: t[0])
+    return kept
+
+
+def _peak_extent(y, i, prominence):
+    """Band y-extent: descend from the peak on both sides until the profile drops to
+    half-prominence below the peak (a stable proxy for valley-to-valley). Returns a
+    half-open [y0, y1)."""
+    n = len(y)
+    floor = y[i] - 0.5 * prominence
+    a = i
+    while a > 0 and y[a - 1] > floor:
+        a -= 1
+    b = i
+    while b < n - 1 and y[b + 1] > floor:
+        b += 1
+    return a, b + 1
+
+
+def _column_profile(norm):
+    """Smoothed vertical projection (mean per column) = the lane axis. Shared by lane
+    detection and the returned laneProfile, so it is computed once."""
+    return _smooth_profile(norm.mean(axis=0), max(3, int(norm.shape[1] * 0.01)))
+
+
+def _lanes_from_profile(column_profile, lane_threshold):
+    """Lanes are contiguous spans of the (already smoothed) column projection above a
+    fraction of its dynamic range. Returns list of (x0, x1) half-open."""
+    w = len(column_profile)
+    lo, hi = float(column_profile.min()), float(column_profile.max())
+    if hi <= lo:
+        return [(0, w)]
+    above = column_profile >= (lo + lane_threshold * (hi - lo))
+    min_width = max(2, int(w * 0.01))
+    lanes = [(int(a), int(b)) for a, b in _bool_runs(above) if (b - a) >= min_width]
+    return lanes or [(0, w)]
+
+
+def _prepare_lanes(norm, lane_threshold):
+    """Level-INDEPENDENT detection work, computed once and shared across the sensitivity
+    sets: the column profile, the lane spans, and each lane's smoothed migration-axis
+    profile with all its peak candidates. The sets differ only in the prominence/spacing
+    filter applied later (_candidate_boxes), so doing this once instead of once per level
+    avoids ~3x redundant column/lane means, convolutions, and prominence walks. Returns
+    (column_profile, lanes, prepared) with prepared = [(x0, x1, profile, peaks), ...]."""
+    column_profile = _column_profile(norm)
+    lanes = _lanes_from_profile(column_profile, lane_threshold)
+    window = max(3, int(norm.shape[0] * 0.01))
+    prepared = []
+    for (x0, x1) in lanes:
+        profile = _smooth_profile(norm[:, x0:x1].mean(axis=1), window)
+        prepared.append((x0, x1, profile, _all_peaks(profile)))
+    return column_profile, lanes, prepared
+
+
+def _candidate_boxes(prepared, level, scale_x, scale_y):
+    """Assemble one sensitivity set's boxes (COMPOSITE coords) from the shared prepared
+    lanes: apply this level's prominence/spacing filter, then a per-peak half-prominence
+    extent. Returns (boxes, truncated)."""
+    boxes = []
+    for li, (x0, x1, profile, peaks) in enumerate(prepared):
+        min_distance = max(2, int(len(profile) * level["min_distance_frac"]))
+        for bi, (p, prom) in enumerate(_select_peaks(peaks, level["prominence"], min_distance)):
+            # This peak's ACTUAL prominence sizes the extent, not the level threshold —
+            # otherwise a tall band descends only a threshold-sized sliver and its box
+            # (hence integrated ROI) is under-sized relative to a faint band.
+            y0, y1 = _peak_extent(profile, p, prom)
+            boxes.append({
+                "x": round(x0 * scale_x, 2),
+                "y": round(y0 * scale_y, 2),
+                "w": round((x1 - x0) * scale_x, 2),
+                "h": round((y1 - y0) * scale_y, 2),
+                "lane": li,
+                "band": bi,
+                "score": round(float(profile[p]), 4),
+            })
+    truncated = False
+    if len(boxes) > MAX_DETECT_BOXES:
+        boxes.sort(key=lambda b: b["score"], reverse=True)   # keep strongest bands
+        boxes = boxes[:MAX_DETECT_BOXES]
+        truncated = True
+    return boxes, truncated
+
+
+@app.route("/detect-bands", methods=["POST"])
+@app.route("/api/detect-bands", methods=["POST"])
+@limiter.limit("15 per minute")
+def detect_bands():
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    try:
+        blot = load_payload_blot(data.get("blot"), (), session_id)
+        channel = data.get("channel", "700")
+        if channel not in ("700", "800"):
+            return jsonify({"error": "Invalid channel"}), 400
+
+        levels = data.get("sensitivities") or DEFAULT_LEVELS
+        if not isinstance(levels, list):
+            return jsonify({"error": "sensitivities must be a list."}), 400
+        # Keep known levels, de-duplicated (dict preserves order), capped at 3.
+        levels = list(dict.fromkeys(n for n in levels if n in SENSITIVITY_LEVELS))[:3] or ["balanced"]
+
+        # Optional lane-threshold override from the client's live laneProfile slider (0..1).
+        lane_threshold = data.get("laneThreshold")
+        if isinstance(lane_threshold, (int, float)) and np.isfinite(lane_threshold):
+            lane_threshold = float(min(1.0, max(0.0, lane_threshold)))
+        else:
+            lane_threshold = None
+
+        descriptor = blot["files"].get(channel)
+        if not descriptor:
+            return jsonify({"error": f"No {channel}nm TIF found"}), 404
+        tif_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel])
+
+        # Same validated-decode path as /extract, but keep the native dtype (uint16/
+        # float16) instead of read_raw_channel's whole-image float32 copy: _working_image
+        # strides this down to DETECT_MAX_DIM (a view) and only _normalize_for_detect
+        # converts the small working copy to float — so peak memory tracks the downsampled
+        # size, not the up-to-MAX_IMAGE_PIXELS native array.
+        arr = read_validated_tif(tif_bytes)
+        native_h, native_w = arr.shape
+
+        # Detect on a downsampled copy; scale boxes from the WORKING grid straight to
+        # composite space (composite = element-wise max of both channels' native sizes,
+        # exactly what the frontend drew its boxes on).
+        work, _step = _working_image(arr)
+        work_h, work_w = work.shape
+        composite_h, composite_w = resolve_composite_dimensions(
+            data, blot, channel, session_id, native_h, native_w
+        )
+        scale_x = composite_w / work_w if work_w else 1.0
+        scale_y = composite_h / work_h if work_h else 1.0
+
+        norm = _orient_polarity(_normalize_for_detect(work))
+
+        # Deskew is gated off in v1 (DETECT_ENABLE_DESKEW): detecting in a rotated frame
+        # would emit boxes that /extract measures against the unrotated native array. Detect
+        # in the unrotated composite frame so boxes flow through /extract unchanged, and
+        # report rotationDeg = 0.0. The rotation code below stays ready for when the angle
+        # is plumbed through display + /extract together (see the flag's comment).
+        if DETECT_ENABLE_DESKEW:
+            # Honor a client-supplied angle if given, else auto-estimate. The returned
+            # angle must then be applied to the canvas display AND /extract to match.
+            requested_angle = data.get("rotationDeg")
+            if isinstance(requested_angle, (int, float)) and np.isfinite(requested_angle):
+                angle = max(-45.0, min(45.0, float(requested_angle)))
+            else:
+                angle = _estimate_skew(norm)
+            norm = _rotate_array(norm, angle)
+        else:
+            angle = 0.0
+
+        # Lane spans, per-lane profiles, and peak candidates are level-independent
+        # (lane_threshold is held constant across levels), so compute them ONCE and let
+        # each sensitivity set differ only by its prominence/spacing filter.
+        effective_lane_threshold = (
+            lane_threshold if lane_threshold is not None
+            else SENSITIVITY_LEVELS[levels[0]]["lane_threshold"]
+        )
+        column_profile, lanes, prepared = _prepare_lanes(norm, effective_lane_threshold)
+
+        candidates = []
+        for name in levels:
+            boxes, truncated = _candidate_boxes(prepared, SENSITIVITY_LEVELS[name], scale_x, scale_y)
+            candidates.append({
+                "id": name,
+                "label": name.capitalize(),
+                "laneCount": len(lanes),
+                "bandCount": len(boxes),
+                "truncated": truncated,   # frontend surfaces this ("showing strongest 200")
+                "boxes": boxes,
+            })
+
+        # Reuse the column projection already computed for lane detection so the client can
+        # re-threshold lanes live without a round-trip (no extra full-image mean/convolve).
+        return jsonify({
+            "imageWidth": composite_w,       # coordinate space the boxes are in
+            "imageHeight": composite_h,
+            "channel": channel,
+            "rotationDeg": round(angle, 2),  # apply to display + /extract to match
+            "candidates": candidates,
+            "laneProfile": _downsample_profile(column_profile, PROFILE_SAMPLES).round(4).tolist(),
+        })
+    except PublicError as error:
+        return error_response(error, "Band detection failed.")
+    except Exception as error:
+        app.logger.exception("Band detection failed")
+        return error_response(error, "Band detection failed.")
+
+
 @app.route("/cleanup", methods=["POST"])
 @app.route("/api/cleanup", methods=["POST"])
 @limiter.limit("30 per minute")
@@ -1645,245 +2322,6 @@ def cleanup_temp_files():
     delete_temp_files(descriptors, session_id, allow_uploads=True)
     return jsonify({"status": "deleted"})
 
-
-# ─── PowerPoint generation ────────────────────────────────────────────────────
-
-@app.route("/generate-pptx", methods=["POST"])
-@app.route("/api/generate-pptx", methods=["POST"])
-@limiter.limit("10 per minute")
-def generate_pptx():
-    try:
-        data = request.get_json(silent=True) or {}
-        slides_data = data.get("slides", [])
-        validate_pptx_payload(slides_data)
-
-        prs = create_pptx_presentation()
-        add_pptx_export_slides(prs, slides_data)
-        return send_pptx(prs)
-
-    except Exception as error:
-        app.logger.exception("PowerPoint generation failed")
-        return error_response(error, "PowerPoint generation failed.")
-
-
-def create_pptx_presentation():
-    prs = Presentation()
-    prs.slide_width = Inches(10)
-    prs.slide_height = Inches(7.5)
-    return prs
-
-
-def add_pptx_export_slides(prs, slides_data):
-    blank_layout = prs.slide_layouts[6]
-    image_slide_data = next((s for s in slides_data if s.get("type") == PPTX_IMAGE_SLIDE_TYPE), None)
-    graph_slides = [s for s in slides_data if s.get("type") == PPTX_GRAPH_SLIDE_TYPE]
-
-    if image_slide_data:
-        build_image_slide(prs.slides.add_slide(blank_layout), image_slide_data, prs)
-
-    for slide_data in graph_slides:
-        for page_data in graph_slide_pages(slide_data):
-            build_graph_slide(prs.slides.add_slide(blank_layout), page_data, prs)
-
-
-def graph_slide_pages(slide_data):
-    graphs = slide_data.get("graphs", [])
-    title = slide_data.get("title", "")
-    for page_start in range(0, max(1, len(graphs)), PPTX_GRAPHS_PER_SLIDE):
-        yield {
-            "title": title if page_start == 0 else f"{title} (cont.)",
-            "graphs": graphs[page_start:page_start + PPTX_GRAPHS_PER_SLIDE],
-        }
-
-
-def send_pptx(prs):
-    buf = io.BytesIO()
-    prs.save(buf)
-    buf.seek(0)
-    return send_file(
-        buf,
-        mimetype=PPTX_MIMETYPE,
-        as_attachment=True,
-        download_name=PPTX_DOWNLOAD_NAME
-    )
-
-
-def validate_pptx_payload(slides_data):
-    if not isinstance(slides_data, list):
-        raise PublicError("Slides must be a list.")
-    if len(slides_data) > MAX_PPTX_SLIDES:
-        raise PublicError(f"Too many slides. Maximum is {MAX_PPTX_SLIDES}.")
-
-    graph_count = 0
-    image_count = 0
-    image_slide_count = 0
-    total_image_bytes = 0
-    for slide in slides_data:
-        slide_type, images, graphs = pptx_slide_parts(slide)
-        if len(str(slide.get("title", ""))) > MAX_NAME_LENGTH:
-            raise PublicError("A PowerPoint slide title is too long.")
-        image_slide_count = validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count)
-        image_count += len(images)
-        if image_count > MAX_PPTX_IMAGES:
-            raise PublicError("Too many blot images in PowerPoint export.")
-        graph_count += len(graphs)
-        total_image_bytes += validate_pptx_images(images)
-        total_image_bytes += validate_pptx_graphs(graphs)
-    if graph_count > MAX_PPTX_GRAPHS:
-        raise PublicError(f"Too many graphs. Maximum is {MAX_PPTX_GRAPHS}.")
-    if total_image_bytes > MAX_PPTX_TOTAL_IMAGE_BYTES:
-        raise PublicError("PowerPoint image data exceeds the total size limit.", 413)
-
-
-def pptx_slide_parts(slide):
-    if not isinstance(slide, dict):
-        raise PublicError("Each slide must be an object.")
-    slide_type = slide.get("type")
-    if slide_type not in PPTX_SLIDE_TYPES:
-        raise PublicError("PowerPoint slide type must be either images or graphs.")
-    images = slide.get("images", [])
-    graphs = slide.get("graphs", [])
-    if not isinstance(images, list) or not isinstance(graphs, list):
-        raise PublicError("PowerPoint images and graphs must be lists.")
-    return slide_type, images, graphs
-
-
-def validate_pptx_slide_contract(slide_type, images, graphs, image_slide_count):
-    if slide_type == PPTX_IMAGE_SLIDE_TYPE:
-        image_slide_count += 1
-        if image_slide_count > 1:
-            raise PublicError("PowerPoint export supports one blot image slide.")
-        if graphs:
-            raise PublicError("PowerPoint image slides cannot include graph data.")
-    if slide_type == PPTX_GRAPH_SLIDE_TYPE and images:
-        raise PublicError("PowerPoint graph slides cannot include blot image data.")
-    return image_slide_count
-
-
-def validate_pptx_images(images):
-    total_image_bytes = 0
-    for item in images:
-        if not isinstance(item, dict):
-            raise PublicError("Invalid blot image entry.")
-        total_image_bytes += validate_data_url_size(item.get("image", ""))
-        if len(str(item.get("label", ""))) > MAX_NAME_LENGTH:
-            raise PublicError("A PowerPoint image label is too long.")
-    return total_image_bytes
-
-
-def validate_pptx_graphs(graphs):
-    return sum(validate_data_url_size(graph) for graph in graphs)
-
-
-def validate_data_url_size(value):
-    if not isinstance(value, str):
-        raise PublicError("Invalid image data.")
-    if not PPTX_DATA_URL_PATTERN.match(value):
-        raise PublicError("Export images must be JPEG or PNG base64 data URLs.")
-    encoded = value.split(",", 1)[-1]
-    approx_bytes = (len(encoded) * 3) // 4
-    if approx_bytes > MAX_PPTX_IMAGE_BYTES:
-        raise PublicError("An exported image is too large for PowerPoint.")
-    try:
-        image_bytes = base64.b64decode(encoded, validate=True)
-        Image.open(io.BytesIO(image_bytes)).verify()
-    except Exception as error:
-        raise PublicError("Export image data is not a valid JPEG or PNG image.") from error
-    if len(image_bytes) > MAX_PPTX_IMAGE_BYTES:
-        raise PublicError("An exported image is too large for PowerPoint.")
-    return len(image_bytes)
-
-
-def add_image_from_data_url(slide, data_url, left, top, width, height):
-    image_bytes = base64.b64decode(data_url.split(",")[-1], validate=True)
-    image_stream = io.BytesIO(image_bytes)
-    slide.shapes.add_picture(image_stream, left, top, width, height)
-
-
-def add_label(slide, text, left, top, width, height, font_size=14, bold=False, align=PP_ALIGN.CENTER):
-    text_box        = slide.shapes.add_textbox(left, top, width, height)
-    tf              = text_box.text_frame
-    tf.word_wrap   = True
-    p              = tf.paragraphs[0]
-    p.alignment    = align
-    run            = p.add_run()
-    run.text       = text
-    run.font.size  = Pt(font_size)
-    run.font.bold  = bold
-    run.font.color.rgb = RGBColor(0x1f, 0x29, 0x33)
-
-
-def build_image_slide(slide, slide_data, prs):
-    images  = slide_data.get("images", [])
-    if not images:
-        return
-
-    slide_w = prs.slide_width
-    slide_h = prs.slide_height
-    margin  = Inches(0.4)
-    label_h = Inches(0.3)
-    spacing = Inches(0.2)
-
-    add_label(slide, "Western Blot Images",
-              margin, Inches(0.1), slide_w - margin * 2, Inches(0.35),
-              font_size=18, bold=True)
-
-    image_count     = len(images)
-    total_label     = label_h * image_count
-    total_spacing   = spacing * (image_count - 1)
-    available_h     = slide_h - Inches(0.6) - total_label - total_spacing - margin
-    full_img_w      = slide_w - margin * 2
-    img_w           = full_img_w * 2 / 3
-    img_h           = available_h / image_count
-    left_x          = margin + (full_img_w - img_w) / 2
-
-    current_y = Inches(0.6)
-    for item in images:
-        image_data_url = item.get("image")
-        label = item.get("label", "")
-        if image_data_url:
-            try:
-                add_image_from_data_url(slide, image_data_url, left_x, current_y, img_w, img_h)
-            except Exception as error:
-                raise PublicError("A PowerPoint blot image could not be inserted.") from error
-        current_y += img_h
-        add_label(slide, label, left_x, current_y, img_w, label_h,
-                  font_size=12, bold=True, align=PP_ALIGN.CENTER)
-        current_y += label_h + spacing
-
-
-def build_graph_slide(slide, slide_data, prs):
-    graphs  = slide_data.get("graphs", [])
-    title   = slide_data.get("title", "")
-    if not graphs:
-        return
-
-    slide_w  = prs.slide_width
-    slide_h  = prs.slide_height
-    margin   = Inches(0.4)
-    padding  = Inches(0.2)
-
-    add_label(slide, title,
-              margin, Inches(0.1), slide_w - margin * 2, Inches(0.4),
-              font_size=16, bold=True)
-
-    cols    = 2
-    rows    = 2
-    img_w   = (slide_w - margin * 2 - padding * (cols - 1)) / cols
-    img_h   = (slide_h - Inches(0.55) - margin - padding * (rows - 1)) / rows
-
-    for i, graph_data_url in enumerate(graphs):
-        if i >= cols * rows:
-            break
-        col = i % cols
-        row = i // cols
-        x   = margin + col * (img_w + padding)
-        y   = Inches(0.55) + row * (img_h + padding)
-        if graph_data_url:
-            try:
-                add_image_from_data_url(slide, graph_data_url, x, y, img_w, img_h)
-            except Exception as error:
-                raise PublicError("A PowerPoint graph image could not be inserted.") from error
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 

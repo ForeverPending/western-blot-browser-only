@@ -6,14 +6,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Western Blot Fold Change Analyzer</title>
   <link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'/%3E" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css?v=browser-session-1" />
   <script src="./config.js?v=browser-session-1"></script>
-  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"
-    integrity="sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT"
-    crossorigin="anonymous" defer></script>
+  <script src="./vendor/xlsx.full.min.js?v=0.20.3" defer></script>
   <script src="./app.js?v=browser-session-1" defer></script>
 </head>
 
@@ -47,6 +42,9 @@
       </button>
       <button class="main-tab-button" type="button" data-main-tab="blot-browser">
         Blot Browser
+      </button>
+      <button class="main-tab-button" type="button" data-main-tab="linear-range">
+        Linear range
       </button>
     </nav>
 
@@ -99,7 +97,7 @@
             <div class="upload-column">
               <div class="section-heading">
                 <span class="badge control">Control</span>
-                <h2>Loading control file</h2>
+                <h2 id="controlColumnHeading">Loading control file</h2>
               </div>
 
               <div class="source-toggle">
@@ -119,8 +117,8 @@
                   <span id="controlFileName">Choose Excel or CSV file</span>
                 </label>
                 <div class="field-row" id="controlProteinRow" hidden>
-                  <label for="controlProtein">Protein name</label>
-                  <input id="controlProtein" type="text" placeholder="e.g. GAPDH" />
+                  <label for="controlProtein">Control name</label>
+                  <input id="controlProtein" type="text" placeholder="e.g. GAPDH or REVERT total protein" />
                 </div>
                 <div class="mapping-grid" id="controlMappingGrid" hidden>
                   <label>
@@ -279,17 +277,62 @@
             <div id="blockGraphs" class="mini-chart-grid"></div>
           </section>
 
-          <section class="panel pptx-panel" id="pptxPanel" hidden>
+          <section class="panel replicate-panel" id="replicatePanel" hidden>
             <div class="chart-header">
               <div>
-                <p class="eyebrow">Export</p>
-                <h2>Generate PowerPoint</h2>
+                <p class="eyebrow">Replicate statistics</p>
+                <h2>Summarize replicates</h2>
               </div>
-              <button class="primary-button" id="generatePptxButton" type="button">
-                Export PowerPoint
-              </button>
+              <div class="button-row">
+                <button class="ghost-button" id="downloadReplicateChartButton" type="button" disabled>Export JPG</button>
+                <button class="ghost-button" id="downloadReplicateCsvButton" type="button" disabled>Export CSV</button>
+              </div>
             </div>
-            <p>Generates a presentation with all blot images on slide 1, followed by one graph slide per sample protein.</p>
+            <label class="checkbox-line" id="replicateToggleWrap">
+              <input id="enableReplicateStats" type="checkbox" />
+              Treat the loaded sample files as replicates of one target
+            </label>
+            <p class="replicate-hint" id="replicateHint"></p>
+            <div class="replicate-body" id="replicateBody" hidden>
+              <div class="chart-wrap">
+                <canvas id="replicateChart" width="960" height="520" aria-label="Replicate mean fold change with 95% confidence intervals"></canvas>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Lane</th>
+                      <th>n</th>
+                      <th>Mean</th>
+                      <th>SD</th>
+                      <th>SEM</th>
+                      <th>95% CI (±)</th>
+                    </tr>
+                  </thead>
+                  <tbody id="replicateTableBody">
+                    <tr><td colspan="6">No replicate summary yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="replicate-test">
+                <h3>Compare two lanes (Welch's t-test)</h3>
+                <div class="field-row replicate-test-fields">
+                  <label>
+                    Lane A
+                    <select id="replicateLaneA"></select>
+                  </label>
+                  <label>
+                    Lane B
+                    <select id="replicateLaneB"></select>
+                  </label>
+                </div>
+                <p class="replicate-test-result" id="replicateTestResult" role="status"></p>
+                <p class="replicate-disclaimer">
+                  Descriptive preview only. Confirm significance in GraphPad Prism, R, or your lab's
+                  validated statistics package before reporting a p-value.
+                </p>
+              </div>
+            </div>
           </section>
         </section>
 
@@ -354,7 +397,14 @@
               <button class="ghost-button blot-clear-button" id="clearWorkspaceButton" type="button" hidden>
                 Clear workspace
               </button>
+              <button class="ghost-button blot-cancel-button" id="cancelZipUploadButton" type="button" hidden>
+                Cancel current upload
+              </button>
             </div>
+          </div>
+          <div class="workspace-status-row">
+            <p class="workspace-recovery-status" id="workspaceRecoveryStatus" role="status"></p>
+            <ul class="upload-queue" id="zipUploadQueue" aria-label="ZIP import queue" hidden></ul>
           </div>
 
           <div class="blot-browser-layout">
@@ -375,17 +425,17 @@
 
             <div class="blot-bottom-panel">
               <div class="blot-bottom-tabs" role="tablist" aria-label="Blot browser sections">
-                <button class="blot-analysis-tab active" type="button" role="tab"
-                  aria-selected="true" aria-controls="blotAnalysisLoaded" data-blot-analysis-tab="loaded">
+                <button class="blot-analysis-tab active" id="blotTabLoaded" type="button" role="tab"
+                  aria-selected="true" aria-controls="blotAnalysisLoaded" data-blot-analysis-tab="loaded" tabindex="0">
                   Loaded blots
                 </button>
-                <button class="blot-analysis-tab" type="button" role="tab"
-                  aria-selected="false" aria-controls="blotAnalysisBoxes" data-blot-analysis-tab="boxes">
+                <button class="blot-analysis-tab" id="blotTabBoxes" type="button" role="tab"
+                  aria-selected="false" aria-controls="blotAnalysisBoxes" data-blot-analysis-tab="boxes" tabindex="-1">
                   Drawn boxes
                 </button>
               </div>
 
-              <div id="blotAnalysisLoaded" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="loaded">
+              <div id="blotAnalysisLoaded" class="blot-analysis-pane" role="tabpanel" aria-labelledby="blotTabLoaded" data-blot-analysis-panel="loaded">
                 <div class="blot-list-navigation">
                   <button class="blot-scroll-button" id="blotScrollUp" type="button"
                     aria-label="Scroll loaded blots up" aria-controls="blotList" disabled>
@@ -401,9 +451,49 @@
                 </div>
               </div>
 
-              <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" data-blot-analysis-panel="boxes" hidden>
+              <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" aria-labelledby="blotTabBoxes" data-blot-analysis-panel="boxes" hidden>
                 <p class="blot-empty-state">Select a blot to view drawn boxes.</p>
               </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div id="tabLinearRange" hidden>
+        <section class="panel linrange-panel" id="linrangePanel">
+          <div class="chart-header">
+            <div>
+              <p class="eyebrow">Optional QC · Linear range</p>
+              <h2>Dilution / linearity check</h2>
+            </div>
+            <div class="button-row">
+              <button class="ghost-button" id="downloadLinrangeChartButton" type="button" disabled>Export JPG</button>
+            </div>
+          </div>
+          <p class="linrange-hint">
+            Optional check — it does not change your fold-change results. Enter the amount loaded per
+            lane (µg, or any consistent unit) for the selected sample, then check whether signal stays
+            proportional to load. Lanes flagged as saturated are excluded from the linear fit.
+          </p>
+          <label id="linrangeSampleWrap" class="linrange-sample" hidden>
+            Sample protein
+            <select id="linrangeSampleSelect"></select>
+          </label>
+          <p class="workflow-message" id="linrangePlaceholder" role="status" hidden></p>
+          <div id="linrangeBody" hidden>
+            <div class="linrange-grid" id="linrangeLoadInputs"></div>
+            <div class="linrange-controls">
+              <label>
+                Target R²
+                <input id="linrangeR2" type="number" min="0.9" max="0.9999" step="0.001" value="0.99" />
+              </label>
+              <button class="primary-button" id="checkLinrangeButton" type="button">Check linear range</button>
+            </div>
+            <div class="linrange-result" id="linrangeResult" hidden>
+              <div class="chart-wrap">
+                <canvas id="linrangeChart" width="960" height="520" aria-label="Signal versus load scatter plot with linear fit"></canvas>
+              </div>
+              <div class="linrange-summary" id="linrangeSummary"></div>
             </div>
           </div>
         </section>
@@ -418,7 +508,7 @@
       This tool is not a medical device and must not be used for clinical or diagnostic decisions.
     </p>
     <p class="footer-note">
-      Your work is temporary — scans, boxes, and results are cleared when you reload or close the tab, and are not backed up. Export anything you want to keep.
+      Your work is temporary — same-tab reloads can restore it, but closing the tab or clearing the workspace removes it. Export anything you want to keep.
     </p>
     <nav class="footer-links" aria-label="Legal and information">
       <a href="./privacy.html">Privacy</a>

@@ -157,6 +157,9 @@ backend/*.pyc
 # VS Code
 .vscode/
 
+# Local Claude/Codex permission state
+.claude/settings.local.json
+
 # Node (just in case)
 node_modules/
 
@@ -189,3 +192,7 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local test data (real blot ZIPs — not for distribution)
+test_blots/
+test-blots/

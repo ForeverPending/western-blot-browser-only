@@ -1,4 +1,3 @@
-import base64
 import io
 import os
 import sys
@@ -56,6 +55,21 @@ def make_licor_pyramid_tif():
     return image.getvalue(), full_resolution
 
 
+def make_multilane_tif(h=600, w=800, n_lanes=6):
+    """Deterministic synthetic bright-bands-on-dark blot: n_lanes columns with a few
+    Gaussian bands each. Used to exercise /detect-bands end to end. No random noise, so
+    detection results are reproducible across runs."""
+    img = np.full((h, w), 300.0)
+    yy, xx = np.mgrid[0:h, 0:w]
+    for i, cx in enumerate(np.linspace(w * 0.11, w * 0.9, n_lanes)):
+        for cy, amp in [(150, 9000), (300, max(400, 4000 - i * 400)), (460, 1500)]:
+            img += amp * np.exp(-(((xx - cx) ** 2) / (2 * 26 ** 2) + ((yy - cy) ** 2) / (2 * 16 ** 2)))
+    img = np.clip(img, 0, 65535).astype(np.uint16)
+    buf = io.BytesIO()
+    tifffile.imwrite(buf, img)
+    return buf.getvalue(), img
+
+
 class StatelessSessionBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -110,6 +124,84 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertIn("http://localhost:*", local_csp)
         self.assertIn("http://127.0.0.1:*", local_csp)
 
+    def test_frontend_csp_self_hosts_scripts_and_blocks_inline_styles(self):
+        response = self.client.get("/", headers={"Host": "analysis.example"})
+        csp = response.headers["Content-Security-Policy"]
+        response.close()
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("style-src 'self'", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("cdn.sheetjs.com", csp)
+        self.assertNotIn("fonts.googleapis.com", csp)
+
+    def test_client_config_reports_effective_direct_upload_limit(self):
+        response = self.client.get("/client-config")
+        payload = response.get_json()
+        self.assertEqual(payload["maxDirectUploadBytes"], min(backend.MAX_REQUEST_BYTES, backend.MAX_ZIP_BYTES))
+        self.assertEqual(payload["maxZipUploadBytes"], backend.MAX_ZIP_BYTES)
+
+    def test_cron_cleanup_requires_secret_and_forces_sweep(self):
+        unauthorized = self.client.get("/cron-cleanup")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        with mock.patch.dict(os.environ, {"CRON_SECRET": "test-cron-secret-value"}), mock.patch.object(
+            backend, "sweep_expired_temp_files", return_value=3
+        ) as sweep:
+            response = self.client.get(
+                "/cron-cleanup",
+                headers={"Authorization": "Bearer test-cron-secret-value"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["removed"], 3)
+        sweep.assert_called_once_with(max_deletes=backend.TEMP_SWEEP_MAX_DELETES, force=True)
+
+    def test_zip_validation_preserves_seekable_stream_position(self):
+        archive = make_test_zip()
+        archive.seek(7)
+        self.assertTrue(backend.is_valid_zip(archive))
+        self.assertEqual(archive.tell(), 7)
+
+    def test_local_temp_object_can_stream_to_seekable_file(self):
+        path = f"uploads/{SESSION_ID}/stream-test.zip"
+        source_path = backend.local_temp_file_path(path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        archive_bytes = make_test_zip().getvalue()
+        with open(source_path, "wb") as source:
+            source.write(archive_bytes)
+        try:
+            output = io.BytesIO()
+            copied = backend.copy_temp_file_to_handle(
+                {"path": path},
+                output,
+                SESSION_ID,
+                allow_uploads=True,
+                max_bytes=len(archive_bytes),
+            )
+            self.assertEqual(copied, len(archive_bytes))
+            self.assertEqual(output.getvalue(), archive_bytes)
+        finally:
+            os.remove(source_path)
+
+    def test_stored_zip_processing_streams_and_deletes_upload(self):
+        path = f"uploads/{SESSION_ID}/stored-stream-test.zip"
+        source_path = backend.local_temp_file_path(path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "wb") as source:
+            source.write(make_test_zip().getvalue())
+
+        response = self.client.post(
+            "/process-upload",
+            json={"sessionId": SESSION_ID, "upload": {"path": path}},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(response.get_json()["blots"]), 1)
+        self.assertFalse(os.path.exists(source_path))
+        cleanup = self.client.post(
+            "/cleanup",
+            json={"sessionId": SESSION_ID, "blots": response.get_json()["blots"]},
+        )
+        self.assertEqual(cleanup.status_code, 200)
+
     def test_renders_composite_and_extracts_signals_from_descriptor(self):
         blot = self.upload_blot()
 
@@ -156,6 +248,66 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertIn("backgroundSignal", signal)
         self.assertIn("adjustedSignal", signal)
         self.assertNotIn("raw_signal", signal)
+
+    def store_multilane_blot(self, blot_id="detect-blot"):
+        tif_bytes, _img = make_multilane_tif()
+        descriptor = backend.store_temp_file(SESSION_ID, blot_id, "700.tif", tif_bytes, "image/tiff")
+        return {"id": blot_id, "files": {"700": descriptor}}
+
+    def test_detect_bands_returns_composite_space_candidates(self):
+        blot = self.store_multilane_blot()
+        response = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID,
+                "blot": blot,
+                "channel": "700",
+                "compositeWidth": 800,
+                "compositeHeight": 600,
+                "sensitivities": ["conservative", "balanced", "aggressive"],
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body["imageWidth"], 800)
+        self.assertEqual(body["imageHeight"], 600)
+        self.assertEqual(body["channel"], "700")
+        # Deskew is gated off in v1, so the boxes stay in the unrotated composite frame
+        # that /extract consumes unchanged.
+        self.assertEqual(body["rotationDeg"], 0.0)
+        self.assertEqual([c["id"] for c in body["candidates"]], ["conservative", "balanced", "aggressive"])
+        self.assertIsInstance(body["laneProfile"], list)
+
+        balanced = next(c for c in body["candidates"] if c["id"] == "balanced")
+        self.assertGreaterEqual(balanced["laneCount"], 2)   # the six lanes must not merge
+        self.assertGreaterEqual(balanced["bandCount"], 2)
+        self.assertEqual(balanced["bandCount"], len(balanced["boxes"]))
+        for box in balanced["boxes"]:
+            self.assertGreater(box["w"], 0)
+            self.assertGreater(box["h"], 0)
+            self.assertGreaterEqual(box["x"], 0)
+            self.assertGreaterEqual(box["y"], 0)
+            self.assertLessEqual(box["x"] + box["w"], body["imageWidth"] + 1)
+            self.assertLessEqual(box["y"] + box["h"], body["imageHeight"] + 1)
+
+    def test_detect_bands_rejects_invalid_channel(self):
+        blot = self.store_multilane_blot("detect-blot-badchan")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": SESSION_ID, "blot": blot, "channel": "999"},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_detect_bands_enforces_session_scoping(self):
+        blot = self.store_multilane_blot("detect-blot-session")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": "someone-else", "blot": blot, "channel": "700"},
+            headers={"X-Blot-Session": "someone-else"},
+        )
+        self.assertEqual(response.status_code, 403)
 
     def test_session_id_must_match_temp_descriptors(self):
         blot = self.upload_blot()
@@ -372,23 +524,6 @@ class StatelessSessionBackendTests(unittest.TestCase):
         tif_bytes, expected = make_licor_pyramid_tif()
         result = backend.decode_validated_tif(tif_bytes, "LI-COR TIF")
         np.testing.assert_array_equal(result, expected)
-
-    def test_pptx_export_rejects_svg_data_urls(self):
-        svg = base64.b64encode(b"<svg></svg>").decode("ascii")
-        with self.assertRaises(backend.PublicError):
-            backend.validate_data_url_size(f"data:image/svg+xml;base64,{svg}")
-
-    def test_pptx_export_rejects_invalid_png_data_urls(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_data_url_size("data:image/png;base64,AAAA")
-
-    def test_pptx_export_rejects_unknown_slide_types(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_pptx_payload([{"type": "image", "images": [], "graphs": []}])
-
-    def test_pptx_export_rejects_mixed_slide_contracts(self):
-        with self.assertRaises(backend.PublicError):
-            backend.validate_pptx_payload([{"type": "graphs", "images": [{"image": ""}], "graphs": []}])
 
 
 if __name__ == "__main__":

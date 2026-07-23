@@ -2,8 +2,8 @@
   color-scheme: light;
 
   /* Typography */
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 
   /* 4px spacing system */
   --space-1: 4px;
@@ -75,6 +75,7 @@
   --chart-average: #b9cce6;
   --annotation: #f4c542;
   --annotation-selected: #ffffff;
+  --annotation-preview: #0ea5e9;
   --image-canvas: #111827;
 
   /* Compatibility aliases used throughout the existing UI. */
@@ -161,6 +162,7 @@
   --chart-average: #2b4064;
   --annotation: #fbbf24;
   --annotation-selected: #ffffff;
+  --annotation-preview: #38bdf8;
   --image-canvas: #05080f;
 
   --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
@@ -615,6 +617,7 @@ input[type="range"]:focus-visible {
 .main-tab-button:focus-visible,
 .blot-list-item:focus-visible,
 .box-number:focus-visible,
+.detection-candidate:focus-visible,
 .file-drop:focus-within {
   outline: none;
   box-shadow: 0 0 0 3px var(--focus-ring);
@@ -885,6 +888,139 @@ input[type="range"]:focus-visible {
   box-shadow: var(--shadow-xs);
 }
 
+/* ── Automatic band detection ──────────────────────────────────────────────── */
+
+.detection-tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.detection-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.detection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.detection-replace {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.detection-replace input {
+  margin: 0;
+}
+
+.detection-status {
+  margin: 0;
+  min-height: 1em;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.detection-status.is-error {
+  color: var(--danger);
+}
+
+.detection-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.detection-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detection-candidate {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), box-shadow var(--transition);
+}
+
+.detection-candidate:hover {
+  border-color: var(--border-interactive);
+  background: var(--surface-subtle);
+}
+
+.detection-candidate.active {
+  border-color: var(--primary-border-strong);
+  background: var(--primary-soft);
+  box-shadow: var(--shadow-xs);
+}
+
+.detection-candidate-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.detection-candidate.active .detection-candidate-name {
+  color: var(--primary);
+}
+
+.detection-candidate-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono), monospace;
+}
+
+.detection-advanced {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-subtle);
+}
+
+.detection-advanced > summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.detection-slider {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: var(--space-2);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.detection-slider input[type="range"] {
+  width: 100%;
+}
+
+.detection-commit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
 /* ── Results, data, and charts ─────────────────────────────────────────────── */
 
 #sharedResults {
@@ -901,8 +1037,7 @@ input[type="range"]:focus-visible {
 .chart-panel,
 .table-panel,
 .label-panel,
-.group-panel,
-.pptx-panel {
+.group-panel {
   padding: var(--space-5);
 }
 
@@ -1001,8 +1136,7 @@ td strong {
 }
 
 .group-panel,
-.label-panel,
-.pptx-panel {
+.label-panel {
   margin-top: var(--space-3);
 }
 
@@ -1013,8 +1147,7 @@ td strong {
   margin-top: var(--space-3);
 }
 
-.group-panel p,
-.pptx-panel p {
+.group-panel p {
   max-width: 780px;
   margin: var(--space-2) 0 0;
   color: var(--text-muted);
@@ -1222,6 +1355,50 @@ td strong {
 
 .blot-clear-button[hidden] {
   display: none;
+}
+
+.workspace-status-row {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.workspace-recovery-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.workspace-recovery-status.error {
+  color: var(--danger);
+}
+
+.upload-queue {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.upload-queue-item {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  font-size: 12px;
+}
+
+.upload-queue-item.status-failed,
+.upload-queue-item.status-cancelled {
+  color: var(--danger);
+}
+
+.upload-queue-item.status-imported {
+  color: var(--teal-hover);
 }
 
 .blot-browser-layout {
@@ -1682,6 +1859,32 @@ td strong {
   height: auto;
   display: block;
   cursor: grab;
+  touch-action: none;
+  outline: none;
+}
+
+#blotCanvas:focus-visible {
+  box-shadow: inset 0 0 0 3px var(--focus-ring);
+}
+
+#blotCanvas.draw-mode {
+  cursor: crosshair;
+}
+
+#blotCanvas.is-grabbing {
+  cursor: grabbing;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 .blot-box-list-wrap {
@@ -1764,6 +1967,139 @@ td strong {
   color: var(--text-muted);
 }
 
+.box-signal-warning {
+  color: var(--danger);
+  font-weight: 600;
+  margin-left: 6px;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* Feature 2 — total-protein normalization signage */
+.section-subheading {
+  margin: var(--space-1) 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  max-width: 40ch;
+}
+
+/* Feature 3 — replicate statistics panel */
+.replicate-panel,
+.linrange-panel {
+  margin-top: var(--space-3);
+  padding: var(--space-5);
+}
+
+.replicate-hint,
+.linrange-hint {
+  margin: var(--space-2) 0 0;
+  max-width: 780px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.replicate-body {
+  margin-top: var(--space-4);
+}
+
+.replicate-test {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.replicate-test h3 {
+  margin: 0 0 var(--space-2);
+  font-size: 14px;
+}
+
+.replicate-test-fields {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-3);
+}
+
+.replicate-test-result {
+  margin: var(--space-2) 0 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.replicate-disclaimer {
+  margin: var(--space-2) 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  max-width: 780px;
+}
+
+/* Feature 5 — linear-range / dilution check panel (own optional tab) */
+.linrange-sample {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: var(--space-3);
+  max-width: 320px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.linrange-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.linrange-load {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.linrange-load input {
+  width: 100%;
+}
+
+.linrange-controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.linrange-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.linrange-result {
+  margin-top: var(--space-4);
+}
+
+.linrange-summary {
+  margin-top: var(--space-3);
+  font-size: 13px;
+}
+
+.linrange-summary p {
+  margin: var(--space-1) 0 0;
+}
+
+.linrange-summary .linrange-ok {
+  color: var(--teal);
+}
+
+.linrange-summary .linrange-warning {
+  color: var(--danger);
+}
+
 .box-actions {
   display: flex;
   gap: var(--space-1);
@@ -1801,6 +2137,10 @@ td strong {
 
 .saved-scans {
   margin-top: var(--space-2);
+}
+
+.saved-scans-empty {
+  margin-top: var(--space-3);
 }
 
 .saved-scans > .eyebrow {
@@ -1982,7 +2322,6 @@ td strong {
   .table-panel,
   .label-panel,
   .group-panel,
-  .pptx-panel,
   .upload-column {
     padding: var(--space-4);
   }
