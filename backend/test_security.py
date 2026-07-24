@@ -273,8 +273,8 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(body["imageWidth"], 800)
         self.assertEqual(body["imageHeight"], 600)
         self.assertEqual(body["channel"], "700")
-        # Deskew is gated off in v1, so the boxes stay in the unrotated composite frame
-        # that /extract consumes unchanged.
+        # No straighten angle was sent, so boxes stay in the unrotated composite frame that
+        # /extract consumes unchanged (rotationDeg defaults to 0).
         self.assertEqual(body["rotationDeg"], 0.0)
         self.assertEqual([c["id"] for c in body["candidates"]], ["conservative", "balanced", "aggressive"])
         self.assertIsInstance(body["laneProfile"], list)
@@ -308,6 +308,129 @@ class StatelessSessionBackendTests(unittest.TestCase):
             headers={"X-Blot-Session": "someone-else"},
         )
         self.assertEqual(response.status_code, 403)
+
+    def test_detect_bands_lanes_stage_returns_lanes_only(self):
+        blot = self.store_multilane_blot("detect-blot-lanes")
+        response = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID, "blot": blot, "channel": "700",
+                "compositeWidth": 800, "compositeHeight": 600, "stage": "lanes",
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        # The lanes-first stage returns the split + a suggested straighten angle, no bands.
+        self.assertNotIn("candidates", body)
+        self.assertIn("suggestedRotationDeg", body)
+        self.assertIsInstance(body["lanes"], list)
+        self.assertGreaterEqual(len(body["lanes"]), 2)   # the six lanes must not all merge
+        for lane in body["lanes"]:
+            self.assertGreater(lane["w"], 0)
+            self.assertGreaterEqual(lane["x"], 0)
+            self.assertLessEqual(lane["x"] + lane["w"], body["imageWidth"] + 1)
+
+    def test_detect_bands_honors_client_lanes(self):
+        blot = self.store_multilane_blot("detect-blot-client-lanes")
+        response = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID, "blot": blot, "channel": "700",
+                "compositeWidth": 800, "compositeHeight": 600,
+                "sensitivities": ["balanced"],
+                # Two user-confirmed lanes must be used verbatim (not auto-detected).
+                "lanes": [{"x": 120, "w": 90}, {"x": 430, "w": 90}],
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body["candidates"][0]["laneCount"], 2)
+        self.assertEqual(len(body["lanes"]), 2)
+
+    def test_detect_bands_no_full_width_fallback_on_blank(self):
+        # A blank blot must yield NO lanes, never one full-width lane (the old catastrophe
+        # that produced full-image-width boxes).
+        blank = np.zeros((300, 400), dtype=np.uint16)
+        buf = io.BytesIO()
+        tifffile.imwrite(buf, blank)
+        descriptor = backend.store_temp_file(SESSION_ID, "detect-blank", "700.tif", buf.getvalue(), "image/tiff")
+        blot = {"id": "detect-blank", "files": {"700": descriptor}}
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": SESSION_ID, "blot": blot, "channel": "700", "stage": "lanes"},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["lanes"], [])
+
+    def test_detect_bands_clamps_rotation(self):
+        blot = self.store_multilane_blot("detect-blot-rot")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": SESSION_ID, "blot": blot, "channel": "700", "rotationDeg": 999},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["rotationDeg"], backend.MAX_STRAIGHTEN_DEG)
+
+    def test_extract_and_composite_accept_rotation(self):
+        # Straighten must not break the measurement/display endpoints; a clamped angle rotates
+        # the native pixels (extract) and the composite (render) without erroring.
+        blot = self.upload_blot()
+        extraction = self.client.post(
+            "/extract",
+            json={
+                "sessionId": SESSION_ID, "blot": blot, "channel": "700",
+                "backgroundAxis": "leftright", "rotationDeg": 5,
+                "boxes": [{"x": 1, "y": 1, "w": 3, "h": 3}],
+            },
+        )
+        self.assertEqual(extraction.status_code, 200, extraction.get_json())
+        self.assertIn("rawSignal", extraction.get_json()["results"][0])
+
+        composite = self.client.post(
+            "/render-composite",
+            json={
+                "sessionId": SESSION_ID, "blot": blot,
+                "brightness700": 1, "contrast700": 1, "brightness800": 1, "contrast800": 1,
+                "colorMode": "color", "rotationDeg": 999,
+            },
+        )
+        self.assertEqual(composite.status_code, 200, composite.get_json())
+        self.assertEqual(composite.mimetype, "image/jpeg")
+
+    def test_composite_straighten_handles_mismatched_channel_shapes(self):
+        # Different-aspect channels make the composite->native scale non-uniform. Straighten
+        # rotates each channel in its native frame (matching /extract), so the display must
+        # still render without error even in this case (regression for the coord-frame fix).
+        b700 = io.BytesIO(); tifffile.imwrite(b700, np.arange(40 * 60, dtype=np.uint16).reshape(40, 60))
+        b800 = io.BytesIO(); tifffile.imwrite(b800, np.arange(60 * 40, dtype=np.uint16).reshape(60, 40))
+        d700 = backend.store_temp_file(SESSION_ID, "mismatch-blot", "700.tif", b700.getvalue(), "image/tiff")
+        d800 = backend.store_temp_file(SESSION_ID, "mismatch-blot", "800.tif", b800.getvalue(), "image/tiff")
+        blot = {"id": "mismatch-blot", "files": {"700": d700, "800": d800}}
+        response = self.client.post(
+            "/render-composite",
+            json={
+                "sessionId": SESSION_ID, "blot": blot,
+                "brightness700": 1, "contrast700": 1, "brightness800": 1, "contrast800": 1,
+                "colorMode": "color", "rotationDeg": 10,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.mimetype, "image/jpeg")
+
+    def test_rotation_preserves_nonfinite_saturation_markers(self):
+        # LI-COR float scans mark saturation with +inf; NEAREST rotation must not interpolate
+        # it away, or a straightened extract would undercount saturated pixels.
+        a = np.zeros((40, 50), dtype=np.float16)
+        a[10, 10] = np.inf
+        before = int(np.count_nonzero(backend.tif_saturation_mask(a)))
+        rotated = backend._rotate_array(a, 4.0, resample=backend.Image.NEAREST).astype(np.float16)
+        after = int(np.count_nonzero(backend.tif_saturation_mask(rotated)))
+        self.assertEqual(before, 1)
+        self.assertEqual(after, before)
 
     def test_session_id_must_match_temp_descriptors(self):
         blot = self.upload_blot()

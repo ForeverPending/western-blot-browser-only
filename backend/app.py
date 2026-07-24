@@ -1607,6 +1607,10 @@ def render_composite():
         contrast_800 = max(0.1, min(10.0, contrast_800))
         gamma_800 = max(0.1, min(5.0, gamma_800))
 
+        # Per-blot straighten happens per-channel in the native frame inside build_composite
+        # (BEFORE the common-size resize) so the displayed rotation matches /detect-bands and
+        # /extract exactly even when the two channels differ in aspect ratio.
+        rotation = parse_rotation(data)
         img = build_composite(
             blot["tif_700_bytes"],
             blot["tif_800_bytes"],
@@ -1614,6 +1618,7 @@ def render_composite():
             brightness_800, contrast_800,
             color_mode,
             gamma_700, gamma_800,
+            rotation,
         )
 
         buf = io.BytesIO()
@@ -1655,9 +1660,18 @@ def apply_adjustments(channel, brightness, contrast, gamma=1.0):
     return np.clip(adjusted, 0.0, 1.0)
 
 
-def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, brightness_800, contrast_800, color_mode="color", gamma_700=1.0, gamma_800=1.0):
+def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, brightness_800, contrast_800, color_mode="color", gamma_700=1.0, gamma_800=1.0, rotation=0.0):
     ch_700 = read_tif_channel(tif_700_bytes)
     ch_800 = read_tif_channel(tif_800_bytes)
+
+    # Per-blot straighten: rotate each channel in its OWN native frame, BEFORE the common-size
+    # resize, so the displayed rotation matches /extract exactly (which rotates the native array,
+    # then scales the box composite->native). Rotating the finished composite instead diverges
+    # from /extract whenever the two channels differ in aspect ratio — a non-uniform
+    # composite->native scale does not commute with rotation. See scale_box / the coord model.
+    if rotation:
+        ch_700 = _rotate_array(ch_700, rotation)
+        ch_800 = _rotate_array(ch_800, rotation)
 
     if ch_700.shape != ch_800.shape:
         h = max(ch_700.shape[0], ch_800.shape[0])
@@ -1735,6 +1749,25 @@ def extract_payload_signals():
         tif_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel])
         arr, raw_pixels = read_raw_channel(tif_bytes, return_saturation=True)
 
+        # Per-blot straighten: rotate the native pixels by the same angle applied to the
+        # composite display and the detector, so axis-aligned boxes measure the intended
+        # (straightened) content. Signal uses bilinear; the saturation array uses nearest and
+        # is cast back to its native dtype so tif_saturation_mask's per-dtype max stays valid.
+        rotation = parse_rotation(data)
+        if rotation:
+            # Rotating converts the array to float32 (+ a PIL copy), so cap it at the render
+            # ceiling — straighten is display-driven and a blot too large to render a composite
+            # can't be straightened in the UI anyway. Keeps the documented memory bound honest.
+            if arr.size > MAX_RENDER_PIXELS:
+                raise PublicError(
+                    "Blot is too large to straighten. "
+                    f"Maximum is {MAX_RENDER_PIXELS:,} pixels.",
+                    413,
+                )
+            raw_dtype = raw_pixels.dtype
+            arr = _rotate_array(arr, rotation)
+            raw_pixels = _rotate_array(raw_pixels, rotation, resample=Image.NEAREST).astype(raw_dtype, copy=False)
+
         # Boxes arrive in COMPOSITE image space (the frontend draws on the
         # max(700,800) composite from build_composite). When the two channels have
         # different native dimensions this channel is smaller than the composite, so
@@ -1811,6 +1844,15 @@ def resolve_composite_dimensions(data, blot, channel, session_id, native_h, nati
     if width and height and width * height <= MAX_IMAGE_PIXELS:
         return height, width
     return composite_dimensions(blot, channel, session_id, native_h, native_w)
+
+
+def parse_rotation(data):
+    """The client's per-blot straighten angle (degrees), clamped to +/-MAX_STRAIGHTEN_DEG.
+    0 (missing/invalid) means no rotation, i.e. the original unchanged code path."""
+    value = data.get("rotationDeg")
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(max(-MAX_STRAIGHTEN_DEG, min(MAX_STRAIGHTEN_DEG, value)))
+    return 0.0
 
 
 def scale_box(box, scale_x, scale_y):
@@ -1962,30 +2004,55 @@ DETECT_MAX_DIM = 1600
 # Longer axis of the returned laneProfile (for optional live client-side re-thresholding).
 PROFILE_SAMPLES = 512
 
+# Cap on client-supplied (or auto-detected) lanes, so a malformed payload can't fan out.
+MAX_DETECT_LANES = 64
+
+# Lane detection robustness. Background under the lane axis is low-frequency (uneven
+# membrane / gradient); a rolling MINIMUM over a window wider than one lane traces that
+# floor without eating lane signal, and subtracting it stops gradients from inventing or
+# merging lanes. The MW ladder is a bright NARROW column — after flattening we scale by a
+# high percentile (not max) so that one spike can't raise the threshold and hide faint
+# real lanes. A wide run is then split wherever an internal valley drops at least
+# LANE_SPLIT_DEPTH (in normalized 0..1 units) below the shoulders on both sides.
+LANE_BASELINE_FRAC = 0.25   # rolling-min baseline window as a fraction of image width
+LANE_NORM_PCT = 99.0        # robust high percentile used to scale the flattened profile
+LANE_SPLIT_DEPTH = 0.30     # min valley depth to split two merged lanes apart
+
+# Per-lane band detection. The migration-axis profile within a lane has its own uneven
+# exposure/smear; a morphological opening (min then max) over a window a few bands wide
+# estimates that background so it can be subtracted — faint bands surface and gradient
+# shoulders stop reading as peaks. Prominence thresholds below are calibrated on the
+# resulting background-subtracted profile (validated against the real test blots).
+BAND_BASELINE_FRAC = 0.12   # opening window along the migration axis, as a fraction of height
+
 # Deskew search: try angles in [-MAX_SKEW_DEG, +MAX_SKEW_DEG] at this step and keep the
 # one that makes the lane (column) projection sharpest. 0 disables auto-deskew.
 MAX_SKEW_DEG = 5.0
 SKEW_STEP_DEG = 0.5
 
-# Rotation is GATED OFF in v1. The box model is axis-aligned {x, y, w, h}, so a box found
-# in a rotated frame is a *tilted* rectangle in the original composite — unrepresentable.
-# Rotation therefore only works as ONE angle applied identically to detection + canvas
-# DISPLAY + /extract (which must rotate the native array before slicing). /extract does
-# not do that yet, so applying any angle here would emit boxes that /extract measures
-# against the UNROTATED pixels — silent wrong signals. Detect in the unrotated composite
-# frame (boxes flow through /extract unchanged) until rotation is plumbed end to end; then
-# flip this flag. See DETECT_BANDS_DESIGN.md ("Rotation / deskew — the one real catch").
-DETECT_ENABLE_DESKEW = False
+# Per-blot straighten. The box model is axis-aligned {x, y, w, h}, so a rotation cannot be a
+# detection-only trick: the SAME angle must be applied to the composite DISPLAY
+# (/render-composite), to detection here, and to /extract (which rotates the native array
+# before slicing) so measured pixels match the straightened view. The client owns that angle
+# (a manual slider + an "Auto" button); this endpoint applies the client angle and also
+# reports a SUGGESTED angle from _estimate_skew for the Auto button to propose. Default 0 =
+# no rotation = unchanged path. See DETECT_BANDS_DESIGN.md ("Rotation / deskew").
+MAX_STRAIGHTEN_DEG = 15.0
 
 # The "sets of bands to choose between" = one detection per sensitivity level. Lower
 # `prominence` => more (fainter) bands captured; that is the knob that varies across
 # levels. `lane_threshold` is deliberately HELD CONSTANT: lowering it with sensitivity
 # merges adjacent lanes into one (verified visually during calibration), which is never
 # wanted. Values are in normalized (0..1) profile units — tune against real blots.
+# Prominence is measured on the per-lane BACKGROUND-SUBTRACTED migration profile
+# (_lane_band_profiles), whose peaks are smaller than the raw 0..1 profile's — so these
+# thresholds are lower than a raw-profile detector would use. Calibrated against the real
+# test blots (scratchpad/calibrate.py): conservative keeps only clear bands, aggressive
+# reaches faint ones. lane_threshold is held constant across levels (see note above).
 SENSITIVITY_LEVELS = {
-    "conservative": {"prominence": 0.20, "lane_threshold": 0.15, "min_distance_frac": 0.030},
-    "balanced":     {"prominence": 0.10, "lane_threshold": 0.15, "min_distance_frac": 0.020},
-    "aggressive":   {"prominence": 0.05, "lane_threshold": 0.15, "min_distance_frac": 0.012},
+    "conservative": {"prominence": 0.10, "lane_threshold": 0.15, "min_distance_frac": 0.030},
+    "balanced":     {"prominence": 0.05, "lane_threshold": 0.15, "min_distance_frac": 0.020},
+    "aggressive":   {"prominence": 0.02, "lane_threshold": 0.15, "min_distance_frac": 0.012},
 }
 DEFAULT_LEVELS = ["conservative", "balanced", "aggressive"]
 
@@ -2046,13 +2113,15 @@ def _downsample_profile(profile, target):
 # would rotate the native array before slicing) so the measured pixels match the view.
 # The functions below cover only the detection side and the angle estimate.
 
-def _rotate_array(arr, angle_deg):
-    """Rotate a 2-D float array about its center by angle_deg (CCW), keeping the same
-    shape (corners cropped). Bilinear resample. Returns arr unchanged at ~0 deg."""
+def _rotate_array(arr, angle_deg, resample=Image.BILINEAR):
+    """Rotate a 2-D float array about its center by angle_deg (CCW), keeping the same shape
+    (corners cropped). Returns arr unchanged at ~0 deg. resample=NEAREST relocates pixels
+    without interpolating, so the exact values survive — used for the saturation array so its
+    per-dtype max counts stay valid after a cast back to the native dtype."""
     if abs(angle_deg) < 1e-3:
         return arr
     img = Image.fromarray(arr.astype(np.float32, copy=False), mode="F")
-    rotated = img.rotate(angle_deg, resample=Image.BILINEAR, expand=False, fillcolor=0.0)
+    rotated = img.rotate(angle_deg, resample=resample, expand=False, fillcolor=0.0)
     return np.asarray(rotated, dtype=np.float32)
 
 
@@ -2142,34 +2211,136 @@ def _column_profile(norm):
     return _smooth_profile(norm.mean(axis=0), max(3, int(norm.shape[1] * 0.01)))
 
 
-def _lanes_from_profile(column_profile, lane_threshold):
-    """Lanes are contiguous spans of the (already smoothed) column projection above a
-    fraction of its dynamic range. Returns list of (x0, x1) half-open."""
-    w = len(column_profile)
-    lo, hi = float(column_profile.min()), float(column_profile.max())
-    if hi <= lo:
-        return [(0, w)]
-    above = column_profile >= (lo + lane_threshold * (hi - lo))
-    min_width = max(2, int(w * 0.01))
-    lanes = [(int(a), int(b)) for a, b in _bool_runs(above) if (b - a) >= min_width]
-    return lanes or [(0, w)]
+def _rolling_min(a, window):
+    """Centered sliding minimum (edge-padded), same length as `a`. numpy-only."""
+    window = int(window)
+    if window <= 1 or a.size == 0:
+        return a
+    ap = np.pad(a, window, mode="edge")
+    mins = np.lib.stride_tricks.sliding_window_view(ap, window).min(axis=1)
+    start = (len(mins) - len(a)) // 2
+    return mins[start:start + len(a)]
 
 
-def _prepare_lanes(norm, lane_threshold):
-    """Level-INDEPENDENT detection work, computed once and shared across the sensitivity
-    sets: the column profile, the lane spans, and each lane's smoothed migration-axis
-    profile with all its peak candidates. The sets differ only in the prominence/spacing
-    filter applied later (_candidate_boxes), so doing this once instead of once per level
-    avoids ~3x redundant column/lane means, convolutions, and prominence walks. Returns
-    (column_profile, lanes, prepared) with prepared = [(x0, x1, profile, peaks), ...]."""
-    column_profile = _column_profile(norm)
-    lanes = _lanes_from_profile(column_profile, lane_threshold)
+def _rolling_max(a, window):
+    """Centered sliding maximum (edge-padded), same length as `a`. numpy-only."""
+    window = int(window)
+    if window <= 1 or a.size == 0:
+        return a
+    ap = np.pad(a, window, mode="edge")
+    maxs = np.lib.stride_tricks.sliding_window_view(ap, window).max(axis=1)
+    start = (len(maxs) - len(a)) // 2
+    return maxs[start:start + len(a)]
+
+
+def _morph_open(profile, window):
+    """Grayscale morphological opening (erosion then dilation) — a background estimate that
+    stays below the peaks without cutting into their bases the way a bare rolling-min does."""
+    return _rolling_max(_rolling_min(profile, window), window)
+
+
+def _flatten_column_profile(column_profile, width):
+    """Baseline-subtract the (raw, smoothed) column projection and scale to 0..1 by a high
+    percentile. Removes low-frequency background and keeps a bright MW-ladder column from
+    dominating the scale, so the lane threshold below is a stable ABSOLUTE 0..1 cut."""
+    window = max(5, int(width * LANE_BASELINE_FRAC))
+    baseline = _smooth_profile(_rolling_min(column_profile, window), max(3, int(width * 0.02)))
+    flat = np.clip(column_profile - baseline, 0.0, None)
+    scale = float(np.percentile(flat, LANE_NORM_PCT))
+    if scale <= 0:
+        return np.zeros_like(flat)
+    return np.clip(flat / scale, 0.0, 1.0)
+
+
+def _split_run_at_valleys(flat, a, b, min_width):
+    """Split a [a, b) run of the flattened profile at strong internal valleys, so two
+    lanes the threshold merged into one wide run come apart. A boundary is the deepest
+    point between two peaks that each clear LANE_SPLIT_DEPTH prominence. Returns >=1 spans."""
+    sub = flat[a:b]
+    peaks = [p for p, prom in _all_peaks(sub) if prom >= LANE_SPLIT_DEPTH]
+    if len(peaks) <= 1:
+        return [(a, b)]
+    spans, start = [], a
+    for left_pk, right_pk in zip(peaks[:-1], peaks[1:]):
+        cut = a + left_pk + int(np.argmin(sub[left_pk:right_pk + 1]))
+        if cut - start >= min_width:
+            spans.append((start, cut))
+            start = cut
+    if b - start >= min_width:
+        spans.append((start, b))
+    return spans or [(a, b)]
+
+
+def _lanes_from_flat(flat, lane_threshold, width):
+    """Lanes from the flattened 0..1 column profile: contiguous runs above the (absolute)
+    threshold, each wide run further split at internal valleys. Returns [] when nothing
+    clears the threshold — the caller must NOT fabricate one full-width lane (that produced
+    full-width boxes on hard blots); the lanes-first UX asks the user to place lanes instead."""
+    min_width = max(2, int(width * 0.01))
+    lanes = []
+    for a, b in _bool_runs(flat >= lane_threshold):
+        if (b - a) < min_width:
+            continue
+        lanes.extend(_split_run_at_valleys(flat, int(a), int(b), min_width))
+    return lanes
+
+
+def _detect_lanes(norm, lane_threshold):
+    """Auto lane detection on the working image. Returns (flat_profile, lanes): the 0..1
+    flattened column projection (also handed to the client for live re-thresholding) and a
+    list of (x0, x1) working-grid spans (possibly empty)."""
+    width = norm.shape[1]
+    flat = _flatten_column_profile(_column_profile(norm), width)
+    return flat, _lanes_from_flat(flat, lane_threshold, width)
+
+
+def _client_lanes_to_working(payload, work_w, composite_w):
+    """Convert client-confirmed lane spans (composite-space {x, w}) to working-grid
+    (x0, x1) spans. Returns None if no list was sent, [] if the list held nothing valid.
+    Malformed/empty entries are dropped; the rest are clamped and sorted."""
+    if not isinstance(payload, list):
+        return None
+    scale = (work_w / composite_w) if composite_w else 1.0
+    spans = []
+    for item in payload[:MAX_DETECT_LANES]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = float(item["x"]); w = float(item["w"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (np.isfinite(x) and np.isfinite(w)) or w <= 0:
+            continue
+        x0 = max(0, min(work_w, int(round(x * scale))))
+        x1 = max(0, min(work_w, int(round((x + w) * scale))))
+        if x1 - x0 >= 1:
+            spans.append((x0, x1))
+    spans.sort()
+    return spans
+
+
+def _lanes_to_composite(lanes, scale_x):
+    """Working-grid (x0, x1) spans -> composite-space {x, w} for the client to draw/edit."""
+    return [{"x": round(x0 * scale_x, 2), "w": round((x1 - x0) * scale_x, 2)}
+            for (x0, x1) in lanes]
+
+
+def _lane_band_profiles(norm, lanes):
+    """Per-lane migration-axis profile + peak candidates for the given lane spans. Level-
+    INDEPENDENT, so computed once and shared across the sensitivity sets (which differ only
+    in the prominence/spacing filter applied later in _candidate_boxes). Returns
+    prepared = [(x0, x1, profile, peaks), ...]."""
     window = max(3, int(norm.shape[0] * 0.01))
+    bg_window = max(5, int(norm.shape[0] * BAND_BASELINE_FRAC))
     prepared = []
     for (x0, x1) in lanes:
         profile = _smooth_profile(norm[:, x0:x1].mean(axis=1), window)
+        # Subtract the per-lane migration-axis background (uneven exposure / smear) so faint
+        # bands surface and gradient shoulders don't read as peaks; opening keeps band peaks.
+        baseline = _smooth_profile(_morph_open(profile, bg_window), window)
+        profile = np.clip(profile - baseline, 0.0, None)
         prepared.append((x0, x1, profile, _all_peaks(profile)))
-    return column_profile, lanes, prepared
+    return prepared
 
 
 def _candidate_boxes(prepared, level, scale_x, scale_y):
@@ -2252,32 +2423,46 @@ def detect_bands():
 
         norm = _orient_polarity(_normalize_for_detect(work))
 
-        # Deskew is gated off in v1 (DETECT_ENABLE_DESKEW): detecting in a rotated frame
-        # would emit boxes that /extract measures against the unrotated native array. Detect
-        # in the unrotated composite frame so boxes flow through /extract unchanged, and
-        # report rotationDeg = 0.0. The rotation code below stays ready for when the angle
-        # is plumbed through display + /extract together (see the flag's comment).
-        if DETECT_ENABLE_DESKEW:
-            # Honor a client-supplied angle if given, else auto-estimate. The returned
-            # angle must then be applied to the canvas display AND /extract to match.
-            requested_angle = data.get("rotationDeg")
-            if isinstance(requested_angle, (int, float)) and np.isfinite(requested_angle):
-                angle = max(-45.0, min(45.0, float(requested_angle)))
-            else:
-                angle = _estimate_skew(norm)
+        # Per-blot straighten. Suggest an angle from the skew estimate (for the "Auto" button)
+        # BEFORE applying any client angle, so the suggestion describes the original blot. Then
+        # apply the client-owned angle — the same one /render-composite and /extract use — so
+        # lanes/bands are found in the straightened frame the boxes will live in.
+        suggested_rotation = round(_estimate_skew(norm), 2)
+        angle = parse_rotation(data)
+        if angle:
             norm = _rotate_array(norm, angle)
-        else:
-            angle = 0.0
 
-        # Lane spans, per-lane profiles, and peak candidates are level-independent
-        # (lane_threshold is held constant across levels), so compute them ONCE and let
-        # each sensitivity set differ only by its prominence/spacing filter.
+        # Lane split. lane_threshold is now an ABSOLUTE 0..1 cut on the flattened profile.
+        # Auto-detect always runs (so the client gets a suggestion + the flattened profile
+        # for its slider), but client-confirmed lanes win — that is the lanes-first UX:
+        # the user fixes the split, then band detection runs strictly within it.
         effective_lane_threshold = (
             lane_threshold if lane_threshold is not None
             else SENSITIVITY_LEVELS[levels[0]]["lane_threshold"]
         )
-        column_profile, lanes, prepared = _prepare_lanes(norm, effective_lane_threshold)
+        flat_profile, auto_lanes = _detect_lanes(norm, effective_lane_threshold)
+        client_lanes = _client_lanes_to_working(data.get("lanes"), work_w, composite_w)
+        lanes = client_lanes if client_lanes else auto_lanes
 
+        lane_profile_out = _downsample_profile(flat_profile, PROFILE_SAMPLES).round(4).tolist()
+        composite_lanes = _lanes_to_composite(lanes, scale_x)
+
+        # Lanes-first stage: return the split (composite coords) + the flattened profile so
+        # the user can confirm/edit lanes before paying for band detection. No candidates.
+        if data.get("stage") == "lanes":
+            return jsonify({
+                "imageWidth": composite_w,
+                "imageHeight": composite_h,
+                "channel": channel,
+                "rotationDeg": round(angle, 2),
+                "suggestedRotationDeg": suggested_rotation,   # for the "Auto" straighten button
+                "lanes": composite_lanes,
+                "laneProfile": lane_profile_out,
+            })
+
+        # Per-lane profiles + peak candidates are level-independent, so compute once and let
+        # each sensitivity set differ only by its prominence/spacing filter.
+        prepared = _lane_band_profiles(norm, lanes)
         candidates = []
         for name in levels:
             boxes, truncated = _candidate_boxes(prepared, SENSITIVITY_LEVELS[name], scale_x, scale_y)
@@ -2290,15 +2475,15 @@ def detect_bands():
                 "boxes": boxes,
             })
 
-        # Reuse the column projection already computed for lane detection so the client can
-        # re-threshold lanes live without a round-trip (no extra full-image mean/convolve).
         return jsonify({
             "imageWidth": composite_w,       # coordinate space the boxes are in
             "imageHeight": composite_h,
             "channel": channel,
             "rotationDeg": round(angle, 2),  # apply to display + /extract to match
+            "suggestedRotationDeg": suggested_rotation,   # for the "Auto" straighten button
             "candidates": candidates,
-            "laneProfile": _downsample_profile(column_profile, PROFILE_SAMPLES).round(4).tolist(),
+            "lanes": composite_lanes,        # so the client can show/edit the split used
+            "laneProfile": lane_profile_out,
         })
     except PublicError as error:
         return error_response(error, "Band detection failed.")

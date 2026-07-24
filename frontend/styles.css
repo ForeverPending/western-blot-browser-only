@@ -1021,6 +1021,43 @@ input[type="range"]:focus-visible {
   gap: var(--space-3);
 }
 
+/* Per-blot straighten control */
+.straighten-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.straighten-control input[type="range"] {
+  width: 100%;
+}
+
+.straighten-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.straighten-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
+/* Lanes-first editor (stage A) */
+.lane-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.lane-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 /* ── Results, data, and charts ─────────────────────────────────────────────── */
 
 #sharedResults {
@@ -1869,6 +1906,10 @@ td strong {
 
 #blotCanvas.draw-mode {
   cursor: crosshair;
+}
+
+#blotCanvas.lanes-mode {
+  cursor: col-resize;
 }
 
 #blotCanvas.is-grabbing {
