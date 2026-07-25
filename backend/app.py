@@ -223,7 +223,21 @@ MAX_NAME_LENGTH = 200
 MAX_TIF_PAGES = 16
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 16 * 1024 * 1024))
 JPEG_MIMETYPE = "image/jpeg"
+PNG_MIMETYPE = "image/png"
 TIFF_MIMETYPE = "image/tiff"
+# The composite is a measurement aid, so encode it losslessly: JPEG's 4:2:0 chroma
+# subsampling bleeds the 700nm channel (red) into the 800nm channel (green) and its
+# quantization noise is the same size as a faint band's whole display range. PNG of a
+# very large composite gets expensive to send and decode, so above this many pixels
+# fall back to JPEG at 4:4:4 (subsampling=0), which at least keeps the channels apart.
+MAX_LOSSLESS_COMPOSITE_PIXELS = int(os.environ.get("MAX_LOSSLESS_COMPOSITE_PIXELS", 4_000_000))
+# Default display window percentiles. The white point sits above p99 because bands
+# occupy well under 1% of a blot's pixels, so p99 lands on a band's shoulder and
+# flattens every core to one value.
+DISPLAY_AUTO_LOW_PCT = 1.0
+DISPLAY_AUTO_HIGH_PCT = 99.8
+MAX_DISPLAY_GAMMA = 5.0
+MIN_DISPLAY_GAMMA = 0.1
 BLOT_TIMEZONE_OFFSETS = {
     "UTC": 0,
     "GMT": 0,
@@ -1592,20 +1606,11 @@ def render_composite():
         if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
             return jsonify({"error": "TIF files not found for this blot"}), 404
 
-        brightness_700 = float(data.get("brightness700", 1.0))
-        contrast_700 = float(data.get("contrast700", 1.0))
-        gamma_700 = float(data.get("gamma700", 1.0))
-        brightness_800 = float(data.get("brightness800", 1.0))
-        contrast_800 = float(data.get("contrast800", 1.0))
-        gamma_800 = float(data.get("gamma800", 1.0))
         color_mode = data.get("colorMode", "color")
-
-        brightness_700 = max(0.1, min(5.0, brightness_700))
-        contrast_700 = max(0.1, min(10.0, contrast_700))
-        gamma_700 = max(0.1, min(5.0, gamma_700))
-        brightness_800 = max(0.1, min(5.0, brightness_800))
-        contrast_800 = max(0.1, min(10.0, contrast_800))
-        gamma_800 = max(0.1, min(5.0, gamma_800))
+        # Display windows in RAW COUNTS, the unit the sliders and /channel-stats report.
+        # None means "auto" and is resolved per channel inside build_composite.
+        window_700 = parse_display_window(data, "700")
+        window_800 = parse_display_window(data, "800")
 
         # Per-blot straighten happens per-channel in the native frame inside build_composite
         # (BEFORE the common-size resize) so the displayed rotation matches /detect-bands and
@@ -1614,17 +1619,23 @@ def render_composite():
         img = build_composite(
             blot["tif_700_bytes"],
             blot["tif_800_bytes"],
-            brightness_700, contrast_700,
-            brightness_800, contrast_800,
+            window_700,
+            window_800,
             color_mode,
-            gamma_700, gamma_800,
             rotation,
         )
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=92)
+        if img.width * img.height <= MAX_LOSSLESS_COMPOSITE_PIXELS:
+            img.save(buf, format="PNG", compress_level=6)
+            mimetype = PNG_MIMETYPE
+        else:
+            # subsampling=0 keeps full chroma resolution, so the red (700nm) and green
+            # (800nm) channels stay separate even on the lossy path.
+            img.save(buf, format="JPEG", quality=95, subsampling=0)
+            mimetype = JPEG_MIMETYPE
         buf.seek(0)
-        return send_file(buf, mimetype=JPEG_MIMETYPE)
+        return send_file(buf, mimetype=mimetype)
     except PublicError as error:
         return error_response(error, "Could not render blot image.")
     except Exception as error:
@@ -1632,8 +1643,58 @@ def render_composite():
         return error_response(error, "Could not render blot image.")
 
 
+@app.route("/channel-stats", methods=["POST"])
+@app.route("/api/channel-stats", methods=["POST"])
+@limiter.limit("60 per minute")
+def channel_stats():
+    """Raw-count statistics per channel, so the client can label its display-window
+    sliders in real intensity units and bound them to this blot's actual range. Without
+    this the window controls would have no idea what numbers mean for a given scan."""
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    try:
+        blot = load_payload_blot(data.get("blot"), (), session_id)
+        stats = {}
+        for channel in ("700", "800"):
+            descriptor = blot["files"].get(channel)
+            if not descriptor:
+                continue
+            tif_bytes = read_temp_file(descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel])
+            arr = read_tif_channel(tif_bytes)
+            auto_low, auto_high = auto_display_window(arr)
+            percentiles = np.percentile(arr, [1.0, 50.0, 99.0, 99.8, 99.99])
+            stats[channel] = {
+                "min": float(arr.min()),
+                "max": float(arr.max()),
+                "p1": float(percentiles[0]),
+                "median": float(percentiles[1]),
+                "p99": float(percentiles[2]),
+                "p998": float(percentiles[3]),
+                "p9999": float(percentiles[4]),
+                "autoMin": auto_low,
+                "autoMax": auto_high,
+                "width": int(arr.shape[1]),
+                "height": int(arr.shape[0]),
+            }
+        if not stats:
+            return jsonify({"error": "No TIF channels found for this blot"}), 404
+        return jsonify({"channels": stats})
+    except PublicError as error:
+        return error_response(error, "Could not read channel statistics.")
+    except Exception as error:
+        app.logger.exception("Channel statistics failed")
+        return error_response(error, "Could not read channel statistics.")
+
+
 def read_tif_channel(tif_bytes):
-    # Display normalization starts from the same validated pixels used for quantification.
+    """RAW validated counts for the display path, size-capped for the render budget.
+
+    Deliberately does NOT normalize. The display window (black point / white point) is
+    applied later from client-supplied raw counts, so the user can move the white point
+    past a band's core the way Image Studio's min/max levels do. Normalizing here — the
+    old behaviour, a fixed p1/p99 stretch — clipped band cores to a single value before
+    any control could reach them, and nothing downstream could recover them.
+    """
     arr = read_raw_channel(tif_bytes)
     if arr.size > MAX_RENDER_PIXELS:
         raise PublicError(
@@ -1641,28 +1702,78 @@ def read_tif_channel(tif_bytes):
             f"Maximum is {MAX_RENDER_PIXELS:,} pixels.",
             413,
         )
-    low  = np.percentile(arr, 1)
-    high = np.percentile(arr, 99)
-    if high > low:
-        arr = (arr - low) / (high - low)
-    else:
-        arr = np.zeros_like(arr)
-    return np.clip(arr, 0.0, 1.0)
+    return arr
 
 
-def apply_adjustments(channel, brightness, contrast, gamma=1.0):
-    # Gamma acts on the normalized [0,1] intensities first: gamma < 1 lifts faint
-    # bands without blowing out strong ones (matching Image Studio's display curve),
-    # gamma > 1 darkens. Contrast (pivot at mid-gray) and additive brightness follow.
-    adjusted = np.power(np.clip(channel, 0.0, 1.0), gamma)
-    adjusted = (adjusted - 0.5) * contrast + 0.5
-    adjusted = adjusted + (brightness - 1.0)
-    return np.clip(adjusted, 0.0, 1.0)
+def auto_display_window(arr):
+    """Default (black, white) points in raw counts for a channel. Percentile-based so it
+    ignores hot pixels, with the white point high enough that band cores keep their shape."""
+    low = float(np.percentile(arr, DISPLAY_AUTO_LOW_PCT))
+    high = float(np.percentile(arr, DISPLAY_AUTO_HIGH_PCT))
+    if not np.isfinite(low):
+        low = 0.0
+    if not np.isfinite(high) or high <= low:
+        finite = arr[np.isfinite(arr)]
+        high = float(finite.max()) if finite.size else low
+    if high <= low:
+        high = low + 1.0
+    return low, high
 
 
-def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, brightness_800, contrast_800, color_mode="color", gamma_700=1.0, gamma_800=1.0, rotation=0.0):
+def finite_float(value):
+    """A finite float from untrusted JSON, or None. Rejects NaN/inf so they cannot reach
+    the window arithmetic and turn a whole channel into NaN."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if np.isfinite(number) else None
+
+
+def parse_display_window(data, channel):
+    """The client's display window for one channel as (low, high, gamma) in raw counts,
+    or None to mean 'use auto'. Gamma alone is enough to build a window: a request that
+    sends only gamma keeps the auto black/white points, which is what the Reset button
+    leaves behind."""
+    low = finite_float(data.get(f"displayMin{channel}"))
+    high = finite_float(data.get(f"displayMax{channel}"))
+    gamma = finite_float(data.get(f"gamma{channel}"))
+    if gamma is None:
+        gamma = 1.0
+    gamma = max(MIN_DISPLAY_GAMMA, min(MAX_DISPLAY_GAMMA, gamma))
+    if low is None or high is None or high <= low:
+        # An unusable pair falls back to auto rather than erroring: the window is a view
+        # preference, and a stale or half-populated slider should still render something.
+        return (None, None, gamma)
+    return (low, high, gamma)
+
+
+def apply_display_window(channel, low, high, gamma=1.0):
+    """Map raw counts onto [0,1] with `low` as black and `high` as white, then bend the
+    curve with gamma. This is Image Studio's model: the WINDOW decides what is visible
+    and gamma only shapes the tones between the two points. gamma < 1 lifts faint bands,
+    gamma > 1 pushes background down."""
+    span = high - low
+    if span <= 0:
+        return np.zeros(channel.shape, dtype=np.float32)
+    scaled = np.clip((channel - low) / span, 0.0, 1.0).astype(np.float32, copy=False)
+    if gamma != 1.0:
+        scaled = np.power(scaled, gamma, dtype=np.float32)
+    return scaled
+
+
+def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=None, color_mode="color", rotation=0.0):
+    """Render the two channels into one RGB image. Each window is (low, high, gamma) in
+    raw counts; None for low/high means auto for that channel."""
     ch_700 = read_tif_channel(tif_700_bytes)
     ch_800 = read_tif_channel(tif_800_bytes)
+
+    # Resolve auto windows on the NATIVE, unrotated counts. Rotation zero-fills the new
+    # corners and the common-size resize interpolates, both of which would drag the
+    # percentiles around — so a blot would change brightness as the user turned the
+    # rotate slider, and /channel-stats (which reports native counts) would disagree
+    # with what is on screen.
+    low_700, high_700, gamma_700 = resolve_window(window_700, ch_700)
+    low_800, high_800, gamma_800 = resolve_window(window_800, ch_800)
 
     # Per-blot straighten: rotate each channel in its OWN native frame, BEFORE the common-size
     # resize, so the displayed rotation matches /extract exactly (which rotates the native array,
@@ -1689,24 +1800,52 @@ def build_composite(tif_700_bytes, tif_800_bytes, brightness_700, contrast_700, 
                 f"at a common resolution. Maximum is {MAX_RENDER_PIXELS:,} pixels.",
                 413,
             )
-        ch_700 = np.array(Image.fromarray((ch_700 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
-        ch_800 = np.array(Image.fromarray((ch_800 * 65535).astype(np.uint16)).resize((w, h), Image.LANCZOS)).astype(np.float32) / 65535
+        # Resize in float ("F" mode) so raw counts survive: the old path scaled by 65535
+        # into uint16, which assumed the array was already normalized to [0,1] and would
+        # now saturate every real count above 1.
+        ch_700 = _resize_float(ch_700, w, h)
+        ch_800 = _resize_float(ch_800, w, h)
 
-    ch_700 = apply_adjustments(ch_700, brightness_700, contrast_700, gamma_700)
-    ch_800 = apply_adjustments(ch_800, brightness_800, contrast_800, gamma_800)
+    ch_700 = apply_display_window(ch_700, low_700, high_700, gamma_700)
+    ch_800 = apply_display_window(ch_800, low_800, high_800, gamma_800)
 
     if color_mode == "grayscale":
         blended = np.clip(ch_700 + ch_800, 0.0, 1.0)
         blended = 1.0 - blended
-        gray = (blended * 255).astype(np.uint8)
+        gray = to_display_bytes(blended)
         rgb = np.stack([gray, gray, gray], axis=2)
     else:
-        r = (ch_700 * 255).astype(np.uint8)
-        g = (ch_800 * 255).astype(np.uint8)
+        r = to_display_bytes(ch_700)
+        g = to_display_bytes(ch_800)
         b = np.zeros_like(r)
         rgb = np.stack([r, g, b], axis=2)
 
     return Image.fromarray(rgb, mode="RGB")
+
+
+def _resize_float(arr, w, h):
+    """LANCZOS resize of a 2-D float array without leaving the float domain."""
+    img = Image.fromarray(arr.astype(np.float32, copy=False), mode="F")
+    return np.asarray(img.resize((w, h), Image.LANCZOS), dtype=np.float32)
+
+
+def to_display_bytes(normalized):
+    """[0,1] -> 0..255, rounding rather than truncating. Truncation threw away up to a
+    whole level and biased everything dark, which matters most for faint bands: they live
+    in the bottom handful of the 8-bit range."""
+    return np.clip(np.rint(normalized * 255.0), 0, 255).astype(np.uint8)
+
+
+def resolve_window(window, arr):
+    """(low, high, gamma) for a channel, filling in the auto black/white points when the
+    client did not supply a usable pair."""
+    if window is None:
+        low, high = auto_display_window(arr)
+        return low, high, 1.0
+    low, high, gamma = window
+    if low is None or high is None:
+        low, high = auto_display_window(arr)
+    return low, high, gamma
 
 # ─── Signal extraction ────────────────────────────────────────────────────────
 

@@ -1047,6 +1047,22 @@ input[type="range"]:focus-visible {
   color: var(--text-primary);
 }
 
+/* Display-window sliders. `.blot-control-group label` is a grid, so the caption and its
+   readout have to share one flex row or they would stack — same reason
+   .detection-slider-head exists. */
+.display-window-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* Live raw-count readout. Tabular figures so the number does not jitter sideways while
+   the slider is being dragged. */
+.display-window-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
 /* Lanes-first editor (stage A) */
 .lane-editor {
   display: flex;

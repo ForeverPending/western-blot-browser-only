@@ -2992,13 +2992,23 @@ function scanMetadataRows(filters = {}) {
     "Background stat": scan.backgroundStat ?? "median",
     Lanes: scan.lanes.length,
     "Color mode": scan.settings?.colorMode || "",
-    "Brightness 700": scan.settings?.brightness700 ?? "",
-    "Contrast 700": scan.settings?.contrast700 ?? "",
-    "Gamma 700": scan.settings?.gamma700 ?? "",
-    "Brightness 800": scan.settings?.brightness800 ?? "",
-    "Contrast 800": scan.settings?.contrast800 ?? "",
-    "Gamma 800": scan.settings?.gamma800 ?? "",
+    ...displaySettingColumns(scan),
   }));
+}
+
+// Display-window provenance for exports, in raw counts. Replaces the old Brightness /
+// Contrast columns, which described a control that no longer exists. Blank means the
+// channel was left on its automatic window.
+function displaySettingColumns(scan) {
+  const settings = scan.settings || {};
+  return {
+    "Black point 700": settings.displayMin700 ?? "",
+    "White point 700": settings.displayMax700 ?? "",
+    "Gamma 700": settings.gamma700 ?? "",
+    "Black point 800": settings.displayMin800 ?? "",
+    "White point 800": settings.displayMax800 ?? "",
+    "Gamma 800": settings.gamma800 ?? "",
+  };
 }
 
 function scanAuditRows(filters = {}) {
@@ -3029,12 +3039,7 @@ function scanAuditRows(filters = {}) {
       H: lane.h ?? "",
       "Area px2": lane.area ?? "",
       "Color mode": scan.settings?.colorMode || "",
-      "Brightness 700": scan.settings?.brightness700 ?? "",
-      "Contrast 700": scan.settings?.contrast700 ?? "",
-      "Gamma 700": scan.settings?.gamma700 ?? "",
-      "Brightness 800": scan.settings?.brightness800 ?? "",
-      "Contrast 800": scan.settings?.contrast800 ?? "",
-      "Gamma 800": scan.settings?.gamma800 ?? "",
+      ...displaySettingColumns(scan),
     })),
   );
 }
@@ -3267,6 +3272,10 @@ function createCanvasState() {
     // box's geometry as of the press, so every pointermove recomputes from the original
     // rect rather than accumulating deltas (which drifts).
     boxDrag: null,            // { index, kind:'nw'|…|'w'|'move', grabX, grabY, startX, startY, startW, startH }
+    // Raw-count statistics per channel from /channel-stats, used to label and bound the
+    // display-window sliders in real intensity units. null until the fetch lands; the
+    // backend renders its own auto window in the meantime.
+    channelStats: null,       // { "700": {min,max,autoMin,autoMax,…}, "800": {…} }
   };
 }
 
@@ -4023,6 +4032,9 @@ async function selectBlot(index) {
     renderBlotAnalysis(blot.id);
     initCanvas(blot.id);
     bindBlotViewerControls(blot.id);
+    // Fire-and-forget: the sliders read "auto" and the backend picks the window until the
+    // real raw-count range arrives, so the first paint is never blocked on this.
+    void loadChannelStats(blot.id);
   } catch (error) {
     preview.innerHTML = `<p class="blot-empty-state">Failed to load blot: ${escapeHtml(error.message)}</p>`;
     renderBlotAnalysisEmpty(`Failed to load blot: ${error.message}`);
@@ -4145,21 +4157,160 @@ function backgroundControlsHtml() {
   `;
 }
 
+// Display window controls, per channel. This is Image Studio's model rather than the
+// brightness/contrast pair it replaced: the black and white points are absolute cuts on
+// RAW COUNTS, so moving the white point past a band's core is what reveals its shape, and
+// pulling it down is what makes faint bands visible. Brightness/contrast could not do
+// either — contrast pivoted at mid-gray while a blot's median pixel sits near 0.015 of
+// the range, so one step above 1.0 crushed the whole image to black, and brightness was
+// an additive pedestal that lifted band and background equally.
+//
+// The two sliders carry raw-count values, but the range they span is only known per blot
+// (see /channel-stats), so they run on a unit 0..1000 track and DISPLAY_SLIDER_CURVE maps
+// position -> counts. The mapping is deliberately non-linear: a blot's useful window is a
+// few hundred counts inside a range whose top end is set by a handful of hot pixels, so a
+// linear track would bury every usable setting in its first 3%.
+const DISPLAY_SLIDER_STEPS = 1000;
+const DISPLAY_SLIDER_CURVE = 2;
+const DEFAULT_DISPLAY_GAMMA = 1;
+
 function channelAdjustmentControlsHtml(colorClass, channel) {
   return `
-    <div class="blot-control-group">
+    <div class="blot-control-group" data-channel="${channel}">
       <span class="channel-label ${colorClass}">${channel}nm</span>
-      <label>Brightness
-        <input type="range" min="0.1" max="3" step="0.05" value="1" id="brightness${channel}" />
+      <label>
+        <span class="display-window-head">Black point
+          <span class="display-window-value" id="displayMinValue${channel}">auto</span>
+        </span>
+        <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="0"
+               id="displayMin${channel}" aria-label="${channel}nm black point" />
       </label>
-      <label>Contrast
-        <input type="range" min="0.1" max="10" step="0.1" value="1" id="contrast${channel}" />
+      <label>
+        <span class="display-window-head">White point
+          <span class="display-window-value" id="displayMaxValue${channel}">auto</span>
+        </span>
+        <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="${DISPLAY_SLIDER_STEPS}"
+               id="displayMax${channel}" aria-label="${channel}nm white point" />
       </label>
-      <label>Gamma <span class="control-hint">lower = reveal faint</span>
+      <label>
+        <span class="display-window-head">Gamma
+          <span class="display-window-value" id="gammaValue${channel}">1.00</span>
+        </span>
         <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
       </label>
+      <button class="ghost-button" id="autoWindow${channel}" type="button"
+              data-channel="${channel}">Auto ${channel}nm</button>
     </div>
   `;
+}
+
+// ── Display window: slider track <-> raw counts ─────────────────────────────────
+function channelStatsFor(channel) {
+  return canvasState.channelStats?.[channel] || null;
+}
+
+function displaySliderToCount(position, stats) {
+  const t = Math.min(1, Math.max(0, Number(position) / DISPLAY_SLIDER_STEPS));
+  return stats.min + (stats.max - stats.min) * Math.pow(t, DISPLAY_SLIDER_CURVE);
+}
+
+function displayCountToSlider(count, stats) {
+  const span = stats.max - stats.min;
+  if (!(span > 0)) return 0;
+  const fraction = Math.min(1, Math.max(0, (Number(count) - stats.min) / span));
+  return Math.round(Math.pow(fraction, 1 / DISPLAY_SLIDER_CURVE) * DISPLAY_SLIDER_STEPS);
+}
+
+function formatCount(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 100) return String(Math.round(value));
+  if (Math.abs(value) >= 10) return value.toFixed(1);
+  return value.toFixed(2);
+}
+
+// The window each channel is currently displaying, in raw counts. Returns null before
+// /channel-stats lands so buildCompositePayload can omit the keys and let the backend
+// apply its own auto window — the first paint must not wait on the stats round trip.
+function currentDisplayWindow(channel) {
+  const stats = channelStatsFor(channel);
+  if (!stats) return null;
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (!minInput || !maxInput) return null;
+  const low = displaySliderToCount(minInput.value, stats);
+  const high = displaySliderToCount(maxInput.value, stats);
+  // A degenerate pair would render a blank frame, so keep a floor of one slider step.
+  if (!(high > low)) return null;
+  return { low, high };
+}
+
+function currentDisplayGamma(channel) {
+  const value = Number(document.getElementById(`gamma${channel}`)?.value);
+  return Number.isFinite(value) ? value : DEFAULT_DISPLAY_GAMMA;
+}
+
+function updateDisplayWindowReadout(channel) {
+  const stats = channelStatsFor(channel);
+  const gammaLabel = document.getElementById(`gammaValue${channel}`);
+  if (gammaLabel) gammaLabel.textContent = currentDisplayGamma(channel).toFixed(2);
+  const window = stats ? currentDisplayWindow(channel) : null;
+  // The slider's own value is a position on an abstract 0..1000 track, which would be
+  // meaningless read aloud, so aria-valuetext carries the raw count instead.
+  [["displayMin", window && window.low], ["displayMax", window && window.high]].forEach(([prefix, count]) => {
+    const label = document.getElementById(`${prefix}Value${channel}`);
+    const text = Number.isFinite(count) ? `${formatCount(count)} counts` : "auto";
+    if (label) label.textContent = Number.isFinite(count) ? formatCount(count) : "auto";
+    document.getElementById(`${prefix}${channel}`)?.setAttribute("aria-valuetext", text);
+  });
+}
+
+// Puts both sliders on this channel's auto window. Called when stats first arrive and by
+// the per-channel Auto button, so "Auto" always means the same thing the backend would
+// have picked on its own.
+function applyAutoDisplayWindow(channel) {
+  const stats = channelStatsFor(channel);
+  if (!stats) return;
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (minInput) minInput.value = String(displayCountToSlider(stats.autoMin, stats));
+  if (maxInput) maxInput.value = String(displayCountToSlider(stats.autoMax, stats));
+  updateDisplayWindowReadout(channel);
+}
+
+// Keeps the black point strictly below the white point. Whichever slider the user moved
+// wins; the other is pushed one step out of the way rather than snapping to it, so a
+// drag never collapses the window into a blank image.
+function enforceWindowOrder(channel, movedId) {
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (!minInput || !maxInput) return;
+  const low = Number(minInput.value);
+  const high = Number(maxInput.value);
+  if (low < high) return;
+  if (movedId === minInput.id) maxInput.value = String(Math.min(DISPLAY_SLIDER_STEPS, low + 1));
+  else minInput.value = String(Math.max(0, high - 1));
+}
+
+async function loadChannelStats(blotId) {
+  const blot = blotById(blotId);
+  if (!blot) return;
+  try {
+    const response = await apiFetch(apiUrl("/channel-stats"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSessionId, blot }),
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    if (canvasState.currentBlotId !== blotId) return;   // user moved on mid-flight
+    canvasState.channelStats = payload.channels || null;
+    ["700", "800"].forEach((channel) => {
+      if (canvasState.channelStats?.[channel]) applyAutoDisplayWindow(channel);
+    });
+  } catch (error) {
+    // Non-fatal: the sliders stay on "auto" and the backend keeps choosing the window.
+    console.warn("Could not load channel statistics", error);
+  }
 }
 
 function boxToolControlsHtml() {
@@ -4233,10 +4384,29 @@ function detectionControlsHtml() {
 }
 
 function bindBlotViewerControls(blotId) {
-  ["brightness700", "contrast700", "gamma700", "brightness800", "contrast800", "gamma800", "colorMode"].forEach(id => {
-    document.getElementById(id)?.addEventListener("change", () => {
+  // Display window sliders bind "input", not "change": on a range input "change" only
+  // fires when the mouse is RELEASED, so the old binding meant you could not sweep a
+  // slider and watch the blot respond — the single biggest reason these controls felt
+  // worse than Image Studio's. The readout updates on every event and the re-render is
+  // debounced, so dragging shows live numbers with one request when the drag settles.
+  ["displayMin700", "displayMax700", "gamma700", "displayMin800", "displayMax800", "gamma800"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", () => {
+      const channel = id.endsWith("800") ? "800" : "700";
+      if (id.startsWith("display")) enforceWindowOrder(channel, id);
+      updateDisplayWindowReadout(channel);
+      scheduleCanvasImageReload(blotId);
+    });
+  });
+  ["700", "800"].forEach((channel) => {
+    document.getElementById(`autoWindow${channel}`)?.addEventListener("click", () => {
+      const gammaInput = document.getElementById(`gamma${channel}`);
+      if (gammaInput) gammaInput.value = String(DEFAULT_DISPLAY_GAMMA);
+      applyAutoDisplayWindow(channel);
       scheduleCanvasImageReload(blotId, true);
     });
+  });
+  document.getElementById("colorMode")?.addEventListener("change", () => {
+    scheduleCanvasImageReload(blotId, true);
   });
   // Per-blot straighten: slider (debounced), Auto (uses the backend skew estimate), Reset.
   document.getElementById("straightenSlider")?.addEventListener("input", (event) => onStraightenInput(event, blotId));
@@ -4496,27 +4666,27 @@ function blotById(blotId) {
 
 // Builds one canonical composite payload for the viewer and exported presentations.
 function buildCompositePayload(blotId, defaultColorMode = "color") {
-  const brightness700 = document.getElementById("brightness700")?.value ?? 1;
-  const contrast700   = document.getElementById("contrast700")?.value   ?? 1;
-  const gamma700      = document.getElementById("gamma700")?.value       ?? 1;
-  const brightness800 = document.getElementById("brightness800")?.value ?? 1;
-  const contrast800   = document.getElementById("contrast800")?.value   ?? 1;
-  const gamma800      = document.getElementById("gamma800")?.value       ?? 1;
-  const colorMode     = document.getElementById("colorMode")?.value     ?? defaultColorMode;
+  const colorMode = document.getElementById("colorMode")?.value ?? defaultColorMode;
   const blot = blotById(blotId);
   if (!blot) throw new Error("Blot is no longer loaded.");
-  return {
+  const payload = {
     sessionId: activeSessionId,
     blot,
-    brightness700,
-    contrast700,
-    gamma700,
-    brightness800,
-    contrast800,
-    gamma800,
+    gamma700: currentDisplayGamma("700"),
+    gamma800: currentDisplayGamma("800"),
     colorMode,
     rotationDeg: canvasState.rotationDeg || 0,   // straighten the displayed composite
   };
+  // Send the black/white points in raw counts, and only once /channel-stats has told us
+  // what this blot's counts look like. Omitting them is meaningful: the backend then
+  // applies its own auto window, which is exactly what the sliders are showing as "auto".
+  ["700", "800"].forEach((channel) => {
+    const window = currentDisplayWindow(channel);
+    if (!window) return;
+    payload[`displayMin${channel}`] = window.low;
+    payload[`displayMax${channel}`] = window.high;
+  });
+  return payload;
 }
 
 async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
@@ -4896,7 +5066,10 @@ function applyDetectionResult(result, blotId) {
     canvasState.detectionPreview = null;
     renderCanvas();
     renderDetectionResults(blotId);
-    setDetectionStatus("No bands detected. Try raising brightness/contrast, lowering gamma, or the lane split.");
+    // Detection reads the RAW TIF, so the display window has no effect on it — the old
+    // advice to raise brightness/contrast pointed at controls that cannot change this
+    // result. Sensitivity and the lane split are the two things that actually can.
+    setDetectionStatus("No bands detected. Try a higher sensitivity or a different lane split.");
     return;
   }
 
@@ -6018,12 +6191,13 @@ async function saveScan(blotId) {
     backgroundStat: backgroundConfig.stat,
     settings: {
       colorMode: document.getElementById("colorMode")?.value ?? "color",
-      brightness700: Number(document.getElementById("brightness700")?.value ?? 1),
-      contrast700: Number(document.getElementById("contrast700")?.value ?? 1),
-      gamma700: Number(document.getElementById("gamma700")?.value ?? 1),
-      brightness800: Number(document.getElementById("brightness800")?.value ?? 1),
-      contrast800: Number(document.getElementById("contrast800")?.value ?? 1),
-      gamma800: Number(document.getElementById("gamma800")?.value ?? 1),
+      // Raw-count display window, or null when the channel is on its automatic window.
+      displayMin700: currentDisplayWindow("700")?.low ?? null,
+      displayMax700: currentDisplayWindow("700")?.high ?? null,
+      gamma700: currentDisplayGamma("700"),
+      displayMin800: currentDisplayWindow("800")?.low ?? null,
+      displayMax800: currentDisplayWindow("800")?.high ?? null,
+      gamma800: currentDisplayGamma("800"),
       rotationDeg: canvasState.rotationDeg || 0,
     },
     lanes: canvasState.boxes.map((box, index) => {

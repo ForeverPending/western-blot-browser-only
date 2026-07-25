@@ -8,6 +8,7 @@ from unittest import mock
 
 import numpy as np
 import tifffile
+from PIL import Image
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
@@ -210,15 +211,15 @@ class StatelessSessionBackendTests(unittest.TestCase):
             json={
                 "sessionId": SESSION_ID,
                 "blot": blot,
-                "brightness700": 1,
-                "contrast700": 1,
-                "brightness800": 1,
-                "contrast800": 1,
+                "displayMin700": 0,
+                "displayMax700": 500,
+                "displayMin800": 0,
+                "displayMax800": 500,
                 "colorMode": "color",
             },
         )
         self.assertEqual(composite.status_code, 200, composite.get_json())
-        self.assertEqual(composite.mimetype, "image/jpeg")
+        self.assertEqual(composite.mimetype, "image/png")
 
         invalid_box = self.client.post(
             "/extract",
@@ -394,12 +395,76 @@ class StatelessSessionBackendTests(unittest.TestCase):
             "/render-composite",
             json={
                 "sessionId": SESSION_ID, "blot": blot,
-                "brightness700": 1, "contrast700": 1, "brightness800": 1, "contrast800": 1,
+                "gamma700": 0.5, "gamma800": 1.0,
                 "colorMode": "color", "rotationDeg": 999,
             },
         )
         self.assertEqual(composite.status_code, 200, composite.get_json())
-        self.assertEqual(composite.mimetype, "image/jpeg")
+        self.assertEqual(composite.mimetype, "image/png")
+
+    def test_channel_stats_reports_raw_counts_and_auto_window(self):
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/channel-stats", json={"sessionId": SESSION_ID, "blot": blot},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        channels = response.get_json()["channels"]
+        for channel in ("700", "800"):
+            stats = channels[channel]
+            # The sliders bound themselves to [min, max] and start at [autoMin, autoMax],
+            # so an inverted or degenerate window here would make them unusable.
+            self.assertLess(stats["min"], stats["max"])
+            self.assertLess(stats["autoMin"], stats["autoMax"])
+            self.assertGreaterEqual(stats["autoMin"], stats["min"])
+            self.assertLessEqual(stats["autoMax"], stats["max"])
+            self.assertGreater(stats["width"], 0)
+            self.assertGreater(stats["height"], 0)
+
+    def test_display_window_white_point_preserves_band_core_detail(self):
+        # The regression this whole control exists for: the old fixed p1/p99 stretch clipped
+        # every band core to one value before any slider could reach it. A tiny bright core
+        # on a dim field reproduces that — bands are far under 1% of a blot's pixels.
+        field = np.full((60, 60), 20, dtype=np.uint16)
+        field[28:32, 28:32] = np.array(
+            [[300, 900, 2600, 400]] * 4, dtype=np.uint16
+        )  # a graded core spanning ~9x
+        buf = io.BytesIO(); tifffile.imwrite(buf, field)
+        descriptor = backend.store_temp_file(
+            SESSION_ID, "window-blot", "700.tif", buf.getvalue(), "image/tiff"
+        )
+        blot = {"id": "window-blot", "files": {"700": descriptor, "800": descriptor}}
+
+        def core_levels(payload):
+            response = self.client.post(
+                "/render-composite", json={"sessionId": SESSION_ID, "blot": blot, **payload},
+            )
+            self.assertEqual(response.status_code, 200, response.data[:200])
+            rendered = np.asarray(Image.open(io.BytesIO(response.data)).convert("RGB"))
+            return len(np.unique(rendered[28:32, 28:32, 0]))
+
+        # A white point below the core flattens it; lifting the white point above the core
+        # keeps its gradation. The old pipeline could only ever produce the first case.
+        self.assertEqual(core_levels({"displayMin700": 0, "displayMax700": 250}), 1)
+        self.assertGreater(core_levels({"displayMin700": 0, "displayMax700": 2600}), 2)
+
+    def test_display_window_rejects_unusable_values_without_erroring(self):
+        # The window is a view preference, so a stale or malformed pair must fall back to the
+        # automatic window rather than 500 or render a NaN-filled frame.
+        blot = self.upload_blot()
+        for payload in (
+            {"displayMin700": 500, "displayMax700": 10},           # inverted
+            {"displayMin700": float("nan"), "displayMax700": 10},  # not finite
+            {"displayMin700": "0", "displayMax700": "500"},        # wrong type
+            {"gamma700": 10_000},                                  # out of range
+            {"displayMin700": 5, "displayMax700": 5},              # zero span
+        ):
+            response = self.client.post(
+                "/render-composite",
+                json={"sessionId": SESSION_ID, "blot": blot, "colorMode": "color", **payload},
+            )
+            self.assertEqual(response.status_code, 200, f"{payload}: {response.data[:200]}")
+            rendered = np.asarray(Image.open(io.BytesIO(response.data)).convert("RGB"))
+            self.assertGreater(len(np.unique(rendered)), 1, f"{payload} rendered a blank frame")
 
     def test_composite_straighten_handles_mismatched_channel_shapes(self):
         # Different-aspect channels make the composite->native scale non-uniform. Straighten
@@ -414,12 +479,11 @@ class StatelessSessionBackendTests(unittest.TestCase):
             "/render-composite",
             json={
                 "sessionId": SESSION_ID, "blot": blot,
-                "brightness700": 1, "contrast700": 1, "brightness800": 1, "contrast800": 1,
                 "colorMode": "color", "rotationDeg": 10,
             },
         )
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.mimetype, "image/jpeg")
+        self.assertEqual(response.mimetype, "image/png")
 
     def test_rotation_preserves_nonfinite_saturation_markers(self):
         # LI-COR float scans mark saturation with +inf; NEAREST rotation must not interpolate
