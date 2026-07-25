@@ -3276,6 +3276,13 @@ function createCanvasState() {
     // display-window sliders in real intensity units. null until the fetch lands; the
     // backend renders its own auto window in the meantime.
     channelStats: null,       // { "700": {min,max,autoMin,autoMax,…}, "800": {…} }
+    // Live display-window preview. pixelBuffer holds both channels' raw intensities in
+    // composite space (/channel-pixels) so a slider drag recomposites locally instead of
+    // waiting on a server render; previewCanvas is the offscreen result renderCanvas draws.
+    pixelBuffer: null,        // { width, height, channels: { 700: {data,scale}, 800: {…} } }
+    previewCanvas: null,      // offscreen canvas at composite size, or null to use `image`
+    previewDirty: false,      // true once a local preview has diverged from the server image
+    histograms: null,         // { "700": Float64Array, "800": Float64Array } binned counts
   };
 }
 
@@ -4032,9 +4039,10 @@ async function selectBlot(index) {
     renderBlotAnalysis(blot.id);
     initCanvas(blot.id);
     bindBlotViewerControls(blot.id);
-    // Fire-and-forget: the sliders read "auto" and the backend picks the window until the
-    // real raw-count range arrives, so the first paint is never blocked on this.
-    void loadChannelStats(blot.id);
+    // Both fire-and-forget: the sliders read "auto" and the backend renders its own window
+    // until these land, so the first paint is never blocked on either. Stats first — the
+    // histogram and the LUT both need the channel's raw range to bin and window against.
+    void loadChannelStats(blot.id).then(() => loadChannelPixels(blot.id));
   } catch (error) {
     preview.innerHTML = `<p class="blot-empty-state">Failed to load blot: ${escapeHtml(error.message)}</p>`;
     renderBlotAnalysisEmpty(`Failed to load blot: ${error.message}`);
@@ -4178,6 +4186,8 @@ function channelAdjustmentControlsHtml(colorClass, channel) {
   return `
     <div class="blot-control-group" data-channel="${channel}">
       <span class="channel-label ${colorClass}">${channel}nm</span>
+      <canvas class="display-histogram" id="histogram${channel}" width="240" height="40" hidden
+              role="img" aria-label="${channel}nm intensity distribution with the current black and white points marked"></canvas>
       <label>
         <span class="display-window-head">Black point
           <span class="display-window-value" id="displayMinValue${channel}">auto</span>
@@ -4291,6 +4301,228 @@ function enforceWindowOrder(channel, movedId) {
   else minInput.value = String(Math.max(0, high - 1));
 }
 
+// ── Live display-window preview ──────────────────────────────────────────────────
+// /channel-pixels hands over both channels' intensities in composite space, so dragging a
+// slider recomposites locally in ~1ms instead of waiting on a render round trip. The
+// debounced server render still runs and replaces this preview when it lands: the server
+// is authoritative (it is what exports use), and the local path quantizes counts to uint16
+// so the two can differ by at most one 8-bit level.
+const PIXEL_BUFFER_MAGIC = "WBP1";
+const PIXEL_BUFFER_HEADER_BYTES = 32;
+const PIXEL_QUANTIZE_CURVE = 2;   // must match PIXEL_QUANTIZE_CURVE in backend/app.py
+const QUANTIZE_MAX = 65535;
+const HISTOGRAM_BINS = 256;
+
+function parsePixelBuffer(bytes) {
+  if (bytes.byteLength < PIXEL_BUFFER_HEADER_BYTES) throw new Error("Pixel buffer is truncated.");
+  const view = new DataView(bytes);
+  const magic = String.fromCharCode(...new Uint8Array(bytes, 0, 4));
+  if (magic !== PIXEL_BUFFER_MAGIC) throw new Error("Unexpected pixel buffer format.");
+  const width = view.getUint32(4, true);
+  const height = view.getUint32(8, true);
+  const channelCount = view.getUint32(12, true);
+  if (channelCount !== 2) throw new Error("Expected two channels.");
+  const pixels = width * height;
+  const expected = PIXEL_BUFFER_HEADER_BYTES + pixels * channelCount * 2;
+  if (!pixels || bytes.byteLength !== expected) throw new Error("Pixel buffer size mismatch.");
+  const scales = [
+    { min: view.getFloat32(16, true), max: view.getFloat32(20, true) },
+    { min: view.getFloat32(24, true), max: view.getFloat32(28, true) },
+  ];
+  return {
+    width,
+    height,
+    channels: {
+      700: { data: new Uint16Array(bytes, PIXEL_BUFFER_HEADER_BYTES, pixels), scale: scales[0] },
+      800: { data: new Uint16Array(bytes, PIXEL_BUFFER_HEADER_BYTES + pixels * 2, pixels), scale: scales[1] },
+    },
+  };
+}
+
+// Decode one quantized sample back to raw counts. The inverse of the backend's curve.
+function decodeQuantized(step, scale) {
+  const t = step / QUANTIZE_MAX;
+  return scale.min + (scale.max - scale.min) * Math.pow(t, PIXEL_QUANTIZE_CURVE);
+}
+
+// A 65536-entry quantized-value -> 8-bit lookup, so compositing costs one array read per
+// pixel rather than a pow() per pixel. Rebuilt per slider event; the table is what makes
+// the live preview cheap enough to run on every input event.
+function buildDisplayLut(channel) {
+  const buffer = canvasState.pixelBuffer?.channels?.[channel];
+  if (!buffer) return null;
+  const stats = channelStatsFor(channel);
+  const window = currentDisplayWindow(channel)
+    || (stats ? { low: stats.autoMin, high: stats.autoMax } : null);
+  if (!window) return null;
+  const gamma = currentDisplayGamma(channel);
+  const span = window.high - window.low;
+  if (!(span > 0)) return null;
+  const lut = new Uint8Array(QUANTIZE_MAX + 1);
+  for (let step = 0; step <= QUANTIZE_MAX; step += 1) {
+    const counts = decodeQuantized(step, buffer.scale);
+    let normalized = (counts - window.low) / span;
+    normalized = normalized < 0 ? 0 : normalized > 1 ? 1 : normalized;
+    if (gamma !== 1) normalized = Math.pow(normalized, gamma);
+    lut[step] = Math.round(normalized * 255);
+  }
+  return lut;
+}
+
+// Recomposite both channels into the offscreen preview canvas that renderCanvas draws.
+// Returns false when there is no pixel buffer yet, so callers can fall back to the server.
+function renderLocalPreview() {
+  const buffer = canvasState.pixelBuffer;
+  if (!buffer) return false;
+  const lut700 = buildDisplayLut("700");
+  const lut800 = buildDisplayLut("800");
+  if (!lut700 || !lut800) return false;
+
+  const { width, height } = buffer;
+  let target = canvasState.previewCanvas;
+  if (!target || target.width !== width || target.height !== height) {
+    target = document.createElement("canvas");
+    target.width = width;
+    target.height = height;
+    canvasState.previewCanvas = target;
+  }
+  const ctx = target.getContext("2d", { willReadFrequently: true });
+  const image = ctx.createImageData(width, height);
+  const out = image.data;
+  const src700 = buffer.channels[700].data;
+  const src800 = buffer.channels[800].data;
+  const grayscale = (document.getElementById("colorMode")?.value ?? "color") === "grayscale";
+
+  for (let i = 0, p = 0; i < src700.length; i += 1, p += 4) {
+    const r = lut700[src700[i]];
+    const g = lut800[src800[i]];
+    if (grayscale) {
+      // Server-side equivalent: 1 - clip(a + b). Rounding through the two 8-bit LUTs
+      // instead of summing floats can differ by a level; the server render corrects it.
+      const sum = r + g;
+      const gray = 255 - (sum > 255 ? 255 : sum);
+      out[p] = gray; out[p + 1] = gray; out[p + 2] = gray;
+    } else {
+      out[p] = r; out[p + 1] = g; out[p + 2] = 0;
+    }
+    out[p + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  canvasState.previewDirty = true;
+  return true;
+}
+
+// Repaint from the local buffer if we can, otherwise leave the current image alone and let
+// the debounced server render catch up.
+function refreshDisplayPreview() {
+  // Only preview once the server image has established the composite dimensions the rest
+  // of the viewer works in (zoom, pan, box coords). Substituting a differently sized source
+  // before then would draw boxes against the wrong frame.
+  const buffer = canvasState.pixelBuffer;
+  if (!buffer || canvasState.imageWidth !== buffer.width || canvasState.imageHeight !== buffer.height) {
+    return;
+  }
+  if (renderLocalPreview()) renderCanvas();
+}
+
+async function loadChannelPixels(blotId) {
+  const blot = blotById(blotId);
+  if (!blot) return;
+  const rotationDeg = canvasState.rotationDeg || 0;
+  try {
+    const response = await apiFetch(apiUrl("/channel-pixels"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSessionId, blot, rotationDeg }),
+      timeoutMs: IMAGE_RENDER_TIMEOUT_MS,
+    });
+    if (!response.ok) {
+      // 413 (blot too large) is expected and benign — the server keeps rendering instead.
+      canvasState.pixelBuffer = null;
+      return;
+    }
+    const parsed = parsePixelBuffer(await response.arrayBuffer());
+    // Rotation or blot may have changed while this was in flight; a stale buffer would be
+    // in the wrong frame and shift the preview out of register with the boxes.
+    if (canvasState.currentBlotId !== blotId) return;
+    if ((canvasState.rotationDeg || 0) !== rotationDeg) return;
+    canvasState.pixelBuffer = parsed;
+    drawAllHistograms();
+  } catch (error) {
+    canvasState.pixelBuffer = null;
+    console.warn("Live display adjustment unavailable; using server rendering", error);
+  }
+}
+
+// ── Histogram ────────────────────────────────────────────────────────────────────
+// Where a channel's pixels actually sit, which is the other thing Image Studio gives you
+// and this app did not: without it, setting a window is guesswork.
+function channelHistogram(channel) {
+  const buffer = canvasState.pixelBuffer?.channels?.[channel];
+  const stats = channelStatsFor(channel);
+  if (!buffer || !stats) return null;
+  const span = stats.max - stats.min;
+  if (!(span > 0)) return null;
+  const bins = new Float64Array(HISTOGRAM_BINS);
+  const data = buffer.data;
+  for (let i = 0; i < data.length; i += 1) {
+    const counts = decodeQuantized(data[i], buffer.scale);
+    // Bin on the same curve the sliders use, so a bar sits under the thumb that selects it.
+    const fraction = Math.pow(Math.min(1, Math.max(0, (counts - stats.min) / span)), 1 / DISPLAY_SLIDER_CURVE);
+    bins[Math.min(HISTOGRAM_BINS - 1, Math.floor(fraction * HISTOGRAM_BINS))] += 1;
+  }
+  return bins;
+}
+
+function drawHistogram(channel) {
+  const canvas = document.getElementById(`histogram${channel}`);
+  if (!canvas) return;
+  const bins = canvasState.histograms?.[channel] || null;
+  // Stay hidden rather than showing an empty bordered box: there is no histogram until the
+  // pixel buffer lands, and on a blot over MAX_INTERACTIVE_PIXELS it never will.
+  canvas.hidden = !bins;
+  if (!bins) return;
+  const width = canvas.clientWidth || canvas.width;
+  const height = canvas.height;
+  if (canvas.width !== width) canvas.width = width;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, height);
+
+  // Log counts: a blot is overwhelmingly background, so on a linear axis the background
+  // spike is the only visible bar and the bands — the part you are windowing for — vanish.
+  let peak = 0;
+  for (let i = 0; i < bins.length; i += 1) peak = Math.max(peak, bins[i]);
+  if (peak <= 0) return;
+  const logPeak = Math.log1p(peak);
+  ctx.fillStyle = themeToken("--histogram-bar") || themeToken("--text-secondary") || "#64748b";
+  const barWidth = canvas.width / bins.length;
+  for (let i = 0; i < bins.length; i += 1) {
+    if (!bins[i]) continue;
+    const barHeight = (Math.log1p(bins[i]) / logPeak) * height;
+    ctx.fillRect(i * barWidth, height - barHeight, Math.max(1, barWidth), barHeight);
+  }
+
+  // Black and white point markers, on the same curve as the bars.
+  const stats = channelStatsFor(channel);
+  const window = currentDisplayWindow(channel);
+  if (!stats || !window) return;
+  ctx.fillStyle = themeToken("--primary") || "#2563eb";
+  [window.low, window.high].forEach((counts) => {
+    const x = (displayCountToSlider(counts, stats) / DISPLAY_SLIDER_STEPS) * canvas.width;
+    ctx.fillRect(Math.min(canvas.width - 2, Math.max(0, x - 1)), 0, 2, height);
+  });
+}
+
+// Binning walks every pixel, so cache per channel and only redraw the markers on a drag.
+function drawAllHistograms() {
+  canvasState.histograms = {};
+  ["700", "800"].forEach((channel) => {
+    const bins = channelHistogram(channel);
+    if (bins) canvasState.histograms[channel] = bins;
+    drawHistogram(channel);
+  });
+}
+
 async function loadChannelStats(blotId) {
   const blot = blotById(blotId);
   if (!blot) return;
@@ -4394,6 +4626,8 @@ function bindBlotViewerControls(blotId) {
       const channel = id.endsWith("800") ? "800" : "700";
       if (id.startsWith("display")) enforceWindowOrder(channel, id);
       updateDisplayWindowReadout(channel);
+      refreshDisplayPreview();      // instant, from the local pixel buffer
+      drawHistogram(channel);       // move the black/white point markers with the thumb
       scheduleCanvasImageReload(blotId);
     });
   });
@@ -4402,10 +4636,13 @@ function bindBlotViewerControls(blotId) {
       const gammaInput = document.getElementById(`gamma${channel}`);
       if (gammaInput) gammaInput.value = String(DEFAULT_DISPLAY_GAMMA);
       applyAutoDisplayWindow(channel);
+      refreshDisplayPreview();
+      drawHistogram(channel);
       scheduleCanvasImageReload(blotId, true);
     });
   });
   document.getElementById("colorMode")?.addEventListener("change", () => {
+    refreshDisplayPreview();        // grayscale/color is a local recomposite too
     scheduleCanvasImageReload(blotId, true);
   });
   // Per-blot straighten: slider (debounced), Auto (uses the backend skew estimate), Reset.
@@ -4617,6 +4854,9 @@ async function loadCanvasImage(blotId, options = {}) {
     canvasState.image = img;
     canvasState.imageWidth = img.naturalWidth;
     canvasState.imageHeight = img.naturalHeight;
+    // The server render is authoritative — it is what exports and presentations use — so
+    // stand down the local preview now that it has arrived.
+    canvasState.previewDirty = false;
 
     const canvas = document.getElementById("blotCanvas");
     if (!canvas) return;
@@ -4728,7 +4968,13 @@ function setStraighten(deg, blotId) {
 
 function applyStraighten(deg, blotId) {
   canvasState.rotationDeg = deg;
+  // The pixel buffer is rotation-baked (it arrives in composite space), so it is now in the
+  // wrong frame. Drop it immediately rather than previewing from it, and refetch at the new
+  // angle — display sliders fall back to server rendering for the moment in between.
+  canvasState.pixelBuffer = null;
+  canvasState.previewDirty = false;
   scheduleCanvasImageReload(blotId, true);   // re-render the straightened composite (preserves view)
+  void loadChannelPixels(blotId);
   if (canvasState.boxes.length) {
     void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });   // re-measure
   }
@@ -5516,11 +5762,15 @@ function renderCanvas() {
   ctx.fillStyle = themeToken("--image-canvas");
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  if (canvasState.image) {
+  // Prefer the locally composited preview while a display slider is in play; it is the
+  // same geometry as the server composite (both come from prepare_composite_channels), so
+  // boxes stay in register either way.
+  const source = (canvasState.previewDirty && canvasState.previewCanvas) || canvasState.image;
+  if (source) {
     ctx.save();
     ctx.translate(canvasState.panX, canvasState.panY);
     ctx.scale(canvasState.zoom, canvasState.zoom);
-    ctx.drawImage(canvasState.image, 0, 0);
+    ctx.drawImage(source, 0, 0);
 
     const backgroundConfig = currentBackgroundConfig();
 

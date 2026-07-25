@@ -101,6 +101,88 @@ test("display sliders react while dragging, not only on release", () => {
     /addEventListener\("change"/);
 });
 
+// ── Pass 2: the live local preview ───────────────────────────────────────────────
+const pixelApi = new Function(`
+  ${grabConst("PIXEL_BUFFER_MAGIC")}
+  ${grabConst("PIXEL_BUFFER_HEADER_BYTES")}
+  ${grabConst("PIXEL_QUANTIZE_CURVE")}
+  ${grabConst("QUANTIZE_MAX")}
+  ${grab("parsePixelBuffer")}
+  ${grab("decodeQuantized")}
+  return { parsePixelBuffer, decodeQuantized, PIXEL_QUANTIZE_CURVE, QUANTIZE_MAX };
+`)();
+
+function makePixelBuffer({ magic = "WBP1", width = 2, height = 2, channels = 2, trailing = 0 } = {}) {
+  const pixels = width * height;
+  const bytes = new ArrayBuffer(32 + pixels * 2 * 2 + trailing);
+  const view = new DataView(bytes);
+  for (let i = 0; i < 4; i += 1) view.setUint8(i, magic.charCodeAt(i));
+  view.setUint32(4, width, true);
+  view.setUint32(8, height, true);
+  view.setUint32(12, channels, true);
+  view.setFloat32(16, 0, true);      // 700nm min
+  view.setFloat32(20, 1000, true);   // 700nm max
+  view.setFloat32(24, 5, true);      // 800nm min
+  view.setFloat32(28, 500, true);    // 800nm max
+  return bytes;
+}
+
+test("the client quantization curve matches the backend's", async () => {
+  // The two constants are the contract for /channel-pixels. If they drift, the live preview
+  // renders wrong intensities while the server render is right — a confusing flicker rather
+  // than a clean failure, so assert them against each other directly.
+  const py = await readFile(new URL("../backend/app.py", import.meta.url), "utf8");
+  const match = py.match(/^PIXEL_QUANTIZE_CURVE = ([\d.]+)/m);
+  assert.ok(match, "backend PIXEL_QUANTIZE_CURVE not found");
+  assert.equal(Number(match[1]), pixelApi.PIXEL_QUANTIZE_CURVE);
+});
+
+test("quantized samples decode back to raw counts", () => {
+  const scale = { min: 0, max: 6684 };
+  assert.equal(pixelApi.decodeQuantized(0, scale), 0);
+  assert.equal(pixelApi.decodeQuantized(pixelApi.QUANTIZE_MAX, scale), 6684);
+  // The curve must put fine resolution at the low end, where band-hunting happens.
+  const step = pixelApi.decodeQuantized(1, scale) - pixelApi.decodeQuantized(0, scale);
+  assert.ok(step < 0.01, `low-end step is ${step} counts`);
+});
+
+test("a pixel buffer parses into two addressable channels", () => {
+  const parsed = pixelApi.parsePixelBuffer(makePixelBuffer({ width: 3, height: 4 }));
+  assert.equal(parsed.width, 3);
+  assert.equal(parsed.height, 4);
+  assert.equal(parsed.channels[700].data.length, 12);
+  assert.equal(parsed.channels[800].data.length, 12);
+  assert.deepEqual(parsed.channels[700].scale, { min: 0, max: 1000 });
+  assert.deepEqual(parsed.channels[800].scale, { min: 5, max: 500 });
+});
+
+test("a malformed pixel buffer is rejected rather than misread", () => {
+  // Misreading the header would paint garbage over the blot, so every field is checked.
+  assert.throws(() => pixelApi.parsePixelBuffer(makePixelBuffer({ magic: "XXXX" })), /format/);
+  assert.throws(() => pixelApi.parsePixelBuffer(makePixelBuffer({ channels: 1 })), /two channels/);
+  assert.throws(() => pixelApi.parsePixelBuffer(makePixelBuffer({ trailing: 8 })), /size mismatch/);
+  assert.throws(() => pixelApi.parsePixelBuffer(new ArrayBuffer(8)), /truncated/);
+  assert.throws(() => pixelApi.parsePixelBuffer(makePixelBuffer({ width: 0 })), /size mismatch/);
+});
+
+test("the local preview is abandoned once the server render arrives", () => {
+  // The server composite is what exports use, so the preview must be transient. If
+  // previewDirty were never cleared, the canvas could keep showing the approximate local
+  // recomposite indefinitely.
+  const loader = app.slice(app.indexOf("async function loadCanvasImage"));
+  const onload = loader.slice(0, loader.indexOf("const canPreserveView"));
+  assert.match(onload, /previewDirty = false/);
+});
+
+test("a stale pixel buffer cannot be previewed after a rotation change", () => {
+  // The buffer is rotation-baked, so reusing it at a new angle would draw the blot out of
+  // register with the boxes drawn on top of it.
+  const straighten = app.slice(app.indexOf("function applyStraighten"));
+  const body = straighten.slice(0, straighten.indexOf("\n}\n"));
+  assert.match(body, /pixelBuffer = null/);
+  assert.match(body, /loadChannelPixels/);
+});
+
 test("quantification never reads the display window", () => {
   // The window is view-only. If an extract payload ever grew display keys, a user could
   // change their numbers by dragging a slider.

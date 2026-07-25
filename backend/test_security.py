@@ -1,5 +1,6 @@
 import io
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -465,6 +466,60 @@ class StatelessSessionBackendTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, f"{payload}: {response.data[:200]}")
             rendered = np.asarray(Image.open(io.BytesIO(response.data)).convert("RGB"))
             self.assertGreater(len(np.unique(rendered)), 1, f"{payload} rendered a blank frame")
+
+    def test_channel_pixels_round_trips_to_the_server_arrays(self):
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/channel-pixels", json={"sessionId": SESSION_ID, "blot": blot},
+        )
+        self.assertEqual(response.status_code, 200, response.data[:200])
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+        body = response.data
+        self.assertEqual(body[:4], b"WBP1")
+        width, height, channels = struct.unpack_from("<III", body, 4)
+        self.assertEqual(channels, 2)
+        scales = struct.unpack_from("<ffff", body, 16)
+        self.assertEqual(len(body), 32 + width * height * 2 * 2)
+
+        # The client decodes with pow(step/65535, PIXEL_QUANTIZE_CURVE); if the two curves
+        # ever disagree the live preview would be visibly wrong while the server render is
+        # right, so pin the round trip against the arrays the renderer actually uses.
+        raw = np.frombuffer(body, dtype="<u2", offset=32).reshape(2, height, width)
+        with backend.app.test_request_context():
+            tif_700 = backend.read_temp_file(
+                blot["files"]["700"], SESSION_ID, max_bytes=backend.BLOT_FILE_LIMITS["700"]
+            )
+            tif_800 = backend.read_temp_file(
+                blot["files"]["800"], SESSION_ID, max_bytes=backend.BLOT_FILE_LIMITS["800"]
+            )
+        expected = backend.prepare_composite_channels(tif_700, tif_800, 0.0)[:2]
+        for index, truth in enumerate(expected):
+            low, high = scales[2 * index], scales[2 * index + 1]
+            decoded = low + (high - low) * np.power(
+                raw[index] / 65535.0, backend.PIXEL_QUANTIZE_CURVE
+            )
+            span = float(truth.max() - truth.min()) or 1.0
+            self.assertLess(float(np.abs(decoded - truth).max()) / span, 1e-4)
+
+    def test_channel_pixels_refuses_oversized_blots(self):
+        # Above the cap the client must be told to fall back to server rendering rather than
+        # being handed a multi-megabyte buffer.
+        blot = self.upload_blot()
+        with mock.patch.object(backend, "MAX_INTERACTIVE_PIXELS", 4):
+            response = self.client.post(
+                "/channel-pixels", json={"sessionId": SESSION_ID, "blot": blot},
+            )
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("maxPixels", response.get_json())
+
+    def test_channel_pixels_is_session_scoped(self):
+        # Same boundary as every other blot route: another session's descriptor must not
+        # become readable just because this endpoint returns raw pixels.
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/channel-pixels", json={"sessionId": "other-session-entirely", "blot": blot},
+        )
+        self.assertGreaterEqual(response.status_code, 400)
 
     def test_composite_straighten_handles_mismatched_channel_shapes(self):
         # Different-aspect channels make the composite->native scale non-uniform. Straighten

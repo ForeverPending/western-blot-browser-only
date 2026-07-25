@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import random
 import shutil
+import struct
 import tempfile
 import time
 import uuid
@@ -231,6 +232,14 @@ TIFF_MIMETYPE = "image/tiff"
 # very large composite gets expensive to send and decode, so above this many pixels
 # fall back to JPEG at 4:4:4 (subsampling=0), which at least keeps the channels apart.
 MAX_LOSSLESS_COMPOSITE_PIXELS = int(os.environ.get("MAX_LOSSLESS_COMPOSITE_PIXELS", 4_000_000))
+# Ceiling on a composite handed to the browser as raw intensities for live display-window
+# adjustment (/channel-pixels). Two uint16 channels, so the response is 4 bytes/pixel —
+# 8MB at this cap. Above it the client falls back to server-side rendering per adjustment.
+MAX_INTERACTIVE_PIXELS = int(os.environ.get("MAX_INTERACTIVE_PIXELS", 2_000_000))
+# Exponent for the uint16 pixel quantization curve in /channel-pixels. The client must
+# raise decoded values by this same power; see the endpoint's docstring for why it is not
+# linear. Keep in sync with PIXEL_QUANTIZE_CURVE in frontend/app.js.
+PIXEL_QUANTIZE_CURVE = 2.0
 # Default display window percentiles. The white point sits above p99 because bands
 # occupy well under 1% of a blot's pixels, so p99 lands on a band's shoulder and
 # flattens every core to one value.
@@ -1686,6 +1695,82 @@ def channel_stats():
         return error_response(error, "Could not read channel statistics.")
 
 
+@app.route("/channel-pixels", methods=["POST"])
+@app.route("/api/channel-pixels", methods=["POST"])
+@limiter.limit("30 per minute")
+def channel_pixels():
+    """Both channels' intensities in composite space so the browser can apply the display
+    window itself and repaint while a slider is being dragged, with no round trip.
+
+    Body layout (little-endian), a self-describing binary prefix rather than metadata in
+    headers so it survives any proxy or cross-origin setup without needing
+    Access-Control-Expose-Headers:
+
+        0  magic       4 bytes  b'WBP1'
+        4  width       uint32
+        8  height      uint32
+        12 channels    uint32   (always 2: the composite needs both)
+        16 scale       float32 x 4   700 min, 700 max, 800 min, 800 max
+        32 pixels      uint16 x width*height, 700nm then 800nm
+
+    Counts are quantized to uint16 against each channel's own [min, max], through a
+    square-root curve (PIXEL_QUANTIZE_CURVE) rather than linearly. Linear quantization
+    looks fine on average but fails exactly where it matters: a channel holding saturated
+    pixels has a scale top of 65504, so a linear step is ~1 full count and a user who
+    windows down to [0, 50] to hunt for a faint band would have only ~50 distinct source
+    levels feeding 256 display levels — visible banding. The curve puts the resolution
+    where the signal is, giving ~0.12-count steps at 250 counts in that same channel.
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    try:
+        blot = load_payload_blot(data.get("blot"), ("700", "800"), session_id)
+        if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
+            return jsonify({"error": "TIF files not found for this blot"}), 404
+
+        rotation = parse_rotation(data)
+        ch_700, ch_800, _auto_700, _auto_800 = prepare_composite_channels(
+            blot["tif_700_bytes"], blot["tif_800_bytes"], rotation
+        )
+        height, width = ch_700.shape
+        if width * height > MAX_INTERACTIVE_PIXELS:
+            # Too big to hand over wholesale. The client falls back to asking the server
+            # for a rendered composite per adjustment, which is the pre-Pass-2 behaviour.
+            return jsonify({
+                "error": "Blot is too large for interactive display adjustment.",
+                "maxPixels": MAX_INTERACTIVE_PIXELS,
+            }), 413
+
+        payload = bytearray()
+        payload += b"WBP1"
+        payload += struct.pack("<III", width, height, 2)
+        scales = []
+        quantized = []
+        for channel in (ch_700, ch_800):
+            low = float(channel.min())
+            high = float(channel.max())
+            if not (high > low):
+                high = low + 1.0
+            scales.extend((low, high))
+            normalized = np.clip((channel - low) / (high - low), 0.0, 1.0)
+            curved = np.power(normalized, 1.0 / PIXEL_QUANTIZE_CURVE) * 65535.0
+            quantized.append(np.rint(curved).astype("<u2"))
+        payload += struct.pack("<ffff", *scales)
+        for channel in quantized:
+            payload += channel.tobytes(order="C")
+
+        response = send_file(io.BytesIO(bytes(payload)), mimetype="application/octet-stream")
+        # The buffer is derived entirely from session-scoped temp files and is not
+        # revalidated on reuse, so keep it out of any shared cache.
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except PublicError as error:
+        return error_response(error, "Could not read channel pixels.")
+    except Exception as error:
+        app.logger.exception("Channel pixel read failed")
+        return error_response(error, "Could not read channel pixels.")
+
+
 def read_tif_channel(tif_bytes):
     """RAW validated counts for the display path, size-capped for the render budget.
 
@@ -1761,9 +1846,13 @@ def apply_display_window(channel, low, high, gamma=1.0):
     return scaled
 
 
-def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=None, color_mode="color", rotation=0.0):
-    """Render the two channels into one RGB image. Each window is (low, high, gamma) in
-    raw counts; None for low/high means auto for that channel."""
+def prepare_composite_channels(tif_700_bytes, tif_800_bytes, rotation=0.0):
+    """Both channels as RAW counts in common composite space, plus each one's auto window.
+
+    Shared by build_composite and /channel-pixels so the two cannot disagree about
+    geometry: the client composites the buffers this returns, and a mismatch in size or
+    rotation would put the live preview out of register with the drawn boxes.
+    """
     ch_700 = read_tif_channel(tif_700_bytes)
     ch_800 = read_tif_channel(tif_800_bytes)
 
@@ -1772,8 +1861,8 @@ def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=No
     # percentiles around — so a blot would change brightness as the user turned the
     # rotate slider, and /channel-stats (which reports native counts) would disagree
     # with what is on screen.
-    low_700, high_700, gamma_700 = resolve_window(window_700, ch_700)
-    low_800, high_800, gamma_800 = resolve_window(window_800, ch_800)
+    auto_700 = auto_display_window(ch_700)
+    auto_800 = auto_display_window(ch_800)
 
     # Per-blot straighten: rotate each channel in its OWN native frame, BEFORE the common-size
     # resize, so the displayed rotation matches /extract exactly (which rotates the native array,
@@ -1806,6 +1895,18 @@ def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=No
         ch_700 = _resize_float(ch_700, w, h)
         ch_800 = _resize_float(ch_800, w, h)
 
+    return ch_700, ch_800, auto_700, auto_800
+
+
+def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=None, color_mode="color", rotation=0.0):
+    """Render the two channels into one RGB image. Each window is (low, high, gamma) in
+    raw counts; None for low/high means auto for that channel."""
+    ch_700, ch_800, auto_700, auto_800 = prepare_composite_channels(
+        tif_700_bytes, tif_800_bytes, rotation
+    )
+    low_700, high_700, gamma_700 = resolve_window(window_700, auto_700)
+    low_800, high_800, gamma_800 = resolve_window(window_800, auto_800)
+
     ch_700 = apply_display_window(ch_700, low_700, high_700, gamma_700)
     ch_800 = apply_display_window(ch_800, low_800, high_800, gamma_800)
 
@@ -1836,15 +1937,14 @@ def to_display_bytes(normalized):
     return np.clip(np.rint(normalized * 255.0), 0, 255).astype(np.uint8)
 
 
-def resolve_window(window, arr):
+def resolve_window(window, auto):
     """(low, high, gamma) for a channel, filling in the auto black/white points when the
-    client did not supply a usable pair."""
+    client did not supply a usable pair. `auto` is this channel's (low, high) default."""
     if window is None:
-        low, high = auto_display_window(arr)
-        return low, high, 1.0
+        return auto[0], auto[1], 1.0
     low, high, gamma = window
     if low is None or high is None:
-        low, high = auto_display_window(arr)
+        low, high = auto
     return low, high, gamma
 
 # ─── Signal extraction ────────────────────────────────────────────────────────
