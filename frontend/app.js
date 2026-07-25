@@ -88,6 +88,9 @@ const state = {
   activeSampleIndex: 0,
   pairedSets: [],
   pairedAnalyses: [],
+  // Custom comparison-chart title ("" = use the generated one). Chart-level rather than
+  // per-analysis, since one comparison chart spans every pair.
+  comparisonTitle: "",
   comparisonCustomGroups: [],
   replicateRows: [],
 };
@@ -255,6 +258,7 @@ const els = {
   resultTableBody: document.querySelector("#resultTableBody"),
   labelPanel: document.querySelector("#labelPanel"),
   labelEditor: document.querySelector("#labelEditor"),
+  graphTitleInput: document.querySelector("#graphTitleInput"),
   groupPanel: document.querySelector("#groupPanel"),
   customGroupingPanel: document.querySelector("#customGroupingPanel"),
   customGroups: document.querySelector("#customGroups"),
@@ -265,6 +269,7 @@ const els = {
   comparisonLabelEditor: document.querySelector("#comparisonLabelEditor"),
   comparisonChartPanel: document.querySelector("#comparisonChartPanel"),
   comparisonChartTitle: document.querySelector("#comparisonChartTitle"),
+  comparisonTitleInput: document.querySelector("#comparisonTitleInput"),
   comparisonChart: document.querySelector("#comparisonChart"),
   downloadComparisonChartButton: document.querySelector("#downloadComparisonChartButton"),
   downloadComparisonWorkbookButton: document.querySelector("#downloadComparisonWorkbookButton"),
@@ -285,18 +290,6 @@ const els = {
   replicateTestResult: document.querySelector("#replicateTestResult"),
   downloadReplicateChartButton: document.querySelector("#downloadReplicateChartButton"),
   downloadReplicateCsvButton: document.querySelector("#downloadReplicateCsvButton"),
-  linrangePanel: document.querySelector("#linrangePanel"),
-  linrangeLoadInputs: document.querySelector("#linrangeLoadInputs"),
-  linrangeR2: document.querySelector("#linrangeR2"),
-  checkLinrangeButton: document.querySelector("#checkLinrangeButton"),
-  linrangeResult: document.querySelector("#linrangeResult"),
-  linrangeChart: document.querySelector("#linrangeChart"),
-  linrangeSummary: document.querySelector("#linrangeSummary"),
-  downloadLinrangeChartButton: document.querySelector("#downloadLinrangeChartButton"),
-  linrangeBody: document.querySelector("#linrangeBody"),
-  linrangePlaceholder: document.querySelector("#linrangePlaceholder"),
-  linrangeSampleWrap: document.querySelector("#linrangeSampleWrap"),
-  linrangeSampleSelect: document.querySelector("#linrangeSampleSelect"),
 };
 
 let sharedSampleControls = [];
@@ -350,6 +343,8 @@ els.groupMode.addEventListener("change", () => {
 });
 els.groupSize.addEventListener("input", renderCurrentGrouping);
 els.labelEditor.addEventListener("input", updateSharedLaneLabel);
+els.graphTitleInput.addEventListener("input", updateGraphTitle);
+els.comparisonTitleInput.addEventListener("input", updateComparisonTitle);
 els.sampleTabs.addEventListener("click", selectSampleTab);
 els.customGroups.addEventListener("input", updateCustomGroups);
 els.customGroups.addEventListener("change", updateCustomGroups);
@@ -369,11 +364,6 @@ els.replicateLaneA?.addEventListener("change", renderReplicateTest);
 els.replicateLaneB?.addEventListener("change", renderReplicateTest);
 els.downloadReplicateChartButton?.addEventListener("click", () => downloadCanvasJpeg(els.replicateChart, "replicate-means.jpg"));
 els.downloadReplicateCsvButton?.addEventListener("click", downloadReplicateCsv);
-// Feature 5 — linear-range / dilution check (its own optional tab).
-els.linrangeSampleSelect?.addEventListener("change", handleLinrangeSampleChange);
-els.linrangeLoadInputs?.addEventListener("input", handleLinrangeLoadInput);
-els.checkLinrangeButton?.addEventListener("click", runLinrangeCheck);
-els.downloadLinrangeChartButton?.addEventListener("click", () => downloadCanvasJpeg(els.linrangeChart, "linear-range.jpg"));
 
 renderSharedSampleInputs(1);
 renderPairInputs(2);
@@ -393,6 +383,9 @@ function createAnalysisState(name, title, results, metadata = {}) {
   return {
     name,
     title,
+    // The generated title is kept so clearing the Graph title field can restore it. Both
+    // are per-analysis, so each sample tab carries its own title.
+    autoTitle: title,
     results,
     normalizationLane: metadata.normalizationLane || "",
     loadingControlAdjusted: metadata.loadingControlAdjusted !== false,
@@ -1196,6 +1189,11 @@ function invalidateAnalyses() {
   state.pairedAnalyses = [];
   state.comparisonCustomGroups = [];
   state.activeSampleIndex = 0;
+  // A custom title belongs to the run that produced it; new inputs get a fresh auto title.
+  // (Shared-mode titles reset for free, since their analyses are rebuilt.)
+  state.comparisonTitle = "";
+  if (els.comparisonTitleInput) els.comparisonTitleInput.value = "";
+  if (els.graphTitleInput) els.graphTitleInput.value = "";
 
   els.sampleTabsPanel.hidden = true;
   els.sampleTabs.innerHTML = "";
@@ -1207,7 +1205,6 @@ function invalidateAnalyses() {
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
   if (els.replicatePanel) els.replicatePanel.hidden = true;
-  renderLinrangePanel();
   state.replicateRows = [];
   els.comparisonLabelPanel.hidden = true;
   els.comparisonChartPanel.hidden = true;
@@ -1604,10 +1601,10 @@ function renderActiveSharedAnalysis() {
   els.chartTitle.textContent = analysis.title;
   drawBarChart(els.foldChart, analysis.results, analysis.title);
   renderResultTable(analysis.results);
+  renderGraphTitleField(analysis);
   renderLabelEditor(analysis.results);
   renderGroupedGraphs();
   renderReplicatePanel();
-  renderLinrangePanel();
   els.downloadChartButton.disabled = false;
   els.downloadCsvButton.disabled = false;
   els.downloadWorkbookButton.disabled = false;
@@ -1699,7 +1696,10 @@ function drawTitle(ctx, canvas, title) {
   ctx.font = themeFont(600, 19);
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
-  ctx.fillText(title, canvas.width / 2, 8);
+  // maxWidth condenses an over-long title instead of letting it spill past the canvas edge
+  // (titles are user-editable, so this is reachable). Condensing keeps every character
+  // visible, unlike clipping or an ellipsis.
+  ctx.fillText(title, canvas.width / 2, 8, canvas.width - 24);
 }
 
 function drawValueLabel(ctx, value, x, y) {
@@ -1866,39 +1866,6 @@ function gammaln(x) {
   return -tmp + Math.log(2.5066282746310005 * ser / x);
 }
 
-// ─── Feature 5: linear-range / dilution check (core math) ─────────────────────
-// Feed a dilution-series scan as points [{load, signal, saturatedPixels}]; this
-// reports the standard R² fit and the longest low-end span meeting r2Target that
-// contains no saturated lanes. (Standard regression — NOT LI-COR's proprietary
-// piecewise method.)
-function linearRegression(points) {
-  const n = points.length;
-  const sx = points.reduce((a, p) => a + p.load, 0);
-  const sy = points.reduce((a, p) => a + p.signal, 0);
-  const sxx = points.reduce((a, p) => a + p.load * p.load, 0);
-  const sxy = points.reduce((a, p) => a + p.load * p.signal, 0);
-  const syy = points.reduce((a, p) => a + p.signal * p.signal, 0);
-  const denom = n * sxx - sx * sx;
-  const slope = denom ? (n * sxy - sx * sy) / denom : NaN;
-  const rDen = Math.sqrt(denom * (n * syy - sy * sy));
-  const r = rDen ? (n * sxy - sx * sy) / rDen : NaN;
-  return { slope, intercept: (sy - slope * sx) / n, r2: r * r, n };
-}
-function linearRangeAnalysis(points, r2Target = 0.99) {
-  const sorted = [...points].sort((a, b) => a.load - b.load);
-  let linear = null;
-  for (let end = sorted.length; end >= 2; end--) {
-    const subset = sorted.slice(0, end);
-    if (subset.some((p) => (p.saturatedPixels || 0) > 0)) continue;
-    const fit = linearRegression(subset);
-    if (fit.r2 >= r2Target) {
-      linear = { ...fit, loadRange: [subset[0].load, subset[end - 1].load] };
-      break;
-    }
-  }
-  return { full: linearRegression(sorted), linear, saturatedCount: sorted.filter((p) => (p.saturatedPixels || 0) > 0).length };
-}
-
 // ─── Feature 3: replicate statistics UI ───────────────────────────────────────
 // Pools the loaded sample-file analyses (one replicate each) into per-lane
 // mean ± 95% CI, an error-bar chart, and an opt-in Welch t-test between two lanes.
@@ -2046,260 +2013,6 @@ function downloadReplicateCsv() {
   URL.revokeObjectURL(url);
 }
 
-// ─── Feature 5: linear-range / dilution check UI ──────────────────────────────
-// Lets the user enter the load per lane for the active sample and checks whether
-// signal stays proportional to load (standard OLS R², saturated lanes excluded).
-function guessLoadFromLabel(label) {
-  const match = String(label).match(/-?\d+(?:\.\d+)?/);
-  if (!match) return null;
-  const value = Number(match[0]);
-  return Number.isFinite(value) ? value : null;
-}
-
-// Lives in its own optional "Linear range" tab. The panel itself stays visible
-// while that tab is open; an inner body/placeholder switch reflects whether the
-// selected sample has enough data to check, so it never clutters the main results.
-function renderLinrangePanel() {
-  const panel = els.linrangePanel;
-  if (!panel) return;
-
-  const analyses = state.mode === "shared" ? state.sharedAnalyses : [];
-  renderLinrangeSampleSelect(analyses);
-
-  const analysis = activeAnalysis();
-  const rows = (state.mode === "shared" && analysis?.results) || [];
-  const ready = rows.length >= 3;
-
-  if (els.linrangeBody) els.linrangeBody.hidden = !ready;
-  if (els.linrangePlaceholder) {
-    els.linrangePlaceholder.hidden = ready;
-    if (!ready) els.linrangePlaceholder.textContent = linrangePlaceholderText(analyses.length, rows.length);
-  }
-  if (!ready) {
-    els.linrangeResult.hidden = true;
-    els.downloadLinrangeChartButton.disabled = true;
-    return;
-  }
-
-  analysis.linrangeLoads = analysis.linrangeLoads || {};
-  els.linrangeLoadInputs.innerHTML = rows
-    .map((row) => {
-      const label = row.displayLane || row.lane;
-      const stored = analysis.linrangeLoads[label];
-      const guess = stored !== undefined ? stored : guessLoadFromLabel(label);
-      const value = guess === null || guess === undefined ? "" : escapeHtml(String(guess));
-      return `
-        <label class="linrange-load">
-          <span>${escapeHtml(label)}</span>
-          <input type="number" step="any" min="0" data-linrange-lane="${escapeHtml(label)}"
-            value="${value}" placeholder="load" />
-        </label>`;
-    })
-    .join("");
-
-  // A fresh sample selection starts with no result shown until the user re-checks.
-  els.linrangeResult.hidden = true;
-  els.downloadLinrangeChartButton.disabled = true;
-}
-
-// The check runs on one shared-mode sample; let the user pick which from inside
-// this tab (the Quantification sample tabs are not visible here). Choosing a
-// sample here also makes it the active sample everywhere, keeping one source of
-// truth. Hidden when there is nothing to choose between.
-function renderLinrangeSampleSelect(analyses) {
-  const wrap = els.linrangeSampleWrap;
-  const select = els.linrangeSampleSelect;
-  if (!wrap || !select) return;
-  if (analyses.length <= 1) {
-    wrap.hidden = true;
-    select.innerHTML = "";
-    return;
-  }
-  wrap.hidden = false;
-  select.innerHTML = analyses
-    .map((analysis, index) => `<option value="${index}">${escapeHtml(analysis.name)}</option>`)
-    .join("");
-  select.value = String(Math.min(state.activeSampleIndex, analyses.length - 1));
-}
-
-function linrangePlaceholderText(sampleCount, laneCount) {
-  if (state.mode !== "shared") {
-    return "The linear-range check runs on a “Multiple samples, optional control” analysis. Switch modes in the Quantification tab and run an analysis first.";
-  }
-  if (!sampleCount) {
-    return "Run an analysis in the Quantification tab first, then come back here to check whether a dilution series stays linear.";
-  }
-  return `This check needs at least 3 lanes in the selected sample (found ${laneCount}). Load a dilution series to test linearity.`;
-}
-
-function handleLinrangeSampleChange(event) {
-  const index = Number(event.target.value);
-  if (!Number.isInteger(index) || index < 0 || index >= state.sharedAnalyses.length) return;
-  state.activeSampleIndex = index;
-  // Keep the Quantification sample tabs in sync; renderActiveSharedAnalysis then
-  // refreshes this panel via renderLinrangePanel.
-  renderSampleTabs();
-  renderActiveSharedAnalysis();
-}
-
-function handleLinrangeLoadInput(event) {
-  const input = event.target.closest("[data-linrange-lane]");
-  if (!input) return;
-  const analysis = activeAnalysis();
-  if (!analysis) return;
-  analysis.linrangeLoads = analysis.linrangeLoads || {};
-  const raw = input.value.trim();
-  if (raw === "") delete analysis.linrangeLoads[input.dataset.linrangeLane];
-  else analysis.linrangeLoads[input.dataset.linrangeLane] = raw;
-}
-
-function runLinrangeCheck() {
-  const analysis = activeAnalysis();
-  if (!analysis) return;
-  const r2Target = clampNumber(Number(els.linrangeR2.value), 0.5, 0.9999, 0.99);
-  els.linrangeR2.value = r2Target;
-
-  const points = [];
-  const skipped = [];
-  (analysis.results || []).forEach((row) => {
-    const label = row.displayLane || row.lane;
-    const loadRaw = (analysis.linrangeLoads || {})[label];
-    const load = Number(loadRaw);
-    if (loadRaw === undefined || loadRaw === "" || !Number.isFinite(load)) {
-      skipped.push(label);
-      return;
-    }
-    points.push({ label, load, signal: row.sampleSignal, saturatedPixels: Number(row.saturatedPixels) || 0 });
-  });
-
-  els.linrangeResult.hidden = false;
-  if (points.length < 3) {
-    els.linrangeSummary.innerHTML =
-      `<p class="linrange-warning">Enter a numeric load for at least 3 lanes (found ${points.length}).</p>`;
-    drawChartMessage(els.linrangeChart, "Need ≥ 3 lanes with a load value");
-    els.downloadLinrangeChartButton.disabled = true;
-    return;
-  }
-
-  const result = linearRangeAnalysis(points, r2Target);
-  renderLinrangeSummary(result, points, skipped, r2Target);
-  drawLinearRangeChart(els.linrangeChart, points, result);
-  els.downloadLinrangeChartButton.disabled = false;
-}
-
-function renderLinrangeSummary(result, points, skipped, r2Target) {
-  const { full, linear, saturatedCount } = result;
-  const parts = [
-    `<p><strong>All ${points.length} points:</strong> R² = ${formatNumber(full.r2)}, slope = ${formatNumber(full.slope)}.</p>`,
-  ];
-  if (linear) {
-    const [lo, hi] = linear.loadRange;
-    parts.push(
-      `<p class="linrange-ok"><strong>Linear range:</strong> load ${formatNumber(lo)}–${formatNumber(hi)} ` +
-        `(${linear.n} points), R² = ${formatNumber(linear.r2)} ≥ ${formatNumber(r2Target)}.</p>`,
-    );
-    if (linear.n === 2) {
-      parts.push(
-        `<p class="linrange-warning">Only 2 points define this range, so R² = 1 is trivial. ` +
-          "Add more load values to confirm linearity.</p>",
-      );
-    }
-  } else {
-    parts.push(
-      `<p class="linrange-warning">No span of unsaturated points reaches R² ≥ ${formatNumber(r2Target)}. ` +
-        "Signal may be outside its linear range — reduce load or exposure.</p>",
-    );
-  }
-  if (saturatedCount > 0) {
-    parts.push(
-      `<p class="linrange-warning">${saturatedCount} saturated lane${saturatedCount === 1 ? "" : "s"} excluded from the fit.</p>`,
-    );
-  }
-  if (skipped.length) {
-    parts.push(`<p class="muted-text">No load entered for: ${skipped.map(escapeHtml).join(", ")}.</p>`);
-  }
-  els.linrangeSummary.innerHTML = parts.join("");
-}
-
-function drawLinearRangeChart(canvas, points, result) {
-  const ctx = canvas.getContext("2d");
-  const padding = { top: 42, right: 32, bottom: 64, left: 84 };
-  const plotWidth = canvas.width - padding.left - padding.right;
-  const plotHeight = canvas.height - padding.top - padding.bottom;
-  const maxLoad = Math.max(...points.map((p) => p.load), 1) * 1.08;
-  const maxSignal = Math.max(...points.map((p) => p.signal), 1) * 1.12;
-  const xOf = (load) => padding.left + (load / maxLoad) * plotWidth;
-  const yOf = (signal) => padding.top + plotHeight - (signal / maxSignal) * plotHeight;
-
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = themeToken("--surface");
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.strokeStyle = themeToken("--border");
-  ctx.lineWidth = 1;
-  ctx.fillStyle = themeToken("--text-muted");
-  ctx.font = themeFont(500, 12, "--font-mono");
-  ctx.textAlign = "right";
-  ctx.textBaseline = "middle";
-  for (let i = 0; i <= 5; i += 1) {
-    const value = (maxSignal / 5) * i;
-    const y = yOf(value);
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(canvas.width - padding.right, y);
-    ctx.stroke();
-    ctx.fillText(value.toLocaleString(undefined, { maximumFractionDigits: 0 }), padding.left - 10, y);
-  }
-
-  const fit = result.linear || result.full;
-  if (fit && Number.isFinite(fit.slope)) {
-    ctx.strokeStyle = themeToken("--chart-series-2") || themeToken("--primary");
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(xOf(0), yOf(fit.intercept));
-    ctx.lineTo(xOf(maxLoad), yOf(fit.intercept + fit.slope * maxLoad));
-    ctx.stroke();
-  }
-
-  const linearRange = result.linear?.loadRange;
-  points.forEach((p) => {
-    const inLinear = linearRange && p.load >= linearRange[0] && p.load <= linearRange[1] && !p.saturatedPixels;
-    ctx.fillStyle = p.saturatedPixels > 0
-      ? themeToken("--danger")
-      : inLinear
-        ? themeToken("--chart-series-1")
-        : themeToken("--text-muted");
-    ctx.beginPath();
-    ctx.arc(xOf(p.load), yOf(p.signal), 5, 0, Math.PI * 2);
-    ctx.fill();
-  });
-
-  ctx.strokeStyle = themeToken("--text");
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(padding.left, padding.top);
-  ctx.lineTo(padding.left, padding.top + plotHeight);
-  ctx.lineTo(canvas.width - padding.right, padding.top + plotHeight);
-  ctx.stroke();
-
-  ctx.fillStyle = themeToken("--text-secondary");
-  ctx.font = themeFont(600, 12);
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  points.forEach((p) => ctx.fillText(String(p.load), xOf(p.load), padding.top + plotHeight + 8));
-
-  drawTitle(ctx, canvas, "Signal vs load");
-  ctx.fillStyle = themeToken("--text-muted");
-  ctx.font = themeFont(600, 12);
-  ctx.textAlign = "center";
-  ctx.fillText("Load", padding.left + plotWidth / 2, canvas.height - 18);
-  ctx.save();
-  ctx.translate(22, padding.top + plotHeight / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.fillText("Signal", 0, 0);
-  ctx.restore();
-}
-
 function renderResultTable(rows) {
   els.resultTableBody.innerHTML = rows
     .map(
@@ -2338,6 +2051,25 @@ function updateSharedLaneLabel(event) {
   drawBarChart(els.foldChart, analysis.results, analysis.title);
   renderResultTable(analysis.results);
   renderGroupedGraphs();
+}
+
+// Shows the active analysis's title, with the generated one as the placeholder so it is
+// obvious what clearing the field falls back to. Called on every tab switch, since the
+// title is per-analysis.
+function renderGraphTitleField(analysis) {
+  if (!els.graphTitleInput) return;
+  els.graphTitleInput.value = analysis.title === analysis.autoTitle ? "" : analysis.title;
+  els.graphTitleInput.placeholder = analysis.autoTitle || "";
+}
+
+function updateGraphTitle(event) {
+  const analysis = activeAnalysis();
+  if (!analysis) return;
+  // Blank restores the generated title rather than leaving the chart untitled. The canvas
+  // title is redrawn here so the exported JPG matches what is on screen.
+  analysis.title = event.target.value.trim() || analysis.autoTitle;
+  els.chartTitle.textContent = analysis.title;
+  drawBarChart(els.foldChart, analysis.results, analysis.title);
 }
 
 function renderGroupedGraphs() {
@@ -2594,19 +2326,61 @@ function updateComparisonLaneLabel(event) {
   renderComparisonChart();
 }
 
+// The generated title tracks the chart type, matching what the draw functions used as their
+// own defaults — so an unedited chart exports exactly the same text as before.
+function comparisonAutoTitle() {
+  return els.comparisonChartType.value === "points"
+    ? "Average with individual points"
+    : "Grouped bar comparison";
+}
+
+function currentComparisonTitle() {
+  return state.comparisonTitle || comparisonAutoTitle();
+}
+
+// One title feeds both the heading and the canvas; they used to disagree (the heading said
+// "Common lane comparison" while the exported JPG said "Grouped bar comparison").
+function drawComparisonInto(canvas, rows, title) {
+  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
+  if (els.comparisonChartType.value === "points") {
+    drawAveragePointChart(canvas, rows, seriesNames, title);
+  } else {
+    drawGroupedComparisonChart(canvas, rows, seriesNames, title);
+  }
+}
+
+function renderComparisonTitleField() {
+  if (!els.comparisonTitleInput) return;
+  els.comparisonTitleInput.value = state.comparisonTitle;
+  els.comparisonTitleInput.placeholder = comparisonAutoTitle();
+}
+
+function updateComparisonTitle(event) {
+  state.comparisonTitle = event.target.value.trim();
+  if (!state.pairedAnalyses.length) return;
+  let rows;
+  try {
+    rows = buildComparisonRows();
+  } catch {
+    return;   // renderComparisonChart owns error reporting; a keystroke shouldn't throw
+  }
+  // With no shared lanes the heading carries a status message, not a title — leave it.
+  if (!rows.length) return;
+  const title = currentComparisonTitle();
+  els.comparisonChartTitle.textContent = title;
+  drawComparisonInto(els.comparisonChart, rows, title);
+  // Grouped graphs below are titled by group name, so they need no redraw here.
+}
+
 function renderComparisonChart() {
   if (!state.pairedAnalyses.length) return false;
   try {
     const rows = buildComparisonRows();
-    els.comparisonChartTitle.textContent = rows.length
-      ? "Common lane comparison"
-      : "No shared lane labels found";
+    renderComparisonTitleField();   // keeps the placeholder in step with the chart type
+    const title = currentComparisonTitle();
+    els.comparisonChartTitle.textContent = rows.length ? title : "No shared lane labels found";
 
-    if (els.comparisonChartType.value === "points") {
-      drawAveragePointChart(els.comparisonChart, rows, state.pairedAnalyses.map((analysis) => analysis.name));
-    } else {
-      drawGroupedComparisonChart(els.comparisonChart, rows, state.pairedAnalyses.map((analysis) => analysis.name));
-    }
+    drawComparisonInto(els.comparisonChart, rows, title);
 
     els.downloadComparisonChartButton.disabled = false;
     els.downloadComparisonWorkbookButton.disabled = false;
@@ -2686,7 +2460,6 @@ function renderComparisonGroupSummary(groups) {
 }
 
 function renderComparisonMiniCharts(groups) {
-  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
   els.comparisonGroupedCharts.innerHTML = groups
     .map(
       (group, index) => `
@@ -2699,13 +2472,9 @@ function renderComparisonMiniCharts(groups) {
     )
     .join("");
 
+  // Each grouped graph is titled by its group name, independent of the main chart title.
   groups.forEach((group, index) => {
-    const canvas = document.querySelector(`#comparisonGroupChart${index}`);
-    if (els.comparisonChartType.value === "points") {
-      drawAveragePointChart(canvas, group.rows, seriesNames, group.name);
-    } else {
-      drawGroupedComparisonChart(canvas, group.rows, seriesNames, group.name);
-    }
+    drawComparisonInto(document.querySelector(`#comparisonGroupChart${index}`), group.rows, group.name);
   });
 }
 
@@ -3300,7 +3069,6 @@ function showSharedError(message) {
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
   if (els.replicatePanel) els.replicatePanel.hidden = true;
-  renderLinrangePanel();
 }
 
 function downloadGeneratedChart(event) {
@@ -3417,12 +3185,9 @@ document.querySelectorAll(".main-tab-button").forEach(button => {
     const tab = button.dataset.mainTab;
     document.getElementById("tabQuantification").hidden = tab !== "quantification";
     document.getElementById("tabBlotBrowser").hidden = tab !== "blot-browser";
-    document.getElementById("tabLinearRange").hidden = tab !== "linear-range";
 
     // Loaded blots should be the first thing shown when entering the browser.
     if (tab === "blot-browser") setBlotAnalysisTab("loaded");
-    // Refresh the linear-range check against the current analysis when entering.
-    if (tab === "linear-range") renderLinrangePanel();
   });
 });
 
@@ -3498,6 +3263,10 @@ function createCanvasState() {
     // are detected. lanes are full-height composite-space columns [{x, w}].
     laneEdit: null,           // { lanes:[{x,w}], profile:[...], imageWidth, selected:number|null }
     laneDrag: null,           // { kind:'move'|'resize-l'|'resize-r'|'new', index, grabX } during a drag
+    // Mouse resize (handle) / move (body) of a drawn box. Holds the grab point and the
+    // box's geometry as of the press, so every pointermove recomputes from the original
+    // rect rather than accumulating deltas (which drifts).
+    boxDrag: null,            // { index, kind:'nw'|…|'w'|'move', grabX, grabY, startX, startY, startW, startH }
   };
 }
 
@@ -4264,7 +4033,7 @@ function blotViewerHtml() {
   return `
     <div class="blot-viewer">
       <div class="blot-canvas-wrap">
-        <p class="visually-hidden" id="blotCanvasInstructions">Use pointer drag to pan or draw. Keyboard users can press A to add a centered box, arrow keys to move the selected box, plus or minus to zoom, and Delete to remove it.</p>
+        <p class="visually-hidden" id="blotCanvasInstructions">Use pointer drag to pan or draw. In pan mode, drag a box to move it, or drag any of the eight square handles on the selected box's edges and corners to resize it. Keyboard users can press A to add a centered box, arrow keys to move the selected box, plus or minus to zoom, and Delete to remove it.</p>
         <canvas id="blotCanvas" tabindex="0" aria-describedby="blotCanvasInstructions" aria-label="Interactive blot image viewer"></canvas>
       </div>
     </div>
@@ -4277,19 +4046,10 @@ function renderBlotAnalysis(blotId) {
   if (toolsPanel) {
     toolsPanel.innerHTML = `
       <div class="blot-controls-bar">
-        ${analysisSectionHtml("Measurement", blotModeControlsHtml(), { hint: "affects results", open: true })}
-        ${analysisSectionHtml(
-          "Display",
-          channelAdjustmentControlsHtml("red", "700") + channelAdjustmentControlsHtml("green", "800"),
-          { hint: "view only" },
-        )}
+        ${analysisSectionHtml("Background", backgroundControlsHtml())}
+        ${analysisSectionHtml("Display", displayControlsHtml())}
         ${analysisSectionHtml("Boxes", boxToolControlsHtml(), { open: true })}
-        ${analysisSectionHtml("Detect bands", detectionControlsHtml(), { hint: "auto", id: "detectionSection" })}
-        ${analysisSectionHtml("Selected box", boxLayoutControlsHtml(), {
-          id: "selectedBoxSection",
-          open: true,
-          hidden: true,
-        })}
+        ${analysisSectionHtml("Detect bands", detectionControlsHtml(), { id: "detectionSection" })}
       </div>
     `;
   }
@@ -4336,11 +4096,10 @@ function setBlotAnalysisTab(tabName) {
 }
 
 // Wraps a group of analysis controls in a collapsible <details> section so the
-// panel reads as a few labelled headers instead of one long flat list. `hidden`
-// keeps a section (e.g. "Selected box") out of the DOM flow until it's relevant.
-function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = "", hidden = false } = {}) {
+// panel reads as a few labelled headers instead of one long flat list.
+function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = "" } = {}) {
   return `
-    <details class="blot-control-section"${id ? ` id="${id}"` : ""}${open ? " open" : ""}${hidden ? " hidden" : ""}>
+    <details class="blot-control-section"${id ? ` id="${id}"` : ""}${open ? " open" : ""}>
       <summary class="blot-section-summary">
         <span class="blot-section-title">${title}</span>
         ${hint ? `<span class="blot-section-hint">${hint}</span>` : ""}
@@ -4353,22 +4112,14 @@ function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = ""
   `;
 }
 
-function blotModeControlsHtml() {
+// Which strips flanking each box get sampled as its background reference, how wide they
+// are, and how they are reduced to one number. All three feed currentBackgroundConfig(),
+// so they change the measured signal — they are not view-only settings.
+function backgroundControlsHtml() {
   return `
     <div class="blot-control-group">
-      <label>Color mode
-        <select id="colorMode">
-          <option value="color">Red / Green</option>
-          <option value="grayscale">Black & White</option>
-        </select>
-      </label>
-      <label>Quantify channel
-        <select id="quantChannel">
-          <option value="700">700nm</option>
-          <option value="800">800nm</option>
-        </select>
-      </label>
-      <label>Background
+      <p class="control-hint">Sampled from strips just outside each box, then subtracted from its signal. The dotted outlines on the image show exactly what gets measured.</p>
+      <label>Sides
         <select id="backgroundAxis">
           <option value="leftright">Left & Right</option>
           <option value="topbottom">Top & Bottom</option>
@@ -4414,16 +4165,46 @@ function channelAdjustmentControlsHtml(colorClass, channel) {
 function boxToolControlsHtml() {
   return `
     <div class="blot-control-group">
-      <label>Mode
-        <div class="mode-toggle">
-          <button class="mode-button active" id="modePan" type="button">Pan</button>
-          <button class="mode-button" id="modeDraw" type="button">Draw</button>
-        </div>
+      <label>Quantify channel
+        <select id="quantChannel">
+          <option value="700">700nm</option>
+          <option value="800">800nm</option>
+        </select>
       </label>
-      <button class="ghost-button" id="addCenteredBoxButton" type="button">Add centered box</button>
+      <div class="mode-toggle">
+        <button class="mode-button" id="modeDraw" type="button" aria-pressed="false">Draw</button>
+      </div>
       <button class="ghost-button" id="extractSignalsButton" type="button">Refresh signals</button>
       <button class="ghost-button" id="clearBoxesButton" type="button">Clear all</button>
-      <label class="straighten-control">Straighten <span class="straighten-value" id="straightenValue">0°</span>
+    </div>
+  `;
+}
+
+// Mostly view-only, with two exceptions. Pan is one half of the canvas mode toggle — Draw
+// is the other half and lives under "Boxes"; setCanvasMode() keeps them mutually exclusive
+// wherever they are rendered. Rotate is the other: its angle is sent to /render-composite,
+// /detect-bands and /extract alike, so the rotated view and the measured native pixels
+// always agree — but rotate BEFORE drawing or detecting boxes, since rotating afterwards
+// shifts the image underneath them.
+function displayControlsHtml() {
+  return `
+    <div class="blot-control-group">
+      <div class="mode-toggle">
+        <button class="mode-button active" id="modePan" type="button" aria-pressed="true">Pan</button>
+      </div>
+    </div>
+    <div class="blot-control-group">
+      <label>Color mode
+        <select id="colorMode">
+          <option value="color">Red / Green</option>
+          <option value="grayscale">Black & White</option>
+        </select>
+      </label>
+    </div>
+    ${channelAdjustmentControlsHtml("red", "700")}
+    ${channelAdjustmentControlsHtml("green", "800")}
+    <div class="blot-control-group">
+      <label class="straighten-control">Rotate <span class="straighten-value" id="straightenValue">0°</span>
         <input type="range" id="straightenSlider" min="-15" max="15" step="0.5" value="0" />
         <span class="straighten-actions">
           <button class="ghost-button" id="autoStraightenButton" type="button">Auto</button>
@@ -4437,7 +4218,7 @@ function boxToolControlsHtml() {
 function detectionControlsHtml() {
   return `
     <div class="blot-control-group detection-tools">
-      <p class="detection-hint">Find candidate band boxes automatically, preview a set on the image, then add them. Detection runs on the current <strong>Quantify channel</strong>.</p>
+      <p class="detection-hint">Find candidate band boxes automatically, tune <strong>Sensitivity</strong> until the preview looks right, then add them. Detection runs on the current <strong>Quantify channel</strong>.</p>
       <div class="detection-actions">
         <button class="primary-button" id="detectBandsButton" type="button">Detect bands</button>
         <label class="detection-replace">
@@ -4447,52 +4228,6 @@ function detectionControlsHtml() {
       </div>
       <p class="detection-status" id="detectionStatus" role="status" aria-live="polite"></p>
       <div class="detection-results" id="detectionResults" hidden></div>
-    </div>
-  `;
-}
-
-function boxLayoutControlsHtml() {
-  return `
-    <div class="blot-control-group box-layout-tools">
-      <span class="channel-label">Box layout</span>
-      <p class="box-selected-status" id="selectedBoxStatus">Select a box below.</p>
-      <div class="box-tool-row">
-        <label>Copies
-          <input id="duplicateBoxCount" type="number" min="1" max="48" step="1" value="1" />
-        </label>
-        <label>Gap px
-          <input id="duplicateBoxGap" type="number" min="-2000" max="2000" step="1" value="8" />
-        </label>
-        <label>Direction
-          <select id="duplicateBoxDirection">
-            <option value="right">Right</option>
-            <option value="left">Left</option>
-            <option value="down">Down</option>
-            <option value="up">Up</option>
-          </select>
-        </label>
-        <button class="ghost-button box-button" id="duplicateBoxButton" type="button">Duplicate</button>
-      </div>
-      <div class="box-button-grid" aria-label="Align boxes to selected box">
-        <button class="ghost-button box-button" type="button" data-box-align="left">Left</button>
-        <button class="ghost-button box-button" type="button" data-box-align="centerX">Center X</button>
-        <button class="ghost-button box-button" type="button" data-box-align="right">Right</button>
-        <button class="ghost-button box-button" type="button" data-box-align="top">Top</button>
-        <button class="ghost-button box-button" type="button" data-box-align="centerY">Center Y</button>
-        <button class="ghost-button box-button" type="button" data-box-align="bottom">Bottom</button>
-      </div>
-      <div class="box-tool-row">
-        <button class="ghost-button box-button" id="matchBoxSizeButton" type="button">Match size</button>
-        <label>Step px
-          <input id="boxNudgeStep" type="number" min="1" max="100" step="1" value="1" />
-        </label>
-        <div class="box-nudge-grid" aria-label="Nudge selected box">
-          <button class="ghost-button box-button" type="button" data-box-nudge="0,-1" aria-label="Nudge box up">&uarr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="-1,0" aria-label="Nudge box left">&larr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="1,0" aria-label="Nudge box right">&rarr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="0,1" aria-label="Nudge box down">&darr;</button>
-        </div>
-      </div>
     </div>
   `;
 }
@@ -4516,31 +4251,33 @@ function bindBlotViewerControls(blotId) {
       if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
     });
   });
-  document.getElementById("duplicateBoxButton")?.addEventListener("click", () => duplicateSelectedBox(blotId));
-  document.getElementById("matchBoxSizeButton")?.addEventListener("click", () => matchBoxesToSelectedSize(blotId));
-  document.getElementById("addCenteredBoxButton")?.addEventListener("click", () => addCenteredBox(blotId));
-  document.querySelectorAll("[data-box-align]").forEach(button => {
-    button.addEventListener("click", () => alignBoxesToSelected(button.dataset.boxAlign, blotId));
-  });
-  document.querySelectorAll("[data-box-nudge]").forEach(button => {
-    button.addEventListener("click", () => {
-      const [dx, dy] = button.dataset.boxNudge.split(",").map(Number);
-      nudgeSelectedBox(dx, dy, blotId);
-    });
-  });
-  // Band detection: one delegated handler covers the Detect button plus the candidate
-  // chooser / accept / cancel / re-detect controls that renderDetectionResults() injects.
+  // Band detection: one delegated handler covers the Detect button plus the accept /
+  // cancel / re-detect controls that renderDetectionResults() injects, and a second covers
+  // the two injected sliders (lane split in stage A, sensitivity in stage B).
   const detectionSection = document.getElementById("detectionSection");
   detectionSection?.addEventListener("click", (event) => handleDetectionClick(event, blotId));
   detectionSection?.addEventListener("input", (event) => {
     if (event.target?.id === "laneThresholdSlider") onLaneThresholdSliderInput(event, blotId);
+    else if (event.target?.id === "sensitivitySlider") onSensitivitySliderInput(event);
   });
-  // Detection is channel-specific; a stale chooser (counts/preview for the old channel)
-  // would be misleading, so clear it when the Quantify channel changes.
-  document.getElementById("quantChannel")?.addEventListener("change", () => {
-    if (canvasState.detection && canvasState.currentBlotId === blotId) cancelDetection(blotId);
+  // Detection is channel-specific end to end: the lane profile and every candidate set are
+  // derived from the selected channel's TIF, so whatever is on screen goes stale the moment
+  // the channel changes. The two stages need different handling:
+  //   Stage B (candidate chooser) — clear it. Those boxes and counts measured the old
+  //     channel, and committing them would silently mix channels.
+  //   Stage A (lane editing) — re-detect at the current threshold instead of clearing, so a
+  //     channel switch doesn't eject the user from the editor. Note that the threshold is an
+  //     absolute cut on a per-channel profile, so the same number legitimately yields a
+  //     different split here; the status line says why the lanes moved.
+  document.getElementById("quantChannel")?.addEventListener("change", (event) => {
+    if (canvasState.currentBlotId !== blotId) return;
+    if (canvasState.detection) {
+      cancelDetection(blotId);
+    } else if (canvasState.laneEdit) {
+      const channel = event.target?.value === "800" ? "800" : "700";
+      void redetectLanesAtThreshold(blotId, { note: `Quantify channel is now ${channel}nm.` });
+    }
   });
-  updateBoxToolState();
 }
 
 // ─── Blot canvas engine ───────────────────────────────────────────────────────
@@ -4560,6 +4297,7 @@ function initCanvas(blotId) {
   canvasState.laneThreshold = null;
   canvasState.laneEdit = null;
   canvasState.laneDrag = null;
+  canvasState.boxDrag = null;
 
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
@@ -4584,7 +4322,11 @@ function initCanvas(blotId) {
 
   // Wire up mode buttons
   document.getElementById("modePan")?.addEventListener("click", () => setCanvasMode("pan"));
-  document.getElementById("modeDraw")?.addEventListener("click", () => setCanvasMode("draw"));
+  // Draw toggles: on -> draw, off -> back to pan. From the lanes editor it always turns on
+  // (setCanvasMode closes the editor), rather than needing two clicks.
+  document.getElementById("modeDraw")?.addEventListener("click", () => {
+    setCanvasMode(canvasState.mode === "draw" ? "pan" : "draw");
+  });
   document.getElementById("clearBoxesButton")?.addEventListener("click", () => {
     canvasState.boxes = [];
     canvasState.selectedBoxIndex = null;
@@ -4599,6 +4341,10 @@ function initCanvas(blotId) {
   canvas.addEventListener("pointermove", onMouseMove);
   canvas.addEventListener("pointerup", onPointerUp);
   canvas.addEventListener("pointercancel", cancelPointerInteraction);
+  // Leaving the canvas mid-hover would otherwise strand a resize cursor on it.
+  canvas.addEventListener("pointerleave", (event) => {
+    if (!canvasState.boxDrag) setCanvasDragCursor(event.currentTarget, null);
+  });
   canvas.addEventListener("wheel", onWheel, { passive: false });
   canvas.addEventListener("keydown", onCanvasKeyDown);
 }
@@ -4616,8 +4362,16 @@ function setCanvasMode(mode) {
   const canvas = document.getElementById("blotCanvas");
   canvas?.classList.toggle("draw-mode", mode === "draw");
   canvas?.classList.toggle("lanes-mode", mode === "lanes");
-  document.getElementById("modePan")?.classList.toggle("active", mode === "pan");
-  document.getElementById("modeDraw")?.classList.toggle("active", mode === "draw");
+  // A resize cursor left over from hovering a handle would outrank the new mode's cursor.
+  if (canvas) setCanvasDragCursor(canvas, null);
+  // Draw is a toggle button and Pan reflects the same one bit of state, so both carry
+  // aria-pressed rather than relying on a visual .active class alone.
+  [["modePan", "pan"], ["modeDraw", "draw"]].forEach(([id, forMode]) => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.classList.toggle("active", mode === forMode);
+    button.setAttribute("aria-pressed", String(mode === forMode));
+  });
 }
 
 function cancelPendingCanvasImageLoad() {
@@ -4820,7 +4574,7 @@ async function autoStraighten(blotId) {
     const suggested = Number(result?.suggestedRotationDeg);
     setStraighten(Number.isFinite(suggested) ? suggested : 0, blotId);
   } catch (error) {
-    showUserMessage(error.message || "Could not estimate a straighten angle.");
+    showUserMessage(error.message || "Could not estimate a rotation angle.");
   } finally {
     if (button) button.disabled = false;
   }
@@ -4888,10 +4642,26 @@ function requestRender() {
 // Boxes come back from the backend in COMPOSITE coordinates (canvasState.imageWidth/
 // Height space) — the same space the user draws in — so a detected box drops straight
 // into createCanvasBox() with no remapping, and committed boxes flow through the exact
-// extractSignalsForBoxes() path a hand-drawn box uses. The chooser lets the user pick
-// among sensitivity sets (conservative/balanced/aggressive) and preview one before
-// committing; an advanced lane-split slider re-thresholds lanes live from the returned
-// laneProfile (no round-trip) and can re-detect bands at the chosen split.
+// extractSignalsForBoxes() path a hand-drawn box uses. All sensitivity sets come back in
+// one response, so the Sensitivity slider switches the preview between them locally (no
+// round-trip) before committing; an advanced lane-split slider re-thresholds lanes live
+// from the returned laneProfile and can re-detect bands at the chosen split.
+
+// Ascending sensitivity, left → right on the Sensitivity slider. The backend already emits
+// its levels in this order, but sort by this rank anyway so the slider stays monotone even
+// if the response order changes. Unknown ids sort after the known ones.
+const SENSITIVITY_ORDER = ["conservative", "balanced", "aggressive"];
+
+function sensitivityRank(id) {
+  const index = SENSITIVITY_ORDER.indexOf(id);
+  return index === -1 ? SENSITIVITY_ORDER.length : index;
+}
+
+function candidateMetaText(candidate) {
+  const lanes = `${candidate.laneCount} lane${candidate.laneCount === 1 ? "" : "s"}`;
+  const bands = `${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}`;
+  return `${lanes} · ${bands}${candidate.truncated ? " · capped" : ""}`;
+}
 
 function setDetectionStatus(message, isError = false) {
   const status = document.getElementById("detectionStatus");
@@ -5019,10 +4789,19 @@ function onLaneThresholdSliderInput(event, blotId) {
   laneThresholdTimer = setTimeout(() => { void redetectLanesAtThreshold(blotId); }, 250);
 }
 
-async function redetectLanesAtThreshold(blotId) {
+// `note` prefixes the status line when something other than the slider triggered this (a
+// channel switch), so a lane split that visibly jumps has a stated cause.
+async function redetectLanesAtThreshold(blotId, { note = "" } = {}) {
   if (!canvasState.laneEdit) return;
+  // Any re-detect supersedes a pending debounced one — /detect-bands is rate limited
+  // (15/min), so a duplicate request for the same split is worth avoiding.
+  if (laneThresholdTimer) {
+    clearTimeout(laneThresholdTimer);
+    laneThresholdTimer = null;
+  }
+  const prefix = note ? `${note} ` : "";
   const requestId = ++detectionRequestId;
-  setDetectionStatus("Re-detecting lanes…");
+  setDetectionStatus(`${prefix}Re-detecting lanes…`);
   try {
     const result = await detectBands(blotId, {
       stage: "lanes",
@@ -5035,7 +4814,7 @@ async function redetectLanesAtThreshold(blotId) {
     renderCanvas();
     renderLaneEditor(blotId);
     const n = canvasState.laneEdit.lanes.length;
-    setDetectionStatus(`${n} lane${n === 1 ? "" : "s"}. Adjust further or detect bands.`);
+    setDetectionStatus(`${prefix}${n} lane${n === 1 ? "" : "s"}. Adjust further or detect bands.`);
   } catch (error) {
     if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
       setDetectionStatus(error.message || "Lane detection failed.", true);
@@ -5096,9 +4875,11 @@ async function detectBandsInLanes(blotId) {
 }
 
 function applyDetectionResult(result, blotId) {
-  const candidates = Array.isArray(result?.candidates)
+  // Sorted least → most sensitive so the slider's left-to-right travel means "more bands".
+  const candidates = (Array.isArray(result?.candidates)
     ? result.candidates.filter(c => c && Array.isArray(c.boxes))
-    : [];
+    : []
+  ).sort((a, b) => sensitivityRank(a.id) - sensitivityRank(b.id));
   canvasState.detection = {
     laneProfile: Array.isArray(result?.laneProfile) ? result.laneProfile : [],
     lanes: Array.isArray(result?.lanes) ? result.lanes : [],
@@ -5124,7 +4905,9 @@ function applyDetectionResult(result, blotId) {
   canvasState.detection.activeId = preferred.id;
   renderDetectionResults(blotId);
   previewDetectionCandidate(preferred);
-  setDetectionStatus(`Found ${candidates.length} set${candidates.length === 1 ? "" : "s"}. Previewing “${preferred.label}”. Pick one, then Add boxes.`);
+  setDetectionStatus(candidates.length > 1
+    ? `Previewing “${preferred.label}”. Drag Sensitivity to compare, then Add boxes.`
+    : `Previewing “${preferred.label}”. Add boxes when it looks right.`);
 }
 
 function renderDetectionResults(blotId) {
@@ -5137,22 +4920,29 @@ function renderDetectionResults(blotId) {
     return;
   }
 
-  // Labels/ids are backend-derived enums, but escape defensively — this is innerHTML.
-  const candidateButtons = detection.candidates.map(candidate => {
-    const isActive = candidate.id === detection.activeId;
-    const lanes = `${candidate.laneCount} lane${candidate.laneCount === 1 ? "" : "s"}`;
-    const bands = `${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}`;
-    const meta = `${lanes} · ${bands}${candidate.truncated ? " · capped" : ""}`;
-    return `
-      <button type="button" class="detection-candidate${isActive ? " active" : ""}"
-              data-candidate-id="${escapeHtml(String(candidate.id))}" aria-pressed="${isActive}">
-        <span class="detection-candidate-name">${escapeHtml(String(candidate.label || candidate.id))}</span>
-        <span class="detection-candidate-meta">${escapeHtml(meta)}</span>
-      </button>`;
-  }).join("");
+  // One discrete stop per returned set, least → most sensitive. Labels/ids are backend-
+  // derived enums, but escape defensively — this is innerHTML.
+  const candidates = detection.candidates;
+  const activeIndex = Math.max(0, candidates.findIndex(c => c.id === detection.activeId));
+  const active = candidates[activeIndex];
+  const activeLabel = String(active.label || active.id);
+  const ticks = candidates
+    .map(c => `<span>${escapeHtml(String(c.label || c.id))}</span>`)
+    .join("");
 
   container.innerHTML = `
-    <div class="detection-candidates" role="group" aria-label="Detected band sets">${candidateButtons}</div>
+    <div class="detection-sensitivity">
+      <label class="detection-slider">
+        <span class="detection-slider-head">Sensitivity
+          <span class="detection-sensitivity-name" id="sensitivityName">${escapeHtml(activeLabel)}</span>
+        </span>
+        <input type="range" id="sensitivitySlider" min="0" max="${candidates.length - 1}" step="1"
+               value="${activeIndex}" aria-valuetext="${escapeHtml(activeLabel)}"
+               ${candidates.length > 1 ? "" : "disabled"} />
+      </label>
+      <div class="detection-slider-ticks" aria-hidden="true">${ticks}</div>
+      <span class="detection-candidate-meta" id="sensitivityMeta">${escapeHtml(candidateMetaText(active))}</span>
+    </div>
     <div class="detection-commit">
       <button type="button" class="primary-button" id="acceptDetectionButton">Add boxes</button>
       <button type="button" class="ghost-button" id="backToLanesButton">Back to lanes</button>
@@ -5168,26 +4958,44 @@ function activeDetectionCandidate() {
   return detection.candidates.find(c => c.id === detection.activeId) || null;
 }
 
+// Slider stop -> candidate. Every set is already in hand, so switching is a local preview
+// redraw with no request; the slider can be dragged freely.
+function onSensitivitySliderInput(event) {
+  const candidates = canvasState.detection?.candidates;
+  if (!candidates) return;
+  const candidate = candidates[Number(event.target.value)];
+  if (candidate) selectDetectionCandidate(candidate.id);
+}
+
 function selectDetectionCandidate(id) {
   const detection = canvasState.detection;
   if (!detection) return;
   const candidate = detection.candidates.find(c => c.id === id);
   if (!candidate) return;
   detection.activeId = id;
-  // Toggle active state in place rather than rebuilding the results DOM — cheaper, and it
-  // avoids flicker while switching sets.
-  updateActiveCandidateButtons();
+  // Update the readout in place rather than rebuilding the results DOM — cheaper, avoids
+  // flicker, and (crucially) doesn't replace the slider the user is mid-drag on.
+  updateSensitivityReadout();
   previewDetectionCandidate(candidate);
   setDetectionStatus(`Previewing “${candidate.label}” — ${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}.`);
 }
 
-function updateActiveCandidateButtons() {
-  const activeId = canvasState.detection?.activeId;
-  document.querySelectorAll("#detectionResults [data-candidate-id]").forEach(button => {
-    const isActive = button.dataset.candidateId === activeId;
-    button.classList.toggle("active", isActive);
-    button.setAttribute("aria-pressed", String(isActive));
-  });
+function updateSensitivityReadout() {
+  const detection = canvasState.detection;
+  if (!detection) return;
+  const index = detection.candidates.findIndex(c => c.id === detection.activeId);
+  const candidate = detection.candidates[index];
+  if (!candidate) return;
+  const slider = document.getElementById("sensitivitySlider");
+  if (slider) {
+    // Only write back when it differs — keyboard/drag input already moved the thumb.
+    if (slider.value !== String(index)) slider.value = String(index);
+    slider.setAttribute("aria-valuetext", String(candidate.label || candidate.id));
+  }
+  const name = document.getElementById("sensitivityName");
+  if (name) name.textContent = String(candidate.label || candidate.id);
+  const meta = document.getElementById("sensitivityMeta");
+  if (meta) meta.textContent = candidateMetaText(candidate);
 }
 
 function previewDetectionCandidate(candidate) {
@@ -5325,12 +5133,174 @@ function updateLaneDrag(imgX) {
   clampLane(lane, imgW);
 }
 
-function handleDetectionClick(event, blotId) {
-  const candidateButton = event.target.closest("[data-candidate-id]");
-  if (candidateButton) {
-    selectDetectionCandidate(candidateButton.dataset.candidateId);
+// ── Box resize / move on the canvas ─────────────────────────────────────────────
+// The selected box gets 8 grab handles (4 corners + 4 edge midpoints) for resizing, and
+// its body drags to move. Sizes below are SCREEN px and divided by canvasState.zoom at
+// use, so a handle stays the same physical size — and stays grabbable — at any zoom.
+const BOX_HANDLE_GRAB_PX = 7;
+const BOX_HANDLE_DRAW_PX = 6;
+const MIN_BOX_SIZE_PX = 2;   // image px; a box can't be dragged smaller than this
+
+// Cursor hints, as classes — this app sets no inline styles anywhere.
+const DRAG_CURSOR_CLASS = {
+  nw: "resize-nwse", se: "resize-nwse",
+  ne: "resize-nesw", sw: "resize-nesw",
+  n: "resize-ns", s: "resize-ns",
+  e: "resize-ew", w: "resize-ew",
+  move: "cursor-move",
+};
+const DRAG_CURSOR_CLASSES = ["resize-nwse", "resize-nesw", "resize-ns", "resize-ew", "cursor-move"];
+
+// Handle anchor points, keyed by the edges each one moves ("nw" moves top + left).
+function boxHandlePoints(box) {
+  const midX = box.x + box.w / 2;
+  const midY = box.y + box.h / 2;
+  const right = box.x + box.w;
+  const bottom = box.y + box.h;
+  return [
+    { kind: "nw", x: box.x, y: box.y },
+    { kind: "ne", x: right, y: box.y },
+    { kind: "se", x: right, y: bottom },
+    { kind: "sw", x: box.x, y: bottom },
+    { kind: "n", x: midX, y: box.y },
+    { kind: "e", x: right, y: midY },
+    { kind: "s", x: midX, y: bottom },
+    { kind: "w", x: box.x, y: midY },
+  ];
+}
+
+// Handles belong to the selected box only — 8 per box would be unreadable on a blot with
+// 20 of them. boxHandlePoints lists corners first so a corner wins where its grab square
+// overlaps an edge handle's on a small box.
+function boxHandleHitTest(imgX, imgY) {
+  const index = canvasState.selectedBoxIndex;
+  const box = Number.isInteger(index) ? canvasState.boxes[index] : null;
+  if (!box) return null;
+  const grab = BOX_HANDLE_GRAB_PX / canvasState.zoom;
+  const point = boxHandlePoints(box).find(
+    p => Math.abs(imgX - p.x) <= grab && Math.abs(imgY - p.y) <= grab,
+  );
+  return point ? { kind: point.kind, index } : null;
+}
+
+// Topmost box containing the point (later boxes draw over earlier ones, so search back).
+function boxBodyHitTest(imgX, imgY) {
+  for (let i = canvasState.boxes.length - 1; i >= 0; i -= 1) {
+    const box = canvasState.boxes[i];
+    if (imgX >= box.x && imgX <= box.x + box.w && imgY >= box.y && imgY <= box.y + box.h) {
+      return i;
+    }
+  }
+  return null;
+}
+
+function setCanvasDragCursor(canvas, kind) {
+  const next = kind ? DRAG_CURSOR_CLASS[kind] : null;
+  DRAG_CURSOR_CLASSES.forEach(cls => canvas.classList.toggle(cls, cls === next));
+}
+
+// Starts a resize (handle) or move (body) drag. Returns true when the press was consumed,
+// so the caller skips pan/draw.
+function onBoxEditMouseDown(canvas, event) {
+  const coords = getImageCoords(canvas, event.clientX, event.clientY);
+  const startDrag = (index, kind) => {
+    const box = canvasState.boxes[index];
+    canvasState.boxDrag = {
+      index,
+      kind,
+      grabX: coords.x,
+      grabY: coords.y,
+      startX: box.x,
+      startY: box.y,
+      startW: box.w,
+      startH: box.h,
+    };
+    setCanvasDragCursor(canvas, kind);   // hold the cursor for the whole drag
+  };
+
+  const handle = boxHandleHitTest(coords.x, coords.y);
+  if (handle) {
+    startDrag(handle.index, handle.kind);
+    return true;
+  }
+  // A press inside a box selects it and begins a move, rather than panning. Draw mode is
+  // left alone — there, dragging always means "new box".
+  if (canvasState.mode === "pan") {
+    const bodyIndex = boxBodyHitTest(coords.x, coords.y);
+    if (bodyIndex !== null) {
+      if (bodyIndex !== canvasState.selectedBoxIndex) selectBox(bodyIndex);
+      startDrag(bodyIndex, "move");
+      return true;
+    }
+  }
+  return false;
+}
+
+function updateBoxDrag(imgX, imgY) {
+  const drag = canvasState.boxDrag;
+  if (!drag) return;
+  const box = canvasState.boxes[drag.index];
+  if (!box) return;
+
+  // Move: translate by the pointer delta and let constrainBoxToImage stop the box at the
+  // border. Deliberately uses the RAW pointer here — clamping it first would freeze the
+  // box as soon as the cursor left the image, not when the box's own edge got there.
+  if (drag.kind === "move") {
+    Object.assign(box, constrainBoxToImage({
+      ...box,
+      x: drag.startX + (imgX - drag.grabX),
+      y: drag.startY + (imgY - drag.grabY),
+    }));
     return;
   }
+
+  // Resize: clamp the pointer to the image BEFORE deriving the rect. Letting a dragged
+  // edge run past the border and relying on constrainBoxToImage to fix it up would shove
+  // the opposite edge instead (it preserves width, then slides x back inside).
+  const px = Math.min(Math.max(imgX, 0), canvasState.imageWidth || Infinity);
+  const py = Math.min(Math.max(imgY, 0), canvasState.imageHeight || Infinity);
+
+  // The edges NOT being dragged stay pinned to where they were at press time.
+  const right = drag.startX + drag.startW;
+  const bottom = drag.startY + drag.startH;
+  let { startX: x, startY: y, startW: w, startH: h } = drag;
+
+  if (drag.kind.includes("w")) {
+    x = Math.min(px, right - MIN_BOX_SIZE_PX);
+    w = right - x;
+  } else if (drag.kind.includes("e")) {
+    w = Math.max(MIN_BOX_SIZE_PX, px - drag.startX);
+  }
+  if (drag.kind.includes("n")) {
+    y = Math.min(py, bottom - MIN_BOX_SIZE_PX);
+    h = bottom - y;
+  } else if (drag.kind.includes("s")) {
+    h = Math.max(MIN_BOX_SIZE_PX, py - drag.startY);
+  }
+  Object.assign(box, constrainBoxToImage({ ...box, x, y, w, h }));
+}
+
+// One re-extract per gesture (on release), not per mouse move — a resize or move is a
+// geometry edit, so the box's cached signal is stale until the backend re-measures it.
+function finishBoxDrag(blotId) {
+  const drag = canvasState.boxDrag;
+  canvasState.boxDrag = null;
+  if (!drag) return;
+  const box = canvasState.boxes[drag.index];
+  if (!box) return;
+  const unchanged = box.x === drag.startX && box.y === drag.startY
+    && box.w === drag.startW && box.h === drag.startH;
+  if (unchanged) {   // a plain click (select, or a handle press with no drag) costs nothing
+    renderCanvas();
+    return;
+  }
+  markBoxGeometryChanged(box);
+  renderCanvas();
+  renderBoxList(blotId);   // refreshes the Area readout and shows "Extracting…"
+  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+}
+
+function handleDetectionClick(event, blotId) {
   const button = event.target.closest("button");
   if (!button) return;
   switch (button.id) {
@@ -5407,6 +5377,21 @@ function renderCanvas() {
       ctx.fillStyle = color;
       ctx.font = themeFont(600, 14 / canvasState.zoom, "--font-mono");
       ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
+
+      // Resize handles, on the selected box only. Outlined so they stay visible against
+      // both a saturated band and dark background.
+      if (isSelected) {
+        const size = BOX_HANDLE_DRAW_PX / canvasState.zoom;
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.strokeStyle = themeToken("--surface");
+        ctx.lineWidth = 1 / canvasState.zoom;
+        boxHandlePoints(box).forEach(point => {
+          ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+          ctx.strokeRect(point.x - size / 2, point.y - size / 2, size, size);
+        });
+        ctx.restore();
+      }
     });
 
     // Live dashed preview of the box being drawn (updated coords live in
@@ -5502,10 +5487,16 @@ function cancelPointerInteraction(event) {
   canvasState.isPanning = false;
   canvasState.isDrawing = false;
   canvasState.laneDrag = null;
+  // A cancelled resize keeps whatever size the box reached, but must still re-extract —
+  // otherwise the box shows a signal measured from its old geometry.
+  if (canvasState.boxDrag) finishBoxDrag(canvasState.currentBlotId);
   event.currentTarget.classList.remove("is-grabbing");
+  setCanvasDragCursor(event.currentTarget, null);
   renderCanvas();
 }
 
+// Reached only by the "A" key on the canvas now that the button is gone — it is the sole
+// keyboard-accessible way to create a box (drawing one needs a pointer drag).
 function addCenteredBox(blotId = canvasState.currentBlotId) {
   if (!canvasState.imageWidth || !canvasState.imageHeight) return;
   if (remainingBoxSlots() <= 0) {
@@ -5589,6 +5580,8 @@ function onMouseDown(event) {
     canvas.classList.add("is-grabbing");
     return;
   }
+  // Resize handles win over pan/draw, so a box can be adjusted without switching modes.
+  if (onBoxEditMouseDown(canvas, event)) return;
   if (canvasState.mode === "pan") {
     canvasState.isPanning = true;
     canvasState.lastPanX = event.clientX;
@@ -5606,6 +5599,12 @@ function onMouseDown(event) {
 
 function onMouseMove(event) {
   const canvas = event.target;
+  if (canvasState.boxDrag) {
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    updateBoxDrag(coords.x, coords.y);
+    requestRender();
+    return;
+  }
   if (canvasState.laneDrag) {
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
     updateLaneDrag(coords.x);
@@ -5623,11 +5622,30 @@ function onMouseMove(event) {
     canvasState.drawCurrentX = coords.x;
     canvasState.drawCurrentY = coords.y;
     requestRender();  // renderCanvas draws the dashed preview from these coords
+  } else if (canvasState.mode !== "lanes") {
+    // Idle hover: preview the gesture the pointer would start. Skip the
+    // getBoundingClientRect layout read when there is nothing draggable under it at all —
+    // this runs on every pointermove.
+    const canDrag = canvasState.boxes.length > 0;
+    if (!canDrag) {
+      setCanvasDragCursor(canvas, null);
+    } else {
+      const coords = getImageCoords(canvas, event.clientX, event.clientY);
+      // Handles win over the body, matching the press order in onBoxEditMouseDown. Body
+      // moves are pan-mode only, so don't advertise one in draw mode.
+      const kind = boxHandleHitTest(coords.x, coords.y)?.kind
+        ?? (canvasState.mode === "pan" && boxBodyHitTest(coords.x, coords.y) !== null ? "move" : null);
+      setCanvasDragCursor(canvas, kind);
+    }
   }
 }
 
 function onMouseUp(event) {
   const canvas = document.getElementById("blotCanvas");
+  if (canvasState.boxDrag) {
+    finishBoxDrag(canvasState.currentBlotId);
+    return;
+  }
   if (canvasState.laneDrag) {
     canvasState.laneDrag = null;
     canvas?.classList.remove("is-grabbing");
@@ -5698,13 +5716,11 @@ function renderBoxList(blotId) {
 
   if (!canvasState.boxes.length) {
     container.innerHTML = emptyBoxListHtml(blotId);
-    updateBoxToolState();
     return;
   }
 
   container.innerHTML = activeBoxListHtml(blotId);
   bindBoxListInputs(container, blotId);
-  updateBoxToolState();
 }
 
 function emptyBoxListHtml(blotId) {
@@ -5921,36 +5937,6 @@ function selectBox(index, blotId = canvasState.currentBlotId) {
   renderBoxList(blotId);
 }
 
-function updateBoxToolState() {
-  const selectedIndex = normalizeSelectedBoxIndex();
-  const hasSelection = selectedIndex !== null;
-  const canAlign = hasSelection && canvasState.boxes.length > 1;
-  const hasBoxCapacity = remainingBoxSlots() > 0;
-  const status = document.getElementById("selectedBoxStatus");
-  if (status) {
-    status.textContent = hasSelection
-      ? `Box ${selectedIndex + 1} selected.`
-      : "Select a box below.";
-  }
-
-  // Box layout tools only apply to a selected box, so keep the whole section out
-  // of the panel until there's a selection (and expand it when one appears).
-  const selectedSection = document.getElementById("selectedBoxSection");
-  if (selectedSection) {
-    selectedSection.hidden = !hasSelection;
-    if (hasSelection) selectedSection.open = true;
-  }
-
-  document.getElementById("duplicateBoxButton")?.toggleAttribute("disabled", !hasSelection || !hasBoxCapacity);
-  document.getElementById("matchBoxSizeButton")?.toggleAttribute("disabled", !canAlign);
-  document.querySelectorAll("[data-box-align]").forEach(button => {
-    button.toggleAttribute("disabled", !canAlign);
-  });
-  document.querySelectorAll("[data-box-nudge]").forEach(button => {
-    button.toggleAttribute("disabled", !hasSelection);
-  });
-}
-
 function remainingBoxSlots() {
   return Math.max(0, MAX_CANVAS_BOXES - canvasState.boxes.length);
 }
@@ -5974,113 +5960,21 @@ function constrainBoxToImage(box) {
   return constrained;
 }
 
-function boxOverlapsImage(box) {
-  if (canvasState.imageWidth <= 0 || canvasState.imageHeight <= 0) return true;
-  return box.x < canvasState.imageWidth
-    && box.y < canvasState.imageHeight
-    && box.x + box.w > 0
-    && box.y + box.h > 0;
-}
-
 function markBoxGeometryChanged(box) {
   box.signal = null;
   box.signalStatus = "loading";
   box.signalError = "";
 }
 
-function duplicateSelectedBox(blotId) {
-  const source = selectedBox();
-  const sourceIndex = canvasState.selectedBoxIndex;
-  if (!source) return;
-
-  const remainingSlots = remainingBoxSlots();
-  if (remainingSlots <= 0) {
-    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
-    return;
-  }
-  const count = Math.min(
-    remainingSlots,
-    clampInteger(Number(document.getElementById("duplicateBoxCount")?.value), 1, 48, 1),
-  );
-  const gap = clampNumber(Number(document.getElementById("duplicateBoxGap")?.value), -2000, 2000, 8);
-  const direction = document.getElementById("duplicateBoxDirection")?.value || "right";
-  const offsets = {
-    right: [source.w + gap, 0],
-    left: [-(source.w + gap), 0],
-    down: [0, source.h + gap],
-    up: [0, -(source.h + gap)],
-  };
-  const [stepX, stepY] = offsets[direction] || offsets.right;
-  const copies = [];
-
-  for (let copyIndex = 1; copyIndex <= count; copyIndex += 1) {
-    const candidate = {
-      x: source.x + stepX * copyIndex,
-      y: source.y + stepY * copyIndex,
-      w: source.w,
-      h: source.h,
-    };
-    if (!boxOverlapsImage(candidate)) break;
-    copies.push(createCanvasBox(candidate));
-  }
-
-  if (!copies.length) return;
-  canvasState.boxes.splice(sourceIndex + 1, 0, ...copies);
-  canvasState.selectedBoxIndex = sourceIndex + copies.length;
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, copies, { alertOnError: false });
-}
-
-function alignBoxesToSelected(alignment, blotId) {
-  const anchor = selectedBox();
-  if (!anchor || canvasState.boxes.length < 2) return;
-
-  const changedBoxes = [];
-  canvasState.boxes.forEach((box, index) => {
-    if (index === canvasState.selectedBoxIndex) return;
-    if (alignment === "left") box.x = anchor.x;
-    if (alignment === "centerX") box.x = anchor.x + anchor.w / 2 - box.w / 2;
-    if (alignment === "right") box.x = anchor.x + anchor.w - box.w;
-    if (alignment === "top") box.y = anchor.y;
-    if (alignment === "centerY") box.y = anchor.y + anchor.h / 2 - box.h / 2;
-    if (alignment === "bottom") box.y = anchor.y + anchor.h - box.h;
-    Object.assign(box, constrainBoxToImage(box));
-    markBoxGeometryChanged(box);
-    changedBoxes.push(box);
-  });
-
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
-}
-
-function matchBoxesToSelectedSize(blotId) {
-  const anchor = selectedBox();
-  if (!anchor || canvasState.boxes.length < 2) return;
-
-  const changedBoxes = [];
-  canvasState.boxes.forEach((box, index) => {
-    if (index === canvasState.selectedBoxIndex) return;
-    const centerX = box.x + box.w / 2;
-    const centerY = box.y + box.h / 2;
-    box.w = anchor.w;
-    box.h = anchor.h;
-    box.x = centerX - box.w / 2;
-    box.y = centerY - box.h / 2;
-    Object.assign(box, constrainBoxToImage(box));
-    markBoxGeometryChanged(box);
-    changedBoxes.push(box);
-  });
-
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
-}
+// Arrow-key nudging on the canvas. One image pixel per press — the same step the removed
+// "Step px" control defaulted to.
+const BOX_NUDGE_STEP_PX = 1;
 
 function nudgeSelectedBox(dx, dy, blotId) {
   const box = selectedBox();
   if (!box) return;
-  const step = clampInteger(Number(document.getElementById("boxNudgeStep")?.value), 1, 100, 1);
-  box.x += dx * step;
-  box.y += dy * step;
+  box.x += dx * BOX_NUDGE_STEP_PX;
+  box.y += dy * BOX_NUDGE_STEP_PX;
   Object.assign(box, constrainBoxToImage(box));
   markBoxGeometryChanged(box);
   renderCanvas();

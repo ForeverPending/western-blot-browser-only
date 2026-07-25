@@ -617,7 +617,6 @@ input[type="range"]:focus-visible {
 .main-tab-button:focus-visible,
 .blot-list-item:focus-visible,
 .box-number:focus-visible,
-.detection-candidate:focus-visible,
 .file-drop:focus-within {
   outline: none;
   box-shadow: 0 0 0 3px var(--focus-ring);
@@ -941,45 +940,48 @@ input[type="range"]:focus-visible {
   gap: var(--space-3);
 }
 
-.detection-candidates {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.detection-candidate {
+/* Sensitivity: one discrete stop per detected set, least -> most sensitive. */
+.detection-sensitivity {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--text);
-  text-align: left;
-  cursor: pointer;
-  transition: background var(--transition), border-color var(--transition), box-shadow var(--transition);
 }
 
-.detection-candidate:hover {
-  border-color: var(--border-interactive);
-  background: var(--surface-subtle);
+/* Label and current stop share one row (.detection-slider is a flex column, so a bare
+   text node next to the value span would take a row of its own). */
+.detection-slider-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
 }
 
-.detection-candidate.active {
-  border-color: var(--primary-border-strong);
-  background: var(--primary-soft);
-  box-shadow: var(--shadow-xs);
-}
-
-.detection-candidate-name {
-  font-size: 13px;
+.detection-sensitivity-name {
   font-weight: 600;
+  color: var(--primary);
 }
 
-.detection-candidate.active .detection-candidate-name {
-  color: var(--primary);
+/* Stop labels under the track: first flush left, last flush right, the rest centered
+   between them — close enough to the thumb positions to read as tick labels. */
+.detection-slider-ticks {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.detection-slider-ticks > span {
+  flex: 1;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.detection-slider-ticks > span:first-child {
+  text-align: left;
+}
+
+.detection-slider-ticks > span:last-child {
+  text-align: right;
 }
 
 .detection-candidate-meta {
@@ -1021,7 +1023,7 @@ input[type="range"]:focus-visible {
   gap: var(--space-3);
 }
 
-/* Per-blot straighten control */
+/* Per-blot rotate control (labelled "Rotate"; ids/classes keep the older straighten name) */
 .straighten-control {
   display: flex;
   flex-direction: column;
@@ -1182,6 +1184,30 @@ td strong {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: var(--space-3);
   margin-top: var(--space-3);
+}
+
+/* Graph title override, above the per-lane label grid. Full width rather than a grid cell:
+   titles are long, and the lane inputs cap out at 190px. */
+.graph-title-field {
+  margin-top: var(--space-3);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.graph-title-field label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.graph-title-field .control-hint {
+  display: block;
+  margin: var(--space-2) 0 0;
+  margin-left: 0;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .group-panel p {
@@ -1804,6 +1830,15 @@ td strong {
   font-weight: 500;
 }
 
+/* .control-hint is normally an inline <span> tucked after a label, so it only sets a left
+   margin. Used as a standalone paragraph in a control group it needs the default UA
+   vertical margins dropped (the group already spaces its children with a flex gap). */
+.blot-control-group > .control-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .blot-control-group input[type="range"] {
   width: 100%;
   max-width: 100%;
@@ -1825,61 +1860,6 @@ td strong {
 
 .channel-label.green {
   color: var(--channel-green-label);
-}
-
-.box-layout-tools {
-  min-width: 0;
-}
-
-.box-selected-status {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.box-tool-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: var(--space-2);
-}
-
-.box-tool-row label {
-  min-width: 72px;
-}
-
-.box-tool-row input[type="number"],
-.box-tool-row select {
-  min-height: 30px;
-  padding: 0 var(--space-2);
-  font-size: 11px;
-}
-
-.box-tool-row input[type="number"] {
-  width: 72px;
-}
-
-.box-tool-row select {
-  width: 104px;
-}
-
-.box-button-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--space-1);
-}
-
-.box-button-grid .box-button,
-.box-nudge-grid .box-button {
-  min-width: 0;
-  padding: 0 var(--space-1);
-}
-
-.box-nudge-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 30px);
-  gap: var(--space-1);
 }
 
 .blot-canvas-wrap {
@@ -1914,6 +1894,28 @@ td strong {
 
 #blotCanvas.is-grabbing {
   cursor: grabbing;
+}
+
+/* Hovering/dragging a box handle (resize) or body (move). These share specificity with the
+   mode cursors above, so they must stay last to win — a handle is grabbable in any mode. */
+#blotCanvas.cursor-move {
+  cursor: move;
+}
+
+#blotCanvas.resize-nwse {
+  cursor: nwse-resize;
+}
+
+#blotCanvas.resize-nesw {
+  cursor: nesw-resize;
+}
+
+#blotCanvas.resize-ns {
+  cursor: ns-resize;
+}
+
+#blotCanvas.resize-ew {
+  cursor: ew-resize;
 }
 
 .visually-hidden {
@@ -2025,14 +2027,12 @@ td strong {
 }
 
 /* Feature 3 — replicate statistics panel */
-.replicate-panel,
-.linrange-panel {
+.replicate-panel {
   margin-top: var(--space-3);
   padding: var(--space-5);
 }
 
-.replicate-hint,
-.linrange-hint {
+.replicate-hint {
   margin: var(--space-2) 0 0;
   max-width: 780px;
   color: var(--text-secondary);
@@ -2072,73 +2072,6 @@ td strong {
   color: var(--text-muted);
   font-size: 12px;
   max-width: 780px;
-}
-
-/* Feature 5 — linear-range / dilution check panel (own optional tab) */
-.linrange-sample {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: var(--space-3);
-  max-width: 320px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.linrange-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: var(--space-3);
-  margin-top: var(--space-3);
-}
-
-.linrange-load {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.linrange-load input {
-  width: 100%;
-}
-
-.linrange-controls {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  margin-top: var(--space-4);
-}
-
-.linrange-controls label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.linrange-result {
-  margin-top: var(--space-4);
-}
-
-.linrange-summary {
-  margin-top: var(--space-3);
-  font-size: 13px;
-}
-
-.linrange-summary p {
-  margin: var(--space-1) 0 0;
-}
-
-.linrange-summary .linrange-ok {
-  color: var(--teal);
-}
-
-.linrange-summary .linrange-warning {
-  color: var(--danger);
 }
 
 .box-actions {

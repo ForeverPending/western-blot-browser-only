@@ -43,9 +43,6 @@
       <button class="main-tab-button" type="button" data-main-tab="blot-browser">
         Blot Browser
       </button>
-      <button class="main-tab-button" type="button" data-main-tab="linear-range">
-        Linear range
-      </button>
     </nav>
 
     <div class="header-right">
@@ -253,8 +250,14 @@
             <div class="chart-header">
               <div>
                 <p class="eyebrow">Graph labels</p>
-                <h2>Edit lane names</h2>
+                <h2>Edit graph title and lane names</h2>
               </div>
+            </div>
+            <div class="graph-title-field">
+              <label>Graph title
+                <input type="text" id="graphTitleInput" maxlength="120" />
+              </label>
+              <p class="control-hint">Applies to the chart heading, the exported JPG, and the Title column in the XLSX export. Clear it to restore the automatic title.</p>
             </div>
             <div class="label-grid" id="labelEditor"></div>
           </section>
@@ -341,8 +344,14 @@
             <div class="chart-header">
               <div>
                 <p class="eyebrow">Comparison labels</p>
-                <h2>Match lanes across samples</h2>
+                <h2>Edit graph title and match lanes across samples</h2>
               </div>
+            </div>
+            <div class="graph-title-field">
+              <label>Graph title
+                <input type="text" id="comparisonTitleInput" maxlength="120" />
+              </label>
+              <p class="control-hint">Applies to the comparison chart heading and its exported JPG. Clear it to restore the automatic title. Grouped graphs below keep their own group names.</p>
             </div>
             <div id="comparisonLabelEditor" class="comparison-labels"></div>
           </section>
@@ -454,46 +463,6 @@
               <div id="blotAnalysisBoxes" class="blot-analysis-pane" role="tabpanel" aria-labelledby="blotTabBoxes" data-blot-analysis-panel="boxes" hidden>
                 <p class="blot-empty-state">Select a blot to view drawn boxes.</p>
               </div>
-            </div>
-          </div>
-        </section>
-      </div>
-
-      <div id="tabLinearRange" hidden>
-        <section class="panel linrange-panel" id="linrangePanel">
-          <div class="chart-header">
-            <div>
-              <p class="eyebrow">Optional QC · Linear range</p>
-              <h2>Dilution / linearity check</h2>
-            </div>
-            <div class="button-row">
-              <button class="ghost-button" id="downloadLinrangeChartButton" type="button" disabled>Export JPG</button>
-            </div>
-          </div>
-          <p class="linrange-hint">
-            Optional check — it does not change your fold-change results. Enter the amount loaded per
-            lane (µg, or any consistent unit) for the selected sample, then check whether signal stays
-            proportional to load. Lanes flagged as saturated are excluded from the linear fit.
-          </p>
-          <label id="linrangeSampleWrap" class="linrange-sample" hidden>
-            Sample protein
-            <select id="linrangeSampleSelect"></select>
-          </label>
-          <p class="workflow-message" id="linrangePlaceholder" role="status" hidden></p>
-          <div id="linrangeBody" hidden>
-            <div class="linrange-grid" id="linrangeLoadInputs"></div>
-            <div class="linrange-controls">
-              <label>
-                Target R²
-                <input id="linrangeR2" type="number" min="0.9" max="0.9999" step="0.001" value="0.99" />
-              </label>
-              <button class="primary-button" id="checkLinrangeButton" type="button">Check linear range</button>
-            </div>
-            <div class="linrange-result" id="linrangeResult" hidden>
-              <div class="chart-wrap">
-                <canvas id="linrangeChart" width="960" height="520" aria-label="Signal versus load scatter plot with linear fit"></canvas>
-              </div>
-              <div class="linrange-summary" id="linrangeSummary"></div>
             </div>
           </div>
         </section>
