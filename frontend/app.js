@@ -3292,6 +3292,11 @@ function createCanvasState() {
     // Quantify channel choices, so it cannot be measured while switched off. Composite
     // dimensions are unaffected (see prepare_composite_channels), so boxes never move.
     enabledChannels: { 700: true, 800: true },
+    // Red/green vs black & white is ONE shared setting, not per channel: the composite is a
+    // single image, so two channels shown at once cannot be in different looks. Each
+    // channel's Off / colour / B&W select writes here and the most recent pick wins for
+    // both, which is why there is no per-channel colorMode.
+    colorMode: "color",       // "color" | "grayscale"
   };
 }
 
@@ -4252,12 +4257,22 @@ const DISPLAY_SLIDER_STEPS = 1000;
 const DISPLAY_SLIDER_CURVE = 2;
 const DEFAULT_DISPLAY_GAMMA = 1;
 
+// One select per channel replaces the old on/off checkbox plus the separate global "Color
+// mode" dropdown: a checkbox said whether a channel was on but not what it would look like,
+// and the two controls together made "800nm off, grayscale" take two widgets to read. The
+// colour option is named for the channel's own colour (700nm renders red, 800nm green)
+// because with the other channel off that is literally all you see.
 function channelAdjustmentControlsHtml(colorClass, channel) {
+  const colorName = colorClass === "red" ? "Red" : "Green";
   return `
     <div class="blot-control-group" data-channel="${channel}">
       <label class="channel-toggle">
-        <input type="checkbox" id="channelEnabled${channel}" checked />
         <span class="channel-label ${colorClass}">${channel}nm</span>
+        <select id="channelMode${channel}">
+          <option value="off">Off</option>
+          <option value="color">${colorName}</option>
+          <option value="grayscale">Black &amp; White</option>
+        </select>
       </label>
       <div class="channel-body" id="channelBody${channel}">
         <canvas class="display-histogram" id="histogram${channel}" width="240" height="40" hidden
@@ -4340,20 +4355,29 @@ function syncQuantChannelOptions() {
   return true;
 }
 
-// Reflect the enabled set in the controls: a disabled channel's window sliders and
-// histogram are hidden (they would adjust something invisible), and the last remaining
-// channel's checkbox is disabled so the frame can never go completely blank.
+function currentColorMode() {
+  return canvasState.colorMode === "grayscale" ? "grayscale" : "color";
+}
+
+// Reflect the enabled set AND the shared look in the controls: a disabled channel's window
+// sliders and histogram are hidden (they would adjust something invisible), and the last
+// remaining channel cannot be switched off so the frame can never go completely blank.
+// Note only the "Off" option is disabled there, not the whole select — a single-channel
+// view still has to be switchable between colour and black & white.
 function syncChannelControls() {
   const enabled = enabledChannels();
   const available = availableChannels();
   ALL_CHANNELS.forEach((channel) => {
-    const toggle = document.getElementById(`channelEnabled${channel}`);
+    const select = document.getElementById(`channelMode${channel}`);
     const body = document.getElementById(`channelBody${channel}`);
     const on = isChannelEnabled(channel);
-    if (toggle) {
-      toggle.checked = on;
-      // Unavailable: nothing to show. Sole survivor: turning it off would blank the view.
-      toggle.disabled = !available.includes(channel) || (on && enabled.length === 1);
+    if (select) {
+      // An "on" channel always shows the shared mode, so flipping one select to B&W is
+      // what visibly drags the other one with it.
+      select.value = on ? currentColorMode() : "off";
+      select.disabled = !available.includes(channel);   // no pixels behind it at all
+      const offOption = select.querySelector('option[value="off"]');
+      if (offOption) offOption.disabled = on && enabled.length === 1;
     }
     if (body) body.hidden = !on;
   });
@@ -4364,16 +4388,24 @@ function setChannelStatus(message) {
   if (status) status.textContent = message;
 }
 
-function onChannelToggle(channel, blotId) {
-  const toggle = document.getElementById(`channelEnabled${channel}`);
-  const wanted = !!toggle?.checked;
-  if (!wanted && enabledChannels().length <= 1) {
-    // Belt and braces: syncChannelControls already disables this checkbox.
-    if (toggle) toggle.checked = true;
-    setChannelStatus("At least one channel has to stay on.");
-    return;
+function onChannelModeChange(channel, blotId) {
+  const select = document.getElementById(`channelMode${channel}`);
+  const wanted = select?.value ?? "off";
+  if (wanted === "off") {
+    if (enabledChannels().length <= 1) {
+      // Belt and braces: syncChannelControls already disables this option.
+      if (select) select.value = currentColorMode();
+      setChannelStatus("At least one channel has to stay on.");
+      return;
+    }
+    canvasState.enabledChannels[channel] = false;
+  } else {
+    canvasState.enabledChannels[channel] = true;
+    // Picking a look here sets it for the whole composite, so if the other channel is also
+    // on it follows — syncChannelControls() pulls its select into line. Two channels shown
+    // at once cannot disagree about colour.
+    canvasState.colorMode = wanted;
   }
-  canvasState.enabledChannels[channel] = wanted;
   applyChannelEnablement(blotId, { announce: true });
 }
 
@@ -4402,7 +4434,10 @@ function applyChannelEnablement(blotId, { announce = false } = {}) {
     }
   } else if (announce) {
     const off = ALL_CHANNELS.filter((channel) => !isChannelEnabled(channel));
-    setChannelStatus(off.length ? `${off.join("nm and ")}nm hidden.` : "Both channels shown.");
+    const look = currentColorMode() === "grayscale" ? "black & white" : "colour";
+    setChannelStatus(off.length
+      ? `${off.join("nm and ")}nm hidden; ${look} view.`
+      : `Both channels shown in ${look}.`);
   }
 
   refreshDisplayPreview();                    // instant, from the local pixel buffer
@@ -4590,7 +4625,7 @@ function renderLocalPreview() {
   const out = image.data;
   const src700 = buffer.channels[700].data;
   const src800 = buffer.channels[800].data;
-  const grayscale = (document.getElementById("colorMode")?.value ?? "color") === "grayscale";
+  const grayscale = currentColorMode() === "grayscale";
 
   for (let i = 0, p = 0; i < src700.length; i += 1, p += 4) {
     const r = lut700[src700[i]];
@@ -4761,8 +4796,13 @@ function boxToolControlsHtml() {
           <option value="800">800nm</option>
         </select>
       </label>
-      <div class="mode-toggle">
-        <button class="mode-button" id="modeDraw" type="button" aria-pressed="false">Draw</button>
+      <div class="switch-control">
+        <span class="switch-caption" id="modeDrawLabel">Draw</span>
+        <button class="switch" id="modeDraw" type="button" role="switch" aria-checked="false"
+                aria-labelledby="modeDrawLabel">
+          <span class="switch-track"><span class="switch-knob"></span></span>
+        </button>
+        <span class="switch-state" id="modeDrawState">Off</span>
       </div>
       <button class="ghost-button" id="extractSignalsButton" type="button">Refresh signals</button>
       <button class="ghost-button" id="clearBoxesButton" type="button">Clear all</button>
@@ -4782,14 +4822,6 @@ function displayControlsHtml() {
       <div class="mode-toggle">
         <button class="mode-button active" id="modePan" type="button" aria-pressed="true">Pan</button>
       </div>
-    </div>
-    <div class="blot-control-group">
-      <label>Color mode
-        <select id="colorMode">
-          <option value="color">Red / Green</option>
-          <option value="grayscale">Black & White</option>
-        </select>
-      </label>
     </div>
     ${channelAdjustmentControlsHtml("red", "700")}
     ${channelAdjustmentControlsHtml("green", "800")}
@@ -4849,14 +4881,15 @@ function bindBlotViewerControls(blotId) {
       scheduleCanvasImageReload(blotId, true);
     });
   });
+  // Off / colour / B&W per channel. applyChannelEnablement() covers both halves: it
+  // repaints the local preview (grayscale is a local recomposite too) and reloads the
+  // server render. Sync first: the freshly injected selects default to their first option
+  // ("Off"), which would misreport both channels until /channel-stats lands.
+  syncChannelControls();
   ["700", "800"].forEach((channel) => {
-    document.getElementById(`channelEnabled${channel}`)?.addEventListener("change", () => {
-      onChannelToggle(channel, blotId);
+    document.getElementById(`channelMode${channel}`)?.addEventListener("change", () => {
+      onChannelModeChange(channel, blotId);
     });
-  });
-  document.getElementById("colorMode")?.addEventListener("change", () => {
-    refreshDisplayPreview();        // grayscale/color is a local recomposite too
-    scheduleCanvasImageReload(blotId, true);
   });
   // Per-blot straighten: slider (debounced), Auto (uses the backend skew estimate), Reset.
   document.getElementById("straightenSlider")?.addEventListener("input", (event) => onStraightenInput(event, blotId));
@@ -4984,14 +5017,20 @@ function setCanvasMode(mode) {
   canvas?.classList.toggle("lanes-mode", mode === "lanes");
   // A resize cursor left over from hovering a handle would outrank the new mode's cursor.
   if (canvas) setCanvasDragCursor(canvas, null);
-  // Draw is a toggle button and Pan reflects the same one bit of state, so both carry
-  // aria-pressed rather than relying on a visual .active class alone.
-  [["modePan", "pan"], ["modeDraw", "draw"]].forEach(([id, forMode]) => {
-    const button = document.getElementById(id);
-    if (!button) return;
-    button.classList.toggle("active", mode === forMode);
-    button.setAttribute("aria-pressed", String(mode === forMode));
-  });
+  const panButton = document.getElementById("modePan");
+  if (panButton) {
+    // Pan is one of a set of view modes, so it stays a pressed-state button.
+    panButton.classList.toggle("active", mode === "pan");
+    panButton.setAttribute("aria-pressed", String(mode === "pan"));
+  }
+  // Draw is plain on/off, so it is a switch: aria-checked drives both the knob position
+  // (see .switch in styles.css) and the On/Off text, with no .active class in play.
+  const drawSwitch = document.getElementById("modeDraw");
+  if (drawSwitch) {
+    drawSwitch.setAttribute("aria-checked", String(mode === "draw"));
+    const drawState = document.getElementById("modeDrawState");
+    if (drawState) drawState.textContent = mode === "draw" ? "On" : "Off";
+  }
 }
 
 function cancelPendingCanvasImageLoad() {
@@ -5119,7 +5158,9 @@ function blotById(blotId) {
 
 // Builds one canonical composite payload for the viewer and exported presentations.
 function buildCompositePayload(blotId, defaultColorMode = "color") {
-  const colorMode = document.getElementById("colorMode")?.value ?? defaultColorMode;
+  // Falls back to the caller's default only before a viewer has ever been opened; once the
+  // per-channel selects exist, canvasState.colorMode is the single source of truth.
+  const colorMode = canvasState.colorMode ?? defaultColorMode;
   const blot = blotById(blotId);
   if (!blot) throw new Error("Blot is no longer loaded.");
   const payload = {
@@ -6654,7 +6695,7 @@ async function saveScan(blotId) {
     borderWidth: backgroundConfig.borderWidth,
     backgroundStat: backgroundConfig.stat,
     settings: {
-      colorMode: document.getElementById("colorMode")?.value ?? "color",
+      colorMode: currentColorMode(),
       enabledChannels: enabledChannels(),
       // Raw-count display window, or null when the channel is on its automatic window.
       displayMin700: currentDisplayWindow("700")?.low ?? null,

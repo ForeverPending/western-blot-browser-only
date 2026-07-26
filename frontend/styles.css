@@ -614,6 +614,7 @@ input[type="range"]:focus-visible {
 .primary-button:focus-visible,
 .ghost-button:focus-visible,
 .mode-button:focus-visible,
+.switch:focus-visible,
 .source-button:focus-visible,
 .tab-button:focus-visible,
 .main-tab-button:focus-visible,
@@ -889,6 +890,76 @@ input[type="range"]:focus-visible {
   box-shadow: var(--shadow-xs);
 }
 
+/* Draw is on/off rather than one of a set, so it reads as a switch instead of a segmented
+   button: the knob position and the adjacent On/Off text carry the state, which is easier
+   to read at a glance than a lone button that looks the same whether or not it is armed.
+   State lives entirely in aria-checked — no .active class — so the visual and the
+   accessible state cannot drift apart. */
+.switch-control {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.switch-caption {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.switch {
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  background: none;
+  line-height: 0;
+  cursor: pointer;
+}
+
+.switch-track {
+  display: block;
+  width: 36px;
+  height: 20px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-control);
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.switch-knob {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: var(--shadow-xs);
+  transition: transform var(--transition), background var(--transition);
+}
+
+.switch[aria-checked="true"] .switch-track {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.switch[aria-checked="true"] .switch-knob {
+  background: var(--surface);
+  /* 36px track less its 1px borders and 2px padding leaves 30px of travel for a 14px knob. */
+  transform: translateX(16px);
+}
+
+/* Fixed width so flipping On/Off does not shuffle anything sitting after it. */
+.switch-state {
+  min-width: 22px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.switch[aria-checked="true"] + .switch-state {
+  color: var(--primary);
+}
+
 /* ── Automatic band detection ──────────────────────────────────────────────── */
 
 .detection-tools {
@@ -1049,19 +1120,26 @@ input[type="range"]:focus-visible {
   color: var(--text-primary);
 }
 
-/* Per-channel on/off. The checkbox sits inline with the channel name; the label is a grid
-   by default (see `.blot-control-group label`), so it needs its own flex row. */
-.channel-toggle {
+/* Per-channel Off / colour / B&W, inline with the channel name. The `label.` qualifier is
+   load-bearing: `.blot-control-group label` above is display:grid at specificity (0,1,1),
+   so a bare `.channel-toggle` (0,1,0) loses to it and the select stacks under the name
+   instead of sitting beside it. */
+.blot-control-group label.channel-toggle {
   display: flex;
   align-items: center;
   gap: var(--space-2);
 }
 
-.channel-toggle input[type="checkbox"] {
-  width: auto;
-  min-height: 0;
-  margin: 0;
+.channel-toggle .channel-label {
   flex: none;
+}
+
+/* Base `select` is width:100%, which in this flex row would squeeze the channel name.
+   min-width:0 lets it shrink past its content on a narrow sidebar instead of overflowing. */
+.channel-toggle select {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
 }
 
 /* A disabled channel's window controls are hidden via the `hidden` attribute rather than a

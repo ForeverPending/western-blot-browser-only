@@ -269,3 +269,127 @@ test("quantification never reads the display window", () => {
   const payload = extractBlock.slice(0, extractBlock.indexOf("apiFetch") + 2000);
   assert.doesNotMatch(payload, /displayMin|displayMax|gamma/);
 });
+
+// ── Per-channel Off / colour / B&W ───────────────────────────────────────────────
+// These selects replaced a per-channel checkbox plus a separate global colour-mode
+// dropdown. The invariant the UI can no longer express, and so has to be enforced here, is
+// that two channels shown at once are always in the SAME look: the composite is one image.
+function stubSelect() {
+  const options = { off: { disabled: false }, color: { disabled: false }, grayscale: { disabled: false } };
+  return {
+    value: "off",
+    disabled: false,
+    querySelector(selector) {
+      const match = /^option\[value="(\w+)"\]$/.exec(selector);
+      return match ? options[match[1]] ?? null : null;
+    },
+  };
+}
+
+function channelModeApi(state) {
+  const canvasState = {
+    channelStats: BOTH_STATS,
+    enabledChannels: { 700: true, 800: true },
+    colorMode: "color",
+    ...state,
+  };
+  const selects = { 700: stubSelect(), 800: stubSelect() };
+  const bodies = { 700: { hidden: false }, 800: { hidden: false } };
+  const status = { text: "" };
+  const document = {
+    getElementById(id) {
+      const select = /^channelMode(700|800)$/.exec(id);
+      if (select) return selects[select[1]];
+      const body = /^channelBody(700|800)$/.exec(id);
+      if (body) return bodies[body[1]];
+      return null;
+    },
+  };
+  const api = new Function("canvasState", "document", "status", `
+    ${grabConst("ALL_CHANNELS")}
+    ${grab("availableChannels")}
+    ${grab("isChannelEnabled")}
+    ${grab("enabledChannels")}
+    ${grab("syncChannelAvailability")}
+    ${grab("currentColorMode")}
+    ${grab("syncChannelControls")}
+    ${grab("onChannelModeChange")}
+    // The shipped applyChannelEnablement() also re-measures boxes and reloads the server
+    // render (covered by its own test above); only its sync half is in scope here.
+    function applyChannelEnablement() { syncChannelAvailability(); syncChannelControls(); }
+    function setChannelStatus(message) { status.text = message; }
+    return { syncChannelControls, onChannelModeChange, currentColorMode };
+  `)(canvasState, document, status);
+  return { api, canvasState, selects, bodies, status };
+}
+
+test("both channels on are locked to the same look", () => {
+  const { api, canvasState, selects } = channelModeApi();
+  api.syncChannelControls();
+  assert.equal(selects[700].value, "color");
+  assert.equal(selects[800].value, "color");
+
+  selects[800].value = "grayscale";      // user picks B&W on 800nm
+  api.onChannelModeChange("800");
+  assert.equal(canvasState.colorMode, "grayscale");
+  assert.equal(selects[700].value, "grayscale", "700nm must follow 800nm, not stay in colour");
+});
+
+test("a single visible channel can still switch between colour and black & white", () => {
+  const { api, canvasState, selects, bodies } = channelModeApi();
+  selects[800].value = "off";
+  api.onChannelModeChange("800");
+  assert.equal(canvasState.enabledChannels[800], false);
+  assert.equal(bodies[800].hidden, true, "a hidden channel's window sliders adjust nothing");
+
+  selects[700].value = "grayscale";
+  api.onChannelModeChange("700");
+  assert.equal(canvasState.colorMode, "grayscale");
+  assert.equal(canvasState.enabledChannels[700], true);
+  assert.equal(selects[700].disabled, false, "the sole channel's look must stay changeable");
+});
+
+test("the last visible channel cannot be switched off", () => {
+  const { api, canvasState, selects, status } = channelModeApi({
+    enabledChannels: { 700: true, 800: false },
+  });
+  api.syncChannelControls();
+  assert.equal(selects[700].querySelector('option[value="off"]').disabled, true);
+
+  selects[700].value = "off";            // as if the disabled option were forced through
+  api.onChannelModeChange("700");
+  assert.equal(canvasState.enabledChannels[700], true);
+  assert.equal(selects[700].value, "color", "the select snaps back rather than lying");
+  assert.match(status.text, /at least one channel/i);
+});
+
+test("turning a channel back on applies its chosen look to both", () => {
+  const { api, canvasState, selects } = channelModeApi({
+    enabledChannels: { 700: true, 800: false },
+    colorMode: "grayscale",
+  });
+  api.syncChannelControls();
+  assert.equal(selects[800].value, "off");
+  assert.equal(selects[700].value, "grayscale");
+
+  selects[800].value = "color";          // "Green" on 800nm
+  api.onChannelModeChange("800");
+  assert.equal(canvasState.colorMode, "color");
+  assert.equal(selects[700].value, "color", "the composite cannot be half colour, half B&W");
+});
+
+test("a channel this blot lacks has its whole select disabled", () => {
+  const { api, selects } = channelModeApi({ channelStats: { 700: { min: 0, max: 100 } } });
+  api.syncChannelControls();
+  assert.equal(selects[800].disabled, true);
+  assert.equal(selects[800].value, "off");
+  assert.equal(selects[700].disabled, false);
+  assert.equal(selects[700].querySelector('option[value="off"]').disabled, true);
+});
+
+test("colour mode has a single source of truth", () => {
+  // The global "Color mode" dropdown is gone; a stray reader of it would silently fall back
+  // to "color" and export a render that does not match the screen.
+  assert.doesNotMatch(app, /id="colorMode"/);
+  assert.doesNotMatch(app, /getElementById\("colorMode"\)/);
+});
