@@ -1,0 +1,37 @@
+# Kept out of the deployment: none of it is imported at runtime, so shipping it only grows
+# the bundle and widens what the static handler can serve. The root is deployed as-is (see
+# README), and the `/:path*` -> `/frontend/:path*` rewrite runs AFTER the filesystem check,
+# so any real file at a requested path is served verbatim.
+#
+# backend/ is deliberately NOT listed. Every api/*.py function does `from app import ...`,
+# resolved through api/index.py's sys.path insert into backend/ — excluding it would 404 the
+# entire API. Because it ships, everything inside it is potentially fetchable, so the .env
+# rules below are not redundant with .gitignore: .gitignore governs what reaches a
+# git-connected deploy, THIS file governs `vercel --prod` from a working tree, and the CLI's
+# own defaults cover .env.local / .env.*.local but not a plain .env. README tells every
+# developer to create backend/.env, and it holds BLOB_READ_WRITE_TOKEN — read/write/delete
+# on the whole blob store, across every session. Never let it ship.
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+backend/data/
+
+tests/
+docs/
+test_blots/
+test-blots/
+
+venv/
+.venv/
+backend/venv/
+backend/test_security.py
+
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+.pre-commit-config.yaml
+.claude/

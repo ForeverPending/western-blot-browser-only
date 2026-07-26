@@ -156,7 +156,13 @@ test("the fingerprint backfill batches to the backend's cap", async () => {
   assert.notEqual(start, -1, "backfill renamed; this test would be vacuous");
   const body = app.slice(start, app.indexOf("\n}\n", start));
   assert.match(body, /FINGERPRINT_BATCH_SIZE/);
-  assert.match(body, /slice\(start, start \+ FINGERPRINT_BATCH_SIZE\)/);
+  assert.match(body, /slice\(0, FINGERPRINT_BATCH_SIZE\)/);
+  // The backend bounds each request by total BYTES read as well as blot count, and says so
+  // with `truncated`. The client has to re-queue the tail it never read, or a workspace of
+  // large TIFs loses dedup on everything past the budget — and the round cap is what stops
+  // a budget too small for even one blot from spinning.
+  assert.match(body, /payload\.truncated === true/);
+  assert.match(body, /FINGERPRINT_MAX_ROUNDS/);
 });
 
 test("skipped duplicates have their temp files released", () => {
