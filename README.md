@@ -13,7 +13,9 @@ database access controls are not part of the security model.
 
 ## Local development
 
-1. Copy `backend/.env.example` to `backend/.env` if you want to override defaults.
+1. Create `backend/.env` if you want to override defaults. Every setting has a
+   working default, so an empty file is fine; `backend/app.py` reads each one via
+   `os.environ.get` with the fallback shown there.
 2. Start the Flask backend from `backend/` on port `5001`.
 3. Serve `frontend/` with any static file server.
 4. No `frontend/config.js` changes are needed. When served from `localhost` or
@@ -48,7 +50,11 @@ uploads outside localhost.
 The browser uploads large ZIPs directly to Vercel Blob. Flask streams each ZIP
 through a temporary file and validates/stores one image member at a time. The
 frontend calls cleanup when blots are removed or the workspace is explicitly
-cleared; a protected daily Vercel Cron reclaims abandoned session objects.
+cleared; a protected daily Vercel Cron reclaims abandoned objects under both temp
+roots — `sessions/` at `TEMP_FILE_TTL_SECONDS`, and directly uploaded ZIPs under
+`uploads/` at the shorter `UPLOAD_FILE_TTL_SECONDS`. The cron returns a non-2xx
+status if the sweep itself fails, so a permanently broken sweep is visible rather
+than looking like a quiet day.
 
 Production startup rejects in-memory Flask rate limiting because serverless
 instances do not share it. Set `ALLOW_IN_MEMORY_RATE_LIMITS=true` only when an

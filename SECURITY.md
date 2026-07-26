@@ -11,7 +11,11 @@
 - Blots and scans are not durable application data. The frontend mirrors the
   workspace to `sessionStorage` so a same-tab reload can recover it, but it is
   still tied to the browser session. Temporary backend objects are cleaned up on
-  blot deletion, explicit workspace clearing, or the backend TTL sweep.
+  blot deletion, explicit workspace clearing, or the backend TTL sweep. The sweep
+  covers both temp roots — per-blot files under `sessions/` at the normal TTL, and
+  directly uploaded ZIPs under `uploads/` at a shorter one, since an upload is
+  consumed inside a single request and a browser that never calls
+  `/process-upload` leaves nothing else to delete it.
 
 ## Authorization stance
 

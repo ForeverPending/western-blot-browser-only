@@ -3,6 +3,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from unittest import mock
@@ -156,6 +157,118 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["removed"], 3)
         sweep.assert_called_once_with(max_deletes=backend.TEMP_SWEEP_MAX_DELETES, force=True)
+
+    def test_sweep_reclaims_abandoned_uploads_not_just_sessions(self):
+        # The browser PUTs a ZIP straight to storage and only THEN calls /process-upload, so
+        # a closed tab leaves the object with nothing to delete it: the sweep used to list
+        # only sessions/, and no frontend caller sends /cleanup an `upload`. Those are the
+        # largest objects the app writes, so the leak was unbounded and permanent.
+        with tempfile.TemporaryDirectory() as isolated:
+            upload_dir = os.path.join(isolated, "uploads", "abandoned-session")
+            session_dir = os.path.join(isolated, "sessions", "abandoned-session")
+            os.makedirs(upload_dir)
+            os.makedirs(session_dir)
+            for path in (os.path.join(upload_dir, "x.zip"), os.path.join(session_dir, "700.tif")):
+                with open(path, "wb") as handle:
+                    handle.write(b"stale")
+            with mock.patch.object(backend, "LOCAL_TEMP_DIR", isolated):
+                removed = backend.sweep_expired_local_files(
+                    cutoff_epoch=time.time() + 60,          # everything is expired
+                    upload_cutoff_epoch=time.time() + 60,
+                    exclude_session_id=None,
+                    max_deletes=50,
+                )
+            self.assertEqual(removed, 2, "both roots must be swept")
+            self.assertFalse(os.path.isdir(upload_dir), "abandoned upload was left behind")
+            self.assertFalse(os.path.isdir(session_dir))
+
+    def test_uploads_expire_sooner_than_sessions(self):
+        # A session's files live as long as the tab might return to them; an uploaded ZIP is
+        # consumed inside one request, so a fresh-ish upload is already abandoned while a
+        # session of the same age is not.
+        with tempfile.TemporaryDirectory() as isolated:
+            upload_dir = os.path.join(isolated, "uploads", "s")
+            session_dir = os.path.join(isolated, "sessions", "s")
+            os.makedirs(upload_dir)
+            os.makedirs(session_dir)
+            for path in (os.path.join(upload_dir, "x.zip"), os.path.join(session_dir, "700.tif")):
+                with open(path, "wb") as handle:
+                    handle.write(b"stale")
+            with mock.patch.object(backend, "LOCAL_TEMP_DIR", isolated):
+                removed = backend.sweep_expired_local_files(
+                    cutoff_epoch=time.time() - 3600,        # session not yet expired
+                    upload_cutoff_epoch=time.time() + 60,   # upload is
+                    exclude_session_id=None,
+                    max_deletes=50,
+                )
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.isdir(upload_dir))
+            self.assertTrue(os.path.isdir(session_dir), "session TTL must not be shortened")
+
+    def test_expired_session_blobs_selects_both_roots(self):
+        page = [
+            {"pathname": f"uploads/{SESSION_ID}/abandoned.zip", "url": "https://x/u",
+             "uploadedAt": "2020-01-01T00:00:00Z"},
+            {"pathname": f"sessions/{SESSION_ID}/blot/700.tif", "url": "https://x/s",
+             "uploadedAt": "2020-01-01T00:00:00Z"},
+            {"pathname": "nonsense/whatever", "url": "https://x/n",
+             "uploadedAt": "2020-01-01T00:00:00Z"},
+        ]
+        selected = backend.expired_session_blobs(page, cutoff_epoch=time.time())
+        self.assertEqual({entry["pathname"] for entry in selected},
+                         {f"uploads/{SESSION_ID}/abandoned.zip", f"sessions/{SESSION_ID}/blot/700.tif"})
+
+    def test_cron_cleanup_reports_a_failed_sweep_as_an_error(self):
+        # Vercel Cron only alerts on non-2xx, so {"status":"ok","removed":0} for a broken
+        # sweep was indistinguishable from a healthy quiet day — objects could pile up
+        # forever with no signal at all.
+        with mock.patch.dict(os.environ, {"CRON_SECRET": "test-cron-secret-value"}), \
+             mock.patch.object(backend, "sweep_expired_temp_files", return_value=None):
+            response = self.client.get(
+                "/cron-cleanup", headers={"Authorization": "Bearer test-cron-secret-value"},
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["status"], "error")
+
+    def test_blob_redirect_never_carries_the_token_off_host(self):
+        # urlopen's default handler copies every header except content-length/content-type
+        # onto a redirect target, up to 10 hops, unvalidated — so the blob token (read/write/
+        # delete over the whole store) would follow a 3xx wherever the first host pointed it.
+        handler = backend.BlobRedirectHandler()
+        original = backend.Request(
+            "https://store.public.blob.vercel-storage.com/sessions/s/b/700.tif",
+            headers={"Authorization": "Bearer super-secret", "X-Api-Version": "7"},
+        )
+
+        # Off-allowlist target: refused outright rather than followed.
+        with self.assertRaises(backend.PublicError):
+            handler.redirect_request(
+                original, None, 302, "Found", {}, "https://attacker.example/steal",
+            )
+
+        # Allowed suffix but a DIFFERENT store: followed, but stripped of credentials.
+        moved = handler.redirect_request(
+            original, None, 302, "Found", {},
+            "https://someone-else.public.blob.vercel-storage.com/sessions/s/b/700.tif",
+        )
+        header_names = {name.lower() for name in moved.headers}
+        self.assertNotIn("authorization", header_names)
+        self.assertIn("x-api-version", header_names, "only credentials should be dropped")
+
+    def test_blob_host_pin_logs_by_default_and_can_enforce(self):
+        # Descriptor URLs are host-checked only against *.blob.vercel-storage.com, so one can
+        # name a store we do not own — and /channel-pixels returns the decoded intensity
+        # array, which makes that a read proxy rather than just wasted I/O. Ships log-only so
+        # it can be proven silent on real traffic before it rejects anything.
+        foreign = "https://not-our-store.public.blob.vercel-storage.com/sessions/s/b/700.tif"
+        with mock.patch.object(backend, "vercel_blob_store_id", return_value="ourstore"):
+            with mock.patch.object(backend, "BLOB_HOST_PIN", "log"):
+                self.assertEqual(backend.validate_vercel_blob_url(foreign), foreign)
+            with mock.patch.object(backend, "BLOB_HOST_PIN", "enforce"):
+                with self.assertRaises(backend.PublicError):
+                    backend.validate_vercel_blob_url(foreign)
+                own = "https://ourstore.public.blob.vercel-storage.com/sessions/s/b/700.tif"
+                self.assertEqual(backend.validate_vercel_blob_url(own), own)
 
     def test_zip_validation_preserves_seekable_stream_position(self):
         archive = make_test_zip()
@@ -648,6 +761,33 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(payload["fingerprints"], {blot["id"]: blot["fingerprint"]})
         self.assertTrue(payload["truncated"], "the client needs to know the tail was skipped")
 
+    def test_a_blot_with_no_tif_channel_gets_no_fingerprint(self):
+        # SHA-256 of nothing is e3b0c442...b855 — a NON-EMPTY string, so it passed the
+        # client's `if (!fingerprint)` sentinel. Every channel-less blot after the first was
+        # then judged a duplicate of the first, dropped, and had its temp files DELETED,
+        # reported as "same image data as X" with nothing having been compared.
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            for folder in ("Blot A", "Blot B"):
+                zf.writestr(f"{folder}/metadata.txt",
+                            f"Image metadata\n#Fri May 15 16:38:05 PDT 2026\nRemarks={folder}")
+        archive.seek(0)
+        response = self.client.post(
+            "/upload-zip",
+            data={"sessionId": SESSION_ID, "file": (archive, "no-channels.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        blots = response.get_json()["blots"]
+        self.assertEqual(len(blots), 2, "both channel-less blots must survive")
+        empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        for blot in blots:
+            self.assertEqual(blot["fingerprint"], "")
+            self.assertNotEqual(blot["fingerprint"], empty_sha)
+
+    def test_a_real_blot_still_gets_a_fingerprint(self):
+        self.assertTrue(self.upload_blot()["fingerprint"])
+
     def test_blot_fingerprints_charges_the_budget_for_failed_reads(self):
         # A read that fails with 413 has already pulled max_bytes+1 off the wire. If the
         # budget is only decremented on SUCCESS, oversize objects are free and the whole
@@ -934,7 +1074,7 @@ class StatelessSessionBackendTests(unittest.TestCase):
                 "BLOB_STORE_ID": "",
             },
             clear=False,
-        ), mock.patch("app.urlopen", side_effect=fake_urlopen):
+        ), mock.patch.object(backend._blob_opener, "open", side_effect=fake_urlopen):
             result = backend.vercel_blob_put(path, b"abc", "image/tiff")
 
         request = captured["request"]
@@ -976,7 +1116,7 @@ class StatelessSessionBackendTests(unittest.TestCase):
                 "BLOB_STORE_ID": "",
             },
             clear=False,
-        ), mock.patch("app.urlopen", side_effect=fake_urlopen), mock.patch.object(
+        ), mock.patch.object(backend._blob_opener, "open", side_effect=fake_urlopen), mock.patch.object(
             backend, "BLOB_ACCESS", "public"
         ), mock.patch.object(
             backend, "RUNTIME_BLOB_ACCESS", "public"
@@ -1020,7 +1160,7 @@ class StatelessSessionBackendTests(unittest.TestCase):
                 "BLOB_STORE_ID": "",
             },
             clear=False,
-        ), mock.patch("app.urlopen", side_effect=fake_urlopen), mock.patch("app.time.sleep"):
+        ), mock.patch.object(backend._blob_opener, "open", side_effect=fake_urlopen), mock.patch("app.time.sleep"):
             result = backend.vercel_blob_read(descriptor, path)
 
         self.assertEqual(result, b"ok")
