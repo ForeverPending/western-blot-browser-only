@@ -240,9 +240,15 @@ MAX_INTERACTIVE_PIXELS = int(os.environ.get("MAX_INTERACTIVE_PIXELS", 2_000_000)
 # raise decoded values by this same power; see the endpoint's docstring for why it is not
 # linear. Keep in sync with PIXEL_QUANTIZE_CURVE in frontend/app.js.
 PIXEL_QUANTIZE_CURVE = 2.0
-# Blots per /blot-fingerprints request. Each one re-reads both TIFs to hash them, so this
-# bounds the I/O a single call can trigger.
+# Blots per /blot-fingerprints request.
 MAX_FINGERPRINT_BLOTS = int(os.environ.get("MAX_FINGERPRINT_BLOTS", 50))
+# ...and the bound that actually matters: total stored bytes re-read per request. A count
+# cap alone does not limit I/O, because each blot is two TIFs of up to MAX_TIF_BYTES — so
+# 50 blots meant one request could pull 50 x 2 x 100 MB = 10 GB out of blob storage and
+# SHA-256 all of it, repeatable at 30 req/min against bytes the caller only had to upload
+# once. The budget is checked before each blot rather than mid-read (a partial read would
+# hash to a wrong digest), so a request can overshoot by at most one blot's two files.
+MAX_FINGERPRINT_BYTES = int(os.environ.get("MAX_FINGERPRINT_BYTES", 200 * 1024 * 1024))
 # Default display window percentiles. The white point sits above p99 because bands
 # occupy well under 1% of a blot's pixels, so p99 lands on a band's shoulder and
 # flattens every core to one value.
@@ -1503,8 +1509,13 @@ def validate_tif_pixels(tif_bytes, label):
 def decode_validated_tif(tif_bytes, label, return_saturation=False):
     try:
         with tifffile.TiffFile(io.BytesIO(tif_bytes)) as tif:
+            # Count before materialising: len() walks the IFD offset chain, while list()
+            # constructs a TiffPage per entry. Checking the cap first means a file that is
+            # nothing but a long chain of IFDs is rejected without paying to build them all.
+            if len(tif.pages) > MAX_TIF_PAGES:
+                raise PublicError(f"{label} has an unsupported number of image pages.")
             pages = list(tif.pages)
-            if not pages or len(pages) > MAX_TIF_PAGES:
+            if not pages:
                 raise PublicError(f"{label} has an unsupported number of image pages.")
 
             full_resolution_pages = [page for page in pages if not page.is_reduced]
@@ -1572,8 +1583,13 @@ def read_tif_dimensions(tif_bytes, label):
     to the native grid on any read failure)."""
     try:
         with tifffile.TiffFile(io.BytesIO(tif_bytes)) as tif:
+            # Count before materialising: len() walks the IFD offset chain, while list()
+            # constructs a TiffPage per entry. Checking the cap first means a file that is
+            # nothing but a long chain of IFDs is rejected without paying to build them all.
+            if len(tif.pages) > MAX_TIF_PAGES:
+                raise PublicError(f"{label} has an unsupported number of image pages.")
             pages = list(tif.pages)
-            if not pages or len(pages) > MAX_TIF_PAGES:
+            if not pages:
                 raise PublicError(f"{label} has an unsupported number of image pages.")
             full_resolution_pages = [page for page in pages if not page.is_reduced]
             if len(full_resolution_pages) != 1:
@@ -1703,7 +1719,14 @@ def blot_fingerprints():
             }), 400
 
         fingerprints = {}
+        budget = MAX_FINGERPRINT_BYTES
+        truncated = False
         for entry in blots:
+            if budget <= 0:
+                # Out of read budget. Report it so the client can ask for the rest in a
+                # follow-up request instead of silently losing dedup on the tail.
+                truncated = True
+                break
             try:
                 blot = load_payload_blot(entry, (), session_id)
             except PublicError:
@@ -1723,8 +1746,14 @@ def blot_fingerprints():
                         descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel]
                     )
                 except Exception:
+                    # Charge the full per-file limit, not zero. A read that fails with 413
+                    # has already pulled max_bytes+1 off the wire (see vercel_blob_request),
+                    # so leaving the budget untouched would make oversize objects free and
+                    # hand back the very amplification the budget exists to stop.
+                    budget -= BLOT_FILE_LIMITS[channel]
                     complete = False
                     break
+                budget -= len(channel_bytes)
                 update_channel_fingerprint(digest, channel, channel_bytes)
                 hashed_any = True
             # Only report a whole fingerprint. A partial one would hash fewer channels than
@@ -1732,7 +1761,7 @@ def blot_fingerprints():
             # that both failed on their second channel would hash the same.
             if complete and hashed_any:
                 fingerprints[blot_id] = digest.hexdigest()
-        return jsonify({"fingerprints": fingerprints})
+        return jsonify({"fingerprints": fingerprints, "truncated": truncated})
     except PublicError as error:
         return error_response(error, "Could not fingerprint blots.")
     except Exception as error:
@@ -2290,6 +2319,14 @@ def extract_box_signal(arr, box, background_sides="leftright", border_width=3, b
 
     background_per_pixel = 0.0
     background_uneven = False
+    # No strip landed inside the image — a box spanning the full width with "Left & Right"
+    # sides (which is what a full-width detected lane produces), or full height with
+    # "Top & Bottom". background_per_pixel then stays 0.0 and adjustedSignal == rawSignal,
+    # which is indistinguishable from a real measurement against a genuinely zero
+    # background. On a blot whose membrane floor is most of a full-width ROI's integrated
+    # density that is a large over-report, so flag it rather than let it pass as an ordinary
+    # number. background_uneven cannot cover this: it needs two strips to compare.
+    background_missing = not strips
     if strips:
         # Compute background stats in float64. The channel is kept in its native
         # dtype now, and np.median / np.mean of a float16 array would otherwise round
@@ -2321,6 +2358,7 @@ def extract_box_signal(arr, box, background_sides="leftright", border_width=3, b
         "adjustedSignal": round(adjusted_signal, 2),
         "backgroundPerPixel": round(background_per_pixel, 4),
         "backgroundUneven": background_uneven,
+        "backgroundMissing": background_missing,
         "saturatedPixels": saturated_pixels,
         "saturatedFraction": round(saturated_pixels / n_pixels, 6) if n_pixels else 0.0,
         "maxPixel": round(float(roi.max()), 2),
@@ -2365,7 +2403,13 @@ DETECT_MAX_DIM = 1600
 PROFILE_SAMPLES = 512
 
 # Cap on client-supplied (or auto-detected) lanes, so a malformed payload can't fan out.
+# Applied to whichever list wins at the call site, not just the client's — auto-detection is
+# bounded only by min_width (~100 lanes) and is what an unauthenticated request gets by
+# default, so capping only the client path left the documented limit unenforced.
 MAX_DETECT_LANES = 64
+# Floor for a client-supplied laneThreshold, matching the UI slider's own `min`. See the
+# clamp in detect_bands() for why 0.0 is the pathological case.
+MIN_LANE_THRESHOLD = 0.02
 
 # Lane detection robustness. Background under the lane axis is low-frequency (uneven
 # membrane / gradient); a rolling MINIMUM over a window wider than one lane traces that
@@ -2751,9 +2795,13 @@ def detect_bands():
         levels = list(dict.fromkeys(n for n in levels if n in SENSITIVITY_LEVELS))[:3] or ["balanced"]
 
         # Optional lane-threshold override from the client's live laneProfile slider (0..1).
+        # Floored at the slider's own minimum: 0.0 puts the entire profile above the cut, so
+        # the whole width becomes one run and _split_run_at_valleys fans it out into the
+        # maximum number of lanes — the most expensive input the detector accepts, and not
+        # one the UI can produce.
         lane_threshold = data.get("laneThreshold")
         if isinstance(lane_threshold, (int, float)) and np.isfinite(lane_threshold):
-            lane_threshold = float(min(1.0, max(0.0, lane_threshold)))
+            lane_threshold = float(min(1.0, max(MIN_LANE_THRESHOLD, lane_threshold)))
         else:
             lane_threshold = None
 
@@ -2787,7 +2835,13 @@ def detect_bands():
         # BEFORE applying any client angle, so the suggestion describes the original blot. Then
         # apply the client-owned angle — the same one /render-composite and /extract use — so
         # lanes/bands are found in the straightened frame the boxes will live in.
-        suggested_rotation = round(_estimate_skew(norm), 2)
+        #
+        # Only on request: _estimate_skew rotates the whole working frame 21 times, and the
+        # only caller that reads suggestedRotationDeg is the "Auto" button. Running it on
+        # every detect made the common path pay for an answer nothing looked at.
+        suggested_rotation = (
+            round(_estimate_skew(norm), 2) if data.get("suggestRotation") is True else None
+        )
         angle = parse_rotation(data)
         if angle:
             norm = _rotate_array(norm, angle)
@@ -2802,7 +2856,17 @@ def detect_bands():
         )
         flat_profile, auto_lanes = _detect_lanes(norm, effective_lane_threshold)
         client_lanes = _client_lanes_to_working(data.get("lanes"), work_w, composite_w)
-        lanes = client_lanes if client_lanes else auto_lanes
+        # Cap here, not only inside _client_lanes_to_working: auto_lanes bypasses that helper
+        # entirely and is bounded only by min_width, so the default path could carry ~100
+        # lanes into the per-lane peak walk.
+        selected_lanes = client_lanes if client_lanes else auto_lanes
+        lanes = selected_lanes[:MAX_DETECT_LANES]
+        # Both lists are ascending in x, so the cap drops the RIGHTMOST lanes. Silently that
+        # is actively misleading: lowering the lane threshold to catch one faint lane can
+        # push the count past the cap and make the right-hand side of the blot lose its
+        # lanes entirely — a knob labelled "more lanes" appearing to delete some. Report it
+        # so the client can say so.
+        lanes_truncated = len(selected_lanes) > len(lanes)
 
         lane_profile_out = _downsample_profile(flat_profile, PROFILE_SAMPLES).round(4).tolist()
         composite_lanes = _lanes_to_composite(lanes, scale_x)
@@ -2817,6 +2881,7 @@ def detect_bands():
                 "rotationDeg": round(angle, 2),
                 "suggestedRotationDeg": suggested_rotation,   # for the "Auto" straighten button
                 "lanes": composite_lanes,
+                "lanesTruncated": lanes_truncated,
                 "laneProfile": lane_profile_out,
             })
 
@@ -2843,6 +2908,7 @@ def detect_bands():
             "suggestedRotationDeg": suggested_rotation,   # for the "Auto" straighten button
             "candidates": candidates,
             "lanes": composite_lanes,        # so the client can show/edit the split used
+            "lanesTruncated": lanes_truncated,
             "laneProfile": lane_profile_out,
         })
     except PublicError as error:

@@ -367,6 +367,78 @@ class StatelessSessionBackendTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["lanes"], [])
 
+    def test_detect_bands_caps_auto_detected_lanes(self):
+        # MAX_DETECT_LANES was only applied to client-supplied lanes, so the DEFAULT path —
+        # what an unauthenticated request gets — could carry ~100 lanes into the per-lane
+        # peak walk. Squeeze the cap and confirm auto-detection now respects it too.
+        blot = self.store_multilane_blot("detect-blot-lanecap")
+        with mock.patch.object(backend, "MAX_DETECT_LANES", 2):
+            response = self.client.post(
+                "/detect-bands",
+                json={"sessionId": SESSION_ID, "blot": blot, "channel": "700", "stage": "lanes"},
+                headers={"X-Blot-Session": SESSION_ID},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertLessEqual(len(payload["lanes"]), 2)
+        # Both lane lists run left to right, so the cap drops the RIGHTMOST lanes. Silently
+        # that looks like the right of the blot having no lanes — and lowering the threshold
+        # to find MORE lanes is exactly what triggers it. The client has to be able to say so.
+        self.assertTrue(payload["lanesTruncated"])
+
+    def test_detect_bands_does_not_claim_truncation_when_under_the_cap(self):
+        blot = self.store_multilane_blot("detect-blot-nocap")
+        response = self.client.post(
+            "/detect-bands",
+            json={"sessionId": SESSION_ID, "blot": blot, "channel": "700", "stage": "lanes"},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        payload = response.get_json()
+        self.assertLess(len(payload["lanes"]), backend.MAX_DETECT_LANES)
+        self.assertFalse(payload["lanesTruncated"])
+
+    def test_detect_bands_floors_the_lane_threshold(self):
+        # laneThreshold 0 puts the whole profile above the cut, making the entire width one
+        # run and fanning it out into the maximum number of lanes — the most expensive input
+        # the detector takes, and one the UI slider (min 0.02) cannot produce.
+        blot = self.store_multilane_blot("detect-blot-thresh")
+        floored = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID, "blot": blot, "channel": "700",
+                "stage": "lanes", "laneThreshold": 0,
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        at_minimum = self.client.post(
+            "/detect-bands",
+            json={
+                "sessionId": SESSION_ID, "blot": blot, "channel": "700",
+                "stage": "lanes", "laneThreshold": backend.MIN_LANE_THRESHOLD,
+            },
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertEqual(floored.status_code, 200, floored.get_json())
+        # 0 is treated as the floor, so it cannot buy a bigger fan-out than the slider can.
+        self.assertEqual(floored.get_json()["lanes"], at_minimum.get_json()["lanes"])
+
+    def test_detect_bands_skips_the_skew_estimate_unless_asked(self):
+        # _estimate_skew rotates the whole working frame 21 times and only the "Auto"
+        # straighten button reads the result, so the common path must not pay for it.
+        blot = self.store_multilane_blot("detect-blot-skew")
+        body = {"sessionId": SESSION_ID, "blot": blot, "channel": "700", "stage": "lanes"}
+        default = self.client.post(
+            "/detect-bands", json=body, headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertIsNone(default.get_json()["suggestedRotationDeg"])
+
+        requested = self.client.post(
+            "/detect-bands",
+            json={**body, "suggestRotation": True},
+            headers={"X-Blot-Session": SESSION_ID},
+        )
+        self.assertIsInstance(requested.get_json()["suggestedRotationDeg"], (int, float))
+
     def test_detect_bands_clamps_rotation(self):
         blot = self.store_multilane_blot("detect-blot-rot")
         response = self.client.post(
@@ -558,6 +630,47 @@ class StatelessSessionBackendTests(unittest.TestCase):
             "/blot-fingerprints", json={"sessionId": SESSION_ID, "blots": "nope"},
         )
         self.assertEqual(not_a_list.status_code, 400)
+
+    def test_blot_fingerprints_stops_at_the_byte_budget(self):
+        # The blot cap bounds COUNT, not bytes: at two 100 MB TIFs each, 50 blots meant one
+        # request could re-read 10 GB out of storage. Squeeze the budget so a second blot
+        # cannot fit and check the request stops rather than reading everything asked for.
+        blot = self.upload_blot()
+        with mock.patch.object(backend, "MAX_FINGERPRINT_BYTES", 1):
+            response = self.client.post(
+                "/blot-fingerprints",
+                json={"sessionId": SESSION_ID, "blots": [blot, blot, blot]},
+            )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        # One blot's worth of reads is allowed to overshoot — the budget is checked before a
+        # blot, not mid-file, because hashing a partially read file would give a wrong digest.
+        self.assertEqual(payload["fingerprints"], {blot["id"]: blot["fingerprint"]})
+        self.assertTrue(payload["truncated"], "the client needs to know the tail was skipped")
+
+    def test_blot_fingerprints_charges_the_budget_for_failed_reads(self):
+        # A read that fails with 413 has already pulled max_bytes+1 off the wire. If the
+        # budget is only decremented on SUCCESS, oversize objects are free and the whole
+        # amplification is back: 100 reads x 100 MB in one request, budget untouched.
+        # 150 MB of budget must survive one 100 MB failure and not a second.
+        blot = self.upload_blot()
+        with mock.patch.object(backend, "MAX_FINGERPRINT_BYTES", 150 * 1024 * 1024), \
+             mock.patch.object(backend, "read_temp_file", side_effect=backend.PublicError("too big", 413)):
+            response = self.client.post(
+                "/blot-fingerprints",
+                json={"sessionId": SESSION_ID, "blots": [blot, blot, blot]},
+            )
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["fingerprints"], {})      # every read failed
+        self.assertTrue(payload["truncated"], "failed reads must still cost budget")
+
+    def test_blot_fingerprints_reports_untruncated_for_a_normal_request(self):
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/blot-fingerprints", json={"sessionId": SESSION_ID, "blots": [blot]},
+        )
+        self.assertFalse(response.get_json()["truncated"])
 
     def test_blot_fingerprint_changes_with_pixel_data(self):
         def upload(pixels):
@@ -961,6 +1074,31 @@ class StatelessSessionBackendTests(unittest.TestCase):
         arr = np.arange(9, dtype=np.float32).reshape(3, 3)
         with self.assertRaises(backend.PublicError):
             backend.extract_box_signal(arr, {"x": 5, "y": 0, "w": 2, "h": 2}, "leftright")
+
+    def test_full_width_box_reports_that_no_background_was_subtracted(self):
+        # A full-width lane (what detection emits when the column profile never drops below
+        # the cut) leaves no room for either left or right strip. adjustedSignal then equals
+        # rawSignal, which on its own is indistinguishable from a real zero background — so
+        # the flag is the only thing separating "measured 0" from "did not measure".
+        arr = np.full((4, 6), 10.0, dtype=np.float32)
+        signal = backend.extract_box_signal(arr, {"x": 0, "y": 0, "w": 6, "h": 4}, "leftright")
+        self.assertTrue(signal["backgroundMissing"])
+        self.assertEqual(signal["backgroundSignal"], 0.0)
+        self.assertEqual(signal["adjustedSignal"], signal["rawSignal"])
+
+    def test_a_box_with_room_for_a_strip_is_not_flagged(self):
+        arr = np.full((4, 6), 10.0, dtype=np.float32)
+        signal = backend.extract_box_signal(arr, {"x": 2, "y": 0, "w": 2, "h": 4}, "leftright")
+        self.assertFalse(signal["backgroundMissing"])
+        self.assertEqual(signal["adjustedSignal"], 0.0)   # uniform field subtracts to zero
+
+    def test_one_sided_background_still_counts_as_measured(self):
+        # A box flush against the left edge keeps its right strip. That is a degraded
+        # estimate, not a missing one, and must not raise the flag.
+        arr = np.full((4, 6), 10.0, dtype=np.float32)
+        signal = backend.extract_box_signal(arr, {"x": 0, "y": 0, "w": 3, "h": 4}, "leftright")
+        self.assertFalse(signal["backgroundMissing"])
+        self.assertEqual(signal["backgroundPerPixel"], 10.0)
 
     def test_rejects_zip_traversal(self):
         archive = io.BytesIO()

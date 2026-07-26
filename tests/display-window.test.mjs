@@ -387,6 +387,101 @@ test("a channel this blot lacks has its whole select disabled", () => {
   assert.equal(selects[700].querySelector('option[value="off"]').disabled, true);
 });
 
+// ── Settings that change what is MEASURED must re-measure ───────────────────────
+// Every one of these controls silently invalidated the numbers already on screen: the box
+// list kept showing values the current settings never produced, and saveScan() then wrote
+// those values under the new settings' labels. Source-level assertions because the failure
+// is a missing call, not bad arithmetic.
+function handlerBody(startMarker, endMarker) {
+  const start = app.indexOf(startMarker);
+  assert.notEqual(start, -1, `missing ${startMarker}; this test would be vacuous`);
+  const end = app.indexOf(endMarker, start);
+  assert.notEqual(end, -1, `missing ${endMarker}; this test would be vacuous`);
+  return app.slice(start, end);
+}
+
+test("rotating invalidates detection results found at the old angle", () => {
+  // Candidates are composite-space coords from before the rotation. At 5°, content ~900px
+  // from centre moves ~80px — several band heights — so committing them quantifies
+  // membrane instead of band, with no error anywhere.
+  const body = grab("applyStraighten");
+  assert.match(body, /detectionRequestId\+\+/, "an in-flight detect must be invalidated too");
+  assert.match(body, /cancelDetection\(blotId\)/, "stage B candidates must be dropped");
+  assert.match(body, /redetectLanesAtThreshold/, "stage A lanes must be re-detected");
+  assert.match(body, /extractSignalsForBoxes/, "committed boxes must be re-measured");
+  // The bump orphans an in-flight detect whose handler is gated on the request id, so with
+  // neither piece of state populated yet nothing else would ever clear "Finding lanes…".
+  assert.match(body, /setDetectionStatus\(""\)/, "an orphaned detect must not leave a live status");
+});
+
+test("straightening to the angle already set does nothing at all", () => {
+  // Everything applyStraighten does is rotation-derived. Without the guard, Reset at 0° (or
+  // a drag that settles back where it started) blanks every box to "Extracting…", drops the
+  // pixel buffer and fires three no-op requests — and blocks Save while they land.
+  const body = grab("applyStraighten");
+  assert.match(body, /if \(canvasState\.rotationDeg === deg\) return;/);
+  // The guard has to come before any of the work it is guarding.
+  assert.ok(body.indexOf("=== deg) return;") < body.indexOf("pixelBuffer = null"));
+  assert.ok(body.indexOf("=== deg) return;") < body.indexOf("extractSignalsForBoxes"));
+});
+
+test("a lane list capped by the backend says so", () => {
+  // The cap drops the rightmost lanes, so unannounced it reads as the right of the blot
+  // having none — triggered by lowering the threshold, which is meant to find more.
+  assert.match(grab("laneCapNote"), /lanesTruncated/);
+  assert.match(grab("enterLaneEditing"), /laneCapNote\(result\)/);
+  assert.match(app.slice(app.indexOf("async function redetectLanesAtThreshold")), /laneCapNote\(result\)/);
+});
+
+test("a held arrow key does not fire one extract per repeat", () => {
+  // /extract is limited to 30/min; OS key-repeat burns that in about a second, and the 429s
+  // mark boxes "Extraction failed" and block Save until a manual refresh.
+  const body = grab("nudgeSelectedBox");
+  assert.match(body, /clearTimeout\(nudgeExtractTimer\)/);
+  assert.match(body, /setTimeout/);
+  // Must re-resolve the target after the delay: the selection can move on mid-burst.
+  assert.match(body, /const target = selectedBox\(\)/);
+});
+
+test("an unsubtracted lane is visible in the exports, not just live", () => {
+  // The live chip and the save confirm only reach someone sitting at the screen. Once saved,
+  // backgroundSignal 0 is all that is left, and that reads as a measured zero.
+  assert.match(grab("scanAuditRows"), /"Background subtracted": lane\.backgroundMissing \? "No" : "Yes"/);
+  assert.match(grab("scanAuditLaneRowHtml"), /lane\.backgroundMissing/);
+});
+
+test("changing the quantify channel re-measures committed boxes", () => {
+  // Otherwise saveScan() writes 700nm signals under channel:"800", and a box drawn after
+  // the switch is genuinely 800nm — one scan measured on two channels.
+  const body = handlerBody(
+    'document.getElementById("quantChannel")?.addEventListener',
+    "// ─── Blot canvas engine",
+  );
+  assert.match(body, /extractSignalsForBoxes\(blotId, canvasState\.boxes/);
+});
+
+test("changing the background method re-measures committed boxes", () => {
+  // Sides / border px / stat decide what is SUBTRACTED. Redrawing the dotted overlay alone
+  // leaves every displayed signal attributed to a method that did not produce it, and a
+  // later single-box re-extract puts one lane on a different method than its neighbours.
+  const body = handlerBody(
+    '["backgroundAxis", "backgroundBorderWidth", "backgroundStat"]',
+    "// Band detection: one delegated handler",
+  );
+  assert.match(body, /extractSignalsForBoxes\(blotId, canvasState\.boxes/);
+});
+
+test("an unsubtracted box is flagged, gated at save, and kept through a round trip", () => {
+  // backendSignal 0 does not distinguish "measured a zero background" from "never measured
+  // one", so the flag is the only thing carrying that difference to the user and the export.
+  assert.match(grab("boxSignalHtml"), /backgroundMissing/);
+  const save = handlerBody("const unsubtractedBoxes", "const scan = {");
+  assert.match(save, /confirmUserAction/, "saving an unsubtracted lane must be a decision");
+  assert.match(handlerBody("lanes: canvasState.boxes.map", "if (!blotState.scans[blotId])"),
+    /backgroundMissing: signal\.backgroundMissing === true/);
+  assert.match(grab("normalizeScan"), /backgroundMissing: lane\.backgroundMissing === true/);
+});
+
 test("colour mode has a single source of truth", () => {
   // The global "Color mode" dropdown is gone; a stray reader of it would silently fall back
   // to "color" and export a render that does not match the screen.

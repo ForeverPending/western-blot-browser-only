@@ -3035,6 +3035,10 @@ function scanAuditRows(filters = {}) {
       "Raw signal": lane.rawSignal ?? "",
       "Background signal": lane.backgroundSignal ?? "",
       "Background per px": lane.backgroundPerPixel ?? "",
+      // Without this the two cells above read "0" for a lane that was never subtracted,
+      // identical to one measured against a genuinely zero background. The save-time
+      // confirm makes it a decision; this is what makes the decision auditable afterwards.
+      "Background subtracted": lane.backgroundMissing ? "No" : "Yes",
       "Saturated px": lane.saturatedPixels ?? 0,
       "Saturated fraction": lane.saturatedFraction ?? 0,
       "Max pixel": lane.maxPixel ?? "",
@@ -3704,6 +3708,7 @@ function normalizeScan(scan) {
         rawSignal: finiteNumberOrNull(lane.rawSignal),
         backgroundSignal: finiteNumberOrNull(lane.backgroundSignal),
         backgroundPerPixel: finiteNumberOrNull(lane.backgroundPerPixel),
+        backgroundMissing: lane.backgroundMissing === true,
         saturatedPixels: finiteNumberOrNull(lane.saturatedPixels) ?? 0,
         saturatedFraction: finiteNumberOrNull(lane.saturatedFraction) ?? 0,
         maxPixel: finiteNumberOrNull(lane.maxPixel),
@@ -4895,13 +4900,19 @@ function bindBlotViewerControls(blotId) {
   document.getElementById("straightenSlider")?.addEventListener("input", (event) => onStraightenInput(event, blotId));
   document.getElementById("autoStraightenButton")?.addEventListener("click", () => void autoStraighten(blotId));
   document.getElementById("resetStraightenButton")?.addEventListener("click", () => setStraighten(0, blotId));
-  // Switching the background axis changes which flanking strips are sampled, so
-  // redraw the dotted overlay to match. No image reload is needed.
-  // Background axis / border width / statistic all change which flanking strips
-  // are sampled, so redraw the dotted overlay to match. No image reload needed.
+  // Background axis / border width / statistic change which flanking strips are sampled, so
+  // redraw the dotted overlay to match. No image reload is needed — but a re-measure IS:
+  // these three decide what gets SUBTRACTED, so every existing box's adjustedSignal was
+  // produced by the old settings. Without this the list keeps showing numbers the current
+  // settings never produced, and a later single-box re-extract (finishBoxDrag) would leave
+  // that one lane measured by a different method than its neighbours.
   ["backgroundAxis", "backgroundBorderWidth", "backgroundStat"].forEach((id) => {
     document.getElementById(id)?.addEventListener("change", () => {
-      if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
+      if (!canvasState.image || canvasState.currentBlotId !== blotId) return;
+      renderCanvas();
+      if (canvasState.boxes.length) {
+        void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+      }
     });
   });
   // Band detection: one delegated handler covers the Detect button plus the accept /
@@ -4929,6 +4940,15 @@ function bindBlotViewerControls(blotId) {
     } else if (canvasState.laneEdit) {
       const channel = event.target?.value === "800" ? "800" : "700";
       void redetectLanesAtThreshold(blotId, { note: `Quantify channel is now ${channel}nm.` });
+    }
+    // Committed boxes go stale for exactly the same reason the detection results do: their
+    // signals were integrated over the channel that just went away. applyChannelEnablement()
+    // already re-measures when the quantify channel changes because a channel was switched
+    // OFF; this is the manual path and needs it too. Without it saveScan() happily writes
+    // 700nm numbers under channel:"800", and a box drawn afterwards is genuinely 800nm — one
+    // scan measured on two channels.
+    if (canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
     }
   });
 }
@@ -5222,12 +5242,34 @@ function setStraighten(deg, blotId) {
 }
 
 function applyStraighten(deg, blotId) {
+  // Everything below is rotation-derived, so an unchanged angle has nothing to redo. The
+  // early return is not just an optimisation: pressing Reset while already at 0°, or a
+  // slider drag that settles back where it started, would otherwise blank every box's
+  // signal to "Extracting…" and block Save until three no-op requests came back.
+  if (canvasState.rotationDeg === deg) return;
   canvasState.rotationDeg = deg;
   // The pixel buffer is rotation-baked (it arrives in composite space), so it is now in the
   // wrong frame. Drop it immediately rather than previewing from it, and refetch at the new
   // angle — display sliders fall back to server rendering for the moment in between.
   canvasState.pixelBuffer = null;
   canvasState.previewDirty = false;
+  // Detection output is composite-space coordinates found at the OLD angle, and the image
+  // has just moved underneath them: at 5°, content ~900px from centre shifts ~80px, several
+  // band heights. Committing those candidates would quantify membrane instead of band, with
+  // no error. Same split as a quantify-channel switch — drop stage B, re-detect stage A.
+  // The bump also kills a detect that is still IN FLIGHT, which neither branch below would
+  // catch: until it lands both pieces of state are null.
+  detectionRequestId++;
+  if (canvasState.detection) {
+    cancelDetection(blotId);
+  } else if (canvasState.laneEdit) {
+    void redetectLanesAtThreshold(blotId, { note: `Rotation is now ${deg}°.` });
+  } else {
+    // Nothing to clear, but an in-flight detect was just orphaned by the bump above — its
+    // handler is gated on the request id, so it will neither finish nor report. Clearing
+    // the status stops "Finding lanes…" sitting there forever asserting live work.
+    setDetectionStatus("");
+  }
   scheduleCanvasImageReload(blotId, true);   // re-render the straightened composite (preserves view)
   void loadChannelPixels(blotId);
   if (canvasState.boxes.length) {
@@ -5239,8 +5281,9 @@ async function autoStraighten(blotId) {
   const button = document.getElementById("autoStraightenButton");
   if (button) button.disabled = true;
   try {
-    // The lanes stage returns suggestedRotationDeg — the estimated skew of the original blot.
-    const result = await detectBands(blotId, { stage: "lanes" });
+    // The lanes stage returns suggestedRotationDeg — the estimated skew of the original blot
+    // — but only when asked for it, since nothing else uses it.
+    const result = await detectBands(blotId, { stage: "lanes", suggestRotation: true });
     if (canvasState.currentBlotId !== blotId) return;
     const suggested = Number(result?.suggestedRotationDeg);
     setStraighten(Number.isFinite(suggested) ? suggested : 0, blotId);
@@ -5341,7 +5384,7 @@ function setDetectionStatus(message, isError = false) {
   status.classList.toggle("is-error", Boolean(isError && message));
 }
 
-async function detectBands(blotId, { sensitivities, laneThreshold, stage, lanes } = {}) {
+async function detectBands(blotId, { sensitivities, laneThreshold, stage, lanes, suggestRotation } = {}) {
   const blot = blotById(blotId);
   if (!blot) throw new Error("Blot is no longer loaded.");
   const channel = document.getElementById("quantChannel")?.value ?? "700";
@@ -5362,6 +5405,9 @@ async function detectBands(blotId, { sensitivities, laneThreshold, stage, lanes 
       laneThreshold,   // optional; the value tuned live via the lane-split slider
       stage,           // "lanes" -> return the lane split only (lanes-first); else bands
       lanes,           // optional; user-confirmed composite-space lane columns [{x, w}]
+      // Opt in to the skew estimate. It costs 21 full-frame rotations server-side and only
+      // the "Auto" straighten button reads the answer, so every other call omits it.
+      suggestRotation: suggestRotation === true ? true : undefined,
       rotationDeg: canvasState.rotationDeg || 0,   // detect in the same straightened frame
     }),
   }, "Band detection failed.");
@@ -5411,8 +5457,15 @@ function enterLaneEditing(result, blotId) {
   renderCanvas();
   renderLaneEditor(blotId);
   setDetectionStatus(lanes.length
-    ? `Found ${lanes.length} lane${lanes.length === 1 ? "" : "s"}. Adjust the split, then detect bands.`
+    ? `Found ${lanes.length} lane${lanes.length === 1 ? "" : "s"}.${laneCapNote(result)} Adjust the split, then detect bands.`
     : "No lanes found. Lower the threshold or add lanes by hand, then detect bands.");
+}
+
+// The backend caps lanes and, since both lists run left to right, drops the RIGHTMOST ones.
+// Unannounced that reads as the right of the blot simply having no lanes — and lowering the
+// threshold, which is meant to find more, is exactly what triggers it.
+function laneCapNote(result) {
+  return result?.lanesTruncated ? " Capped — rightmost lanes dropped; raise the threshold." : "";
 }
 
 function backToLaneEditing(blotId) {
@@ -5485,7 +5538,7 @@ async function redetectLanesAtThreshold(blotId, { note = "" } = {}) {
     renderCanvas();
     renderLaneEditor(blotId);
     const n = canvasState.laneEdit.lanes.length;
-    setDetectionStatus(`${prefix}${n} lane${n === 1 ? "" : "s"}. Adjust further or detect bands.`);
+    setDetectionStatus(`${prefix}${n} lane${n === 1 ? "" : "s"}.${laneCapNote(result)} Adjust further or detect bands.`);
   } catch (error) {
     if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
       setDetectionStatus(error.message || "Lane detection failed.", true);
@@ -6462,11 +6515,16 @@ function boxSignalHtml(box) {
     const unevenHtml = box.signal.backgroundUneven
       ? `<span class="box-signal-warning" title="The background strips on opposite sides differ by more than 2×, which usually means one overlaps a neighbouring band. Move the box or switch the background sides.">⚠ uneven background</span>`
       : "";
+    // Not a nuance like the two above: this signal is the raw integrated density with
+    // nothing taken off, so it is not comparable to any box that was subtracted.
+    const missingBgHtml = box.signal.backgroundMissing
+      ? `<span class="box-signal-warning" title="No background strip fits beside this box — it reaches the image edge on both sides, so nothing was subtracted and this is the raw signal. Shrink the box or switch the background sides.">⚠ no background subtracted</span>`
+      : "";
     return `
       <span class="box-signal">
         <strong>${box.signal.adjustedSignal.toLocaleString()}</strong>
         <span class="muted-text">(raw: ${box.signal.rawSignal.toLocaleString()})</span>
-        ${satHtml}${unevenHtml}
+        ${satHtml}${unevenHtml}${missingBgHtml}
       </span>
     `;
   }
@@ -6552,7 +6610,9 @@ function scanAuditLaneRowHtml(lane) {
       <td>${escapeHtml(lane.name)}</td>
       <td>${formatAuditNumber(lane.adjustedSignal ?? lane.signal)}</td>
       <td>${formatAuditNumber(lane.rawSignal)}</td>
-      <td>${formatAuditNumber(lane.backgroundSignal)}</td>
+      <td>${lane.backgroundMissing
+        ? `<span class="box-signal-warning" title="No background strip fitted beside this box, so nothing was subtracted — this lane's signal is raw integrated density and is not comparable to the others.">none</span>`
+        : formatAuditNumber(lane.backgroundSignal)}</td>
       <td>${formatAuditNumber(lane.x)}</td>
       <td>${formatAuditNumber(lane.y)}</td>
       <td>${formatAuditNumber(lane.w)}</td>
@@ -6647,6 +6707,12 @@ function markBoxGeometryChanged(box) {
 // Arrow-key nudging on the canvas. One image pixel per press — the same step the removed
 // "Step px" control defaulted to.
 const BOX_NUDGE_STEP_PX = 1;
+// A held arrow key repeats at the OS rate, and one /extract per keypress burns the 30/min
+// limit in about a second — the 429s then mark the box "Extraction failed" and block Save
+// until a manual refresh. Coalesce to one measurement when the key-repeat burst stops,
+// matching finishBoxDrag's one-request-per-gesture rule. The box still moves every frame.
+let nudgeExtractTimer = null;
+const NUDGE_EXTRACT_DELAY_MS = 250;
 
 function nudgeSelectedBox(dx, dy, blotId) {
   const box = selectedBox();
@@ -6656,7 +6722,16 @@ function nudgeSelectedBox(dx, dy, blotId) {
   Object.assign(box, constrainBoxToImage(box));
   markBoxGeometryChanged(box);
   renderCanvas();
-  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+  if (nudgeExtractTimer) clearTimeout(nudgeExtractTimer);
+  nudgeExtractTimer = setTimeout(() => {
+    nudgeExtractTimer = null;
+    // Re-resolve rather than closing over `box`: the selection (or the blot) may have moved
+    // on during the delay, and re-measuring a box the user is no longer editing is wrong.
+    if (canvasState.currentBlotId !== blotId) return;
+    const target = selectedBox();
+    if (!target) return;
+    void extractSignalsForBoxes(blotId, [target], { alertOnError: false });
+  }, NUDGE_EXTRACT_DELAY_MS);
 }
 
 async function saveScan(blotId) {
@@ -6679,6 +6754,15 @@ async function saveScan(blotId) {
   const saturatedBoxes = canvasState.boxes.filter((b) => (b.signal?.saturatedPixels || 0) > 0);
   if (saturatedBoxes.length &&
       !confirmUserAction(`${saturatedBoxes.length} box(es) contain saturated pixels, which cannot be accurately quantified (signal is underestimated). Save anyway?`)) {
+    return;
+  }
+
+  // Same shape as the saturation gate above. A box with no background strip reports raw
+  // integrated density, so saving it alongside subtracted lanes mixes two different
+  // measurements into one fold change — worth a decision rather than a silent number.
+  const unsubtractedBoxes = canvasState.boxes.filter((b) => b.signal?.backgroundMissing);
+  if (unsubtractedBoxes.length &&
+      !confirmUserAction(`${unsubtractedBoxes.length} box(es) had no background strip in bounds, so their signal is NOT background-subtracted and is not comparable to the other lanes. Save anyway?`)) {
     return;
   }
 
@@ -6717,6 +6801,9 @@ async function saveScan(blotId) {
         rawSignal: signal.rawSignal,
         backgroundSignal: signal.backgroundSignal,
         backgroundPerPixel: finiteNumberOrNull(signal.backgroundPerPixel),
+        // Provenance: a lane with no subtraction is not comparable to one with it, and the
+        // stored backgroundSignal of 0 does not distinguish the two on its own.
+        backgroundMissing: signal.backgroundMissing === true,
         saturatedPixels: finiteNumberOrNull(signal.saturatedPixels) ?? 0,
         saturatedFraction: finiteNumberOrNull(signal.saturatedFraction) ?? 0,
         maxPixel: finiteNumberOrNull(signal.maxPixel),
@@ -7066,29 +7153,45 @@ function restoreWorkspace() {
 // Matches MAX_FINGERPRINT_BLOTS in backend/app.py. A single scanner ZIP can hold ten blots,
 // so a few uploads would blow past the per-request cap and the whole backfill would 400.
 const FINGERPRINT_BATCH_SIZE = 50;
+// Backstop on the retry loop below. Only reached if every round keeps hitting the backend's
+// byte budget, which at 50 blots a round is far more workspace than a browser tab holds.
+const FINGERPRINT_MAX_ROUNDS = 20;
 
 async function backfillBlotFingerprints() {
   const missing = blotState.blots.filter((blot) => !blotFingerprint(blot) && blot.files);
   if (!missing.length) return;
   let filled = 0;
   try {
-    for (let start = 0; start < missing.length; start += FINGERPRINT_BATCH_SIZE) {
-      const batch = missing.slice(start, start + FINGERPRINT_BATCH_SIZE);
+    let pending = missing;
+    for (let round = 0; pending.length && round < FINGERPRINT_MAX_ROUNDS; round += 1) {
+      const batch = pending.slice(0, FINGERPRINT_BATCH_SIZE);
       const response = await apiFetch(apiUrl("/blot-fingerprints"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId: activeSessionId, blots: batch }),
       });
       if (!response.ok) break;
-      const { fingerprints } = await response.json();
+      const payload = await response.json();
+      const fingerprints = payload?.fingerprints;
       if (!fingerprints || typeof fingerprints !== "object") break;
+      let gained = 0;
       batch.forEach((blot) => {
         const fingerprint = fingerprints[blot.id];
         if (typeof fingerprint === "string" && fingerprint && !blotFingerprint(blot)) {
           blot.fingerprint = fingerprint;
-          filled += 1;
+          gained += 1;
         }
       });
+      filled += gained;
+      // The backend also caps total bytes read per request, so a batch of large TIFs can
+      // come back part-done. `truncated` means it stopped early and the tail was never
+      // read — keep those queued rather than writing them off. Anything else it declined
+      // (files already swept) will never hash, so drop the batch and move on.
+      pending = (payload.truncated === true ? pending : pending.slice(batch.length))
+        .filter((blot) => !blotFingerprint(blot));
+      // Truncated but nothing gained means the budget cannot fit even one blot; retrying
+      // the identical request would spin forever.
+      if (payload.truncated === true && !gained) break;
     }
   } catch (error) {
     // Non-fatal: duplicate detection just stays limited to newly uploaded blots.
