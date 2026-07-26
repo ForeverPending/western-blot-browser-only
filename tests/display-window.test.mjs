@@ -183,6 +183,83 @@ test("a stale pixel buffer cannot be previewed after a rotation change", () => {
   assert.match(body, /loadChannelPixels/);
 });
 
+// ── Channel enable/disable ───────────────────────────────────────────────────────
+function channelApi(state) {
+  const canvasState = { channelStats: null, enabledChannels: { 700: true, 800: true }, ...state };
+  const api = new Function("canvasState", `
+    ${grabConst("ALL_CHANNELS")}
+    ${grab("availableChannels")}
+    ${grab("isChannelEnabled")}
+    ${grab("enabledChannels")}
+    ${grab("syncChannelAvailability")}
+    return { availableChannels, isChannelEnabled, enabledChannels, syncChannelAvailability };
+  `)(canvasState);
+  return { api, canvasState };
+}
+
+const BOTH_STATS = { 700: { min: 0, max: 100 }, 800: { min: 0, max: 100 } };
+
+test("both channels are assumed available until stats say otherwise", () => {
+  // Guessing "one" before /channel-stats lands would briefly hide a channel that exists.
+  const { api } = channelApi({ channelStats: null });
+  assert.deepEqual(api.availableChannels(), ["700", "800"]);
+  assert.deepEqual(api.enabledChannels(), ["700", "800"]);
+});
+
+test("a channel this blot lacks is never available or enabled", () => {
+  const { api } = channelApi({ channelStats: { 800: { min: 0, max: 100 } } });
+  assert.deepEqual(api.availableChannels(), ["800"]);
+  assert.equal(api.isChannelEnabled("700"), false);
+  assert.deepEqual(api.enabledChannels(), ["800"]);
+});
+
+test("a missing channel stays off even if state claims it is enabled", () => {
+  // Defence in depth: enabledChannels() must never name a channel with no pixels behind it,
+  // because it feeds both the render request and the quantify options.
+  const { api, canvasState } = channelApi({
+    channelStats: { 700: { min: 0, max: 100 } },
+    enabledChannels: { 700: true, 800: true },
+  });
+  assert.deepEqual(api.enabledChannels(), ["700"]);
+  api.syncChannelAvailability();
+  assert.equal(canvasState.enabledChannels[800], false);
+});
+
+test("disabling one channel leaves the other enabled", () => {
+  const { api, canvasState } = channelApi({ channelStats: BOTH_STATS });
+  canvasState.enabledChannels[800] = false;
+  assert.deepEqual(api.enabledChannels(), ["700"]);
+  assert.equal(api.isChannelEnabled("700"), true);
+  assert.equal(api.isChannelEnabled("800"), false);
+});
+
+test("a disabled channel maps to an all-zero LUT", () => {
+  // This is how the local preview drops a channel, mirroring build_composite zeroing the
+  // array server-side. A non-zero entry here would leave a ghost of the hidden channel.
+  const lutBlock = app.slice(app.indexOf("function buildDisplayLut"));
+  const body = lutBlock.slice(0, lutBlock.indexOf("\n}\n"));
+  assert.match(body, /isChannelEnabled\(channel\)/);
+  assert.match(body, /return new Uint8Array\(QUANTIZE_MAX \+ 1\)/);
+});
+
+test("the render request carries the enabled set", () => {
+  const start = app.indexOf("function buildCompositePayload");
+  assert.notEqual(start, -1, "payload builder renamed; this test would be vacuous");
+  const payload = app.slice(start, app.indexOf("async function renderCompositeBlob"));
+  assert.match(payload, /enabledChannels: enabledChannels\(\)/);
+});
+
+test("switching off the quantify channel re-measures the boxes", () => {
+  // The user chose auto-switch: signals measured against the channel that just went away
+  // are stale, so they have to be re-extracted rather than left on screen.
+  const start = app.indexOf("function applyChannelEnablement");
+  assert.notEqual(start, -1, "enablement handler renamed; this test would be vacuous");
+  const body = app.slice(start, app.indexOf("// ── Display window", start));
+  assert.match(body, /syncQuantChannelOptions\(\)/);
+  assert.match(body, /extractSignalsForBoxes/);
+  assert.match(body, /cancelDetection/);
+});
+
 test("quantification never reads the display window", () => {
   // The window is view-only. If an extract payload ever grew display keys, a user could
   // change their numbers by dragging a slider.

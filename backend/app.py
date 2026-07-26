@@ -1611,10 +1611,10 @@ def render_composite():
     data = request.get_json(silent=True) or {}
     session_id = request_session_id(data)
     try:
+        # Only one channel is required: a single-channel blot renders the channel it has
+        # (this used to 404, so such blots could not be viewed at all), and the user can
+        # switch either channel off on a two-channel blot.
         blot = load_payload_blot(data.get("blot"), ("700", "800"), session_id)
-        if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
-            return jsonify({"error": "TIF files not found for this blot"}), 404
-
         color_mode = data.get("colorMode", "color")
         # Display windows in RAW COUNTS, the unit the sliders and /channel-stats report.
         # None means "auto" and is resolved per channel inside build_composite.
@@ -1632,6 +1632,7 @@ def render_composite():
             window_800,
             color_mode,
             rotation,
+            parse_enabled_channels(data),
         )
 
         buf = io.BytesIO()
@@ -1724,10 +1725,11 @@ def channel_pixels():
     data = request.get_json(silent=True) or {}
     session_id = request_session_id(data)
     try:
+        # Deliberately ignores which channels are enabled: the buffer always carries both,
+        # so switching a channel off is an instant local recomposite with no refetch. An
+        # absent channel arrives as zeros (prepare_composite_channels), and /channel-stats
+        # omits it, which is how the client knows it cannot be switched back on.
         blot = load_payload_blot(data.get("blot"), ("700", "800"), session_id)
-        if not blot["tif_700_bytes"] or not blot["tif_800_bytes"]:
-            return jsonify({"error": "TIF files not found for this blot"}), 404
-
         rotation = parse_rotation(data)
         ch_700, ch_800, _auto_700, _auto_800 = prepare_composite_channels(
             blot["tif_700_bytes"], blot["tif_800_bytes"], rotation
@@ -1814,6 +1816,18 @@ def finite_float(value):
     return number if np.isfinite(number) else None
 
 
+def parse_enabled_channels(data):
+    """Which channels the client wants shown, as a tuple. Anything unparseable means both.
+    An explicitly empty selection also falls back to both rather than rendering a blank
+    frame — the UI forbids turning the last channel off, so an empty list is a bug or a
+    hand-rolled request, and a black image is a worse answer than showing everything."""
+    requested = data.get("enabledChannels")
+    if not isinstance(requested, list):
+        return ("700", "800")
+    enabled = tuple(channel for channel in ("700", "800") if channel in requested)
+    return enabled or ("700", "800")
+
+
 def parse_display_window(data, channel):
     """The client's display window for one channel as (low, high, gamma) in raw counts,
     or None to mean 'use auto'. Gamma alone is enough to build a window: a request that
@@ -1852,17 +1866,25 @@ def prepare_composite_channels(tif_700_bytes, tif_800_bytes, rotation=0.0):
     Shared by build_composite and /channel-pixels so the two cannot disagree about
     geometry: the client composites the buffers this returns, and a mismatch in size or
     rotation would put the live preview out of register with the drawn boxes.
+
+    A channel whose file is absent (single-channel blot) becomes zeros shaped like the one
+    that is present. Note the distinction from a channel the user has DISABLED: a disabled
+    channel is still decoded here and still counts toward the composite size, because
+    composite dimensions are max(700, 800) and box coordinates live in that space —
+    resizing the frame when a channel is switched off would move every drawn box.
     """
-    ch_700 = read_tif_channel(tif_700_bytes)
-    ch_800 = read_tif_channel(tif_800_bytes)
+    if not tif_700_bytes and not tif_800_bytes:
+        raise PublicError("TIF files not found for this blot", 404)
+    ch_700 = read_tif_channel(tif_700_bytes) if tif_700_bytes else None
+    ch_800 = read_tif_channel(tif_800_bytes) if tif_800_bytes else None
 
     # Resolve auto windows on the NATIVE, unrotated counts. Rotation zero-fills the new
     # corners and the common-size resize interpolates, both of which would drag the
     # percentiles around — so a blot would change brightness as the user turned the
     # rotate slider, and /channel-stats (which reports native counts) would disagree
     # with what is on screen.
-    auto_700 = auto_display_window(ch_700)
-    auto_800 = auto_display_window(ch_800)
+    auto_700 = auto_display_window(ch_700) if ch_700 is not None else (0.0, 1.0)
+    auto_800 = auto_display_window(ch_800) if ch_800 is not None else (0.0, 1.0)
 
     # Per-blot straighten: rotate each channel in its OWN native frame, BEFORE the common-size
     # resize, so the displayed rotation matches /extract exactly (which rotates the native array,
@@ -1870,10 +1892,16 @@ def prepare_composite_channels(tif_700_bytes, tif_800_bytes, rotation=0.0):
     # from /extract whenever the two channels differ in aspect ratio — a non-uniform
     # composite->native scale does not commute with rotation. See scale_box / the coord model.
     if rotation:
-        ch_700 = _rotate_array(ch_700, rotation)
-        ch_800 = _rotate_array(ch_800, rotation)
+        if ch_700 is not None:
+            ch_700 = _rotate_array(ch_700, rotation)
+        if ch_800 is not None:
+            ch_800 = _rotate_array(ch_800, rotation)
 
-    if ch_700.shape != ch_800.shape:
+    if ch_700 is None:
+        ch_700 = np.zeros_like(ch_800)
+    elif ch_800 is None:
+        ch_800 = np.zeros_like(ch_700)
+    elif ch_700.shape != ch_800.shape:
         h = max(ch_700.shape[0], ch_800.shape[0])
         w = max(ch_700.shape[1], ch_800.shape[1])
         # Each channel individually passes read_tif_channel's MAX_RENDER_PIXELS
@@ -1898,9 +1926,11 @@ def prepare_composite_channels(tif_700_bytes, tif_800_bytes, rotation=0.0):
     return ch_700, ch_800, auto_700, auto_800
 
 
-def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=None, color_mode="color", rotation=0.0):
+def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=None, color_mode="color", rotation=0.0, enabled_channels=("700", "800")):
     """Render the two channels into one RGB image. Each window is (low, high, gamma) in
-    raw counts; None for low/high means auto for that channel."""
+    raw counts; None for low/high means auto for that channel. A channel left out of
+    enabled_channels contributes nothing, which is how a user turns one off — the frame
+    keeps its size either way, so drawn boxes do not move."""
     ch_700, ch_800, auto_700, auto_800 = prepare_composite_channels(
         tif_700_bytes, tif_800_bytes, rotation
     )
@@ -1909,6 +1939,10 @@ def build_composite(tif_700_bytes, tif_800_bytes, window_700=None, window_800=No
 
     ch_700 = apply_display_window(ch_700, low_700, high_700, gamma_700)
     ch_800 = apply_display_window(ch_800, low_800, high_800, gamma_800)
+    if "700" not in enabled_channels:
+        ch_700 = np.zeros_like(ch_700)
+    if "800" not in enabled_channels:
+        ch_800 = np.zeros_like(ch_800)
 
     if color_mode == "grayscale":
         blended = np.clip(ch_700 + ch_800, 0.0, 1.0)

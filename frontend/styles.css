@@ -1049,6 +1049,28 @@ input[type="range"]:focus-visible {
   color: var(--text-primary);
 }
 
+/* Per-channel on/off. The checkbox sits inline with the channel name; the label is a grid
+   by default (see `.blot-control-group label`), so it needs its own flex row. */
+.channel-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.channel-toggle input[type="checkbox"] {
+  width: auto;
+  min-height: 0;
+  margin: 0;
+  flex: none;
+}
+
+/* A disabled channel's window controls are hidden via the `hidden` attribute rather than a
+   class, so this only has to lay out the enabled case. */
+.channel-body {
+  display: grid;
+  gap: 6px;
+}
+
 /* Display-window sliders. `.blot-control-group label` is a grid, so the caption and its
    readout have to share one flex row or they would stack — same reason
    .detection-slider-head exists. */

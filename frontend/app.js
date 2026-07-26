@@ -3002,6 +3002,11 @@ function scanMetadataRows(filters = {}) {
 function displaySettingColumns(scan) {
   const settings = scan.settings || {};
   return {
+    // Which channels were actually visible, so a saved scan records that e.g. 800nm was
+    // switched off rather than leaving its window values looking meaningful.
+    "Channels shown": Array.isArray(settings.enabledChannels)
+      ? settings.enabledChannels.map((channel) => `${channel}nm`).join(" + ")
+      : "",
     "Black point 700": settings.displayMin700 ?? "",
     "White point 700": settings.displayMax700 ?? "",
     "Gamma 700": settings.gamma700 ?? "",
@@ -3283,6 +3288,10 @@ function createCanvasState() {
     previewCanvas: null,      // offscreen canvas at composite size, or null to use `image`
     previewDirty: false,      // true once a local preview has diverged from the server image
     histograms: null,         // { "700": Float64Array, "800": Float64Array } binned counts
+    // Per-channel on/off. A disabled channel is dropped from the composite AND from the
+    // Quantify channel choices, so it cannot be measured while switched off. Composite
+    // dimensions are unaffected (see prepare_composite_channels), so boxes never move.
+    enabledChannels: { 700: true, 800: true },
   };
 }
 
@@ -4185,33 +4194,158 @@ const DEFAULT_DISPLAY_GAMMA = 1;
 function channelAdjustmentControlsHtml(colorClass, channel) {
   return `
     <div class="blot-control-group" data-channel="${channel}">
-      <span class="channel-label ${colorClass}">${channel}nm</span>
-      <canvas class="display-histogram" id="histogram${channel}" width="240" height="40" hidden
-              role="img" aria-label="${channel}nm intensity distribution with the current black and white points marked"></canvas>
-      <label>
-        <span class="display-window-head">Black point
-          <span class="display-window-value" id="displayMinValue${channel}">auto</span>
-        </span>
-        <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="0"
-               id="displayMin${channel}" aria-label="${channel}nm black point" />
+      <label class="channel-toggle">
+        <input type="checkbox" id="channelEnabled${channel}" checked />
+        <span class="channel-label ${colorClass}">${channel}nm</span>
       </label>
-      <label>
-        <span class="display-window-head">White point
-          <span class="display-window-value" id="displayMaxValue${channel}">auto</span>
-        </span>
-        <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="${DISPLAY_SLIDER_STEPS}"
-               id="displayMax${channel}" aria-label="${channel}nm white point" />
-      </label>
-      <label>
-        <span class="display-window-head">Gamma
-          <span class="display-window-value" id="gammaValue${channel}">1.00</span>
-        </span>
-        <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
-      </label>
-      <button class="ghost-button" id="autoWindow${channel}" type="button"
-              data-channel="${channel}">Auto ${channel}nm</button>
+      <div class="channel-body" id="channelBody${channel}">
+        <canvas class="display-histogram" id="histogram${channel}" width="240" height="40" hidden
+                role="img" aria-label="${channel}nm intensity distribution with the current black and white points marked"></canvas>
+        <label>
+          <span class="display-window-head">Black point
+            <span class="display-window-value" id="displayMinValue${channel}">auto</span>
+          </span>
+          <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="0"
+                 id="displayMin${channel}" aria-label="${channel}nm black point" />
+        </label>
+        <label>
+          <span class="display-window-head">White point
+            <span class="display-window-value" id="displayMaxValue${channel}">auto</span>
+          </span>
+          <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="${DISPLAY_SLIDER_STEPS}"
+                 id="displayMax${channel}" aria-label="${channel}nm white point" />
+        </label>
+        <label>
+          <span class="display-window-head">Gamma
+            <span class="display-window-value" id="gammaValue${channel}">1.00</span>
+          </span>
+          <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
+        </label>
+        <button class="ghost-button" id="autoWindow${channel}" type="button"
+                data-channel="${channel}">Auto ${channel}nm</button>
+      </div>
     </div>
   `;
+}
+
+// ── Channel enable/disable ───────────────────────────────────────────────────────
+// Two separate ideas, kept distinct on purpose:
+//   AVAILABLE — this blot actually has that TIF. /channel-stats only reports channels it
+//     could read, so a single-channel blot has one available channel and the other can
+//     never be switched on.
+//   ENABLED — the user wants it shown. Only meaningful for available channels.
+const ALL_CHANNELS = ["700", "800"];
+
+function availableChannels() {
+  // Before /channel-stats lands, assume both: the server renders both by default, and
+  // guessing "one" here would briefly hide a channel that does exist.
+  if (!canvasState.channelStats) return [...ALL_CHANNELS];
+  return ALL_CHANNELS.filter((channel) => canvasState.channelStats[channel]);
+}
+
+function isChannelEnabled(channel) {
+  return availableChannels().includes(channel) && canvasState.enabledChannels?.[channel] !== false;
+}
+
+function enabledChannels() {
+  return availableChannels().filter(isChannelEnabled);
+}
+
+// Force-disable channels this blot does not have, so enabledChannels() can never name a
+// channel with no pixels behind it.
+function syncChannelAvailability() {
+  ALL_CHANNELS.forEach((channel) => {
+    if (!availableChannels().includes(channel)) canvasState.enabledChannels[channel] = false;
+  });
+}
+
+// Rebuild the Quantify channel options from the enabled set. Returns true when the
+// selected channel had to change, which the caller must follow up on: the boxes' signals
+// were measured against the old channel and are stale the moment it switches.
+function syncQuantChannelOptions() {
+  const select = document.getElementById("quantChannel");
+  if (!select) return false;
+  const enabled = enabledChannels();
+  if (!enabled.length) return false;
+  const previous = select.value;
+  select.innerHTML = enabled
+    .map((channel) => `<option value="${channel}">${channel}nm</option>`)
+    .join("");
+  if (enabled.includes(previous)) {
+    select.value = previous;
+    return false;
+  }
+  select.value = enabled[0];
+  return true;
+}
+
+// Reflect the enabled set in the controls: a disabled channel's window sliders and
+// histogram are hidden (they would adjust something invisible), and the last remaining
+// channel's checkbox is disabled so the frame can never go completely blank.
+function syncChannelControls() {
+  const enabled = enabledChannels();
+  const available = availableChannels();
+  ALL_CHANNELS.forEach((channel) => {
+    const toggle = document.getElementById(`channelEnabled${channel}`);
+    const body = document.getElementById(`channelBody${channel}`);
+    const on = isChannelEnabled(channel);
+    if (toggle) {
+      toggle.checked = on;
+      // Unavailable: nothing to show. Sole survivor: turning it off would blank the view.
+      toggle.disabled = !available.includes(channel) || (on && enabled.length === 1);
+    }
+    if (body) body.hidden = !on;
+  });
+}
+
+function setChannelStatus(message) {
+  const status = document.getElementById("channelStatus");
+  if (status) status.textContent = message;
+}
+
+function onChannelToggle(channel, blotId) {
+  const toggle = document.getElementById(`channelEnabled${channel}`);
+  const wanted = !!toggle?.checked;
+  if (!wanted && enabledChannels().length <= 1) {
+    // Belt and braces: syncChannelControls already disables this checkbox.
+    if (toggle) toggle.checked = true;
+    setChannelStatus("At least one channel has to stay on.");
+    return;
+  }
+  canvasState.enabledChannels[channel] = wanted;
+  applyChannelEnablement(blotId, { announce: true });
+}
+
+// Single place that pushes the enabled set through everything that depends on it.
+function applyChannelEnablement(blotId, { announce = false } = {}) {
+  syncChannelAvailability();
+  syncChannelControls();
+  const quantChanged = syncQuantChannelOptions();
+  const active = enabledChannels();
+
+  if (quantChanged) {
+    const channel = document.getElementById("quantChannel")?.value ?? active[0];
+    // Detection results and lane edits belong to the old channel; reuse the same handling
+    // as a manual channel switch rather than leaving stale lanes on screen.
+    if (canvasState.detection) {
+      cancelDetection(blotId);
+    } else if (canvasState.laneEdit) {
+      void redetectLanesAtThreshold(blotId, { note: `Quantify channel is now ${channel}nm.` });
+    }
+    // Re-measure: every box's signal came from the channel that just went away.
+    if (canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+    }
+    if (announce) {
+      setChannelStatus(`${channel}nm is now the quantify channel; boxes re-measured.`);
+    }
+  } else if (announce) {
+    const off = ALL_CHANNELS.filter((channel) => !isChannelEnabled(channel));
+    setChannelStatus(off.length ? `${off.join("nm and ")}nm hidden.` : "Both channels shown.");
+  }
+
+  refreshDisplayPreview();                    // instant, from the local pixel buffer
+  scheduleCanvasImageReload(blotId, true);    // authoritative server render
 }
 
 // ── Display window: slider track <-> raw counts ─────────────────────────────────
@@ -4351,6 +4485,10 @@ function decodeQuantized(step, scale) {
 function buildDisplayLut(channel) {
   const buffer = canvasState.pixelBuffer?.channels?.[channel];
   if (!buffer) return null;
+  // A disabled channel maps everything to 0, which is exactly what build_composite does
+  // server-side (it zeroes the array). Doing it in the LUT keeps the compositing loop
+  // branch-free and makes toggling a channel a local repaint with no refetch.
+  if (!isChannelEnabled(channel)) return new Uint8Array(QUANTIZE_MAX + 1);
   const stats = channelStatsFor(channel);
   const window = currentDisplayWindow(channel)
     || (stats ? { low: stats.autoMin, high: stats.autoMax } : null);
@@ -4539,6 +4677,14 @@ async function loadChannelStats(blotId) {
     ["700", "800"].forEach((channel) => {
       if (canvasState.channelStats?.[channel]) applyAutoDisplayWindow(channel);
     });
+    // Now that we know which channels this blot actually has, force-disable any it does
+    // not — a single-channel blot must not offer the missing one for display or
+    // quantification. No announcement: the user did not do anything.
+    syncChannelAvailability();
+    syncChannelControls();
+    if (syncQuantChannelOptions() && canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+    }
   } catch (error) {
     // Non-fatal: the sliders stay on "auto" and the backend keeps choosing the window.
     console.warn("Could not load channel statistics", error);
@@ -4586,6 +4732,7 @@ function displayControlsHtml() {
     </div>
     ${channelAdjustmentControlsHtml("red", "700")}
     ${channelAdjustmentControlsHtml("green", "800")}
+    <p class="control-hint" id="channelStatus" role="status" aria-live="polite"></p>
     <div class="blot-control-group">
       <label class="straighten-control">Rotate <span class="straighten-value" id="straightenValue">0°</span>
         <input type="range" id="straightenSlider" min="-15" max="15" step="0.5" value="0" />
@@ -4639,6 +4786,11 @@ function bindBlotViewerControls(blotId) {
       refreshDisplayPreview();
       drawHistogram(channel);
       scheduleCanvasImageReload(blotId, true);
+    });
+  });
+  ["700", "800"].forEach((channel) => {
+    document.getElementById(`channelEnabled${channel}`)?.addEventListener("change", () => {
+      onChannelToggle(channel, blotId);
     });
   });
   document.getElementById("colorMode")?.addEventListener("change", () => {
@@ -4916,6 +5068,7 @@ function buildCompositePayload(blotId, defaultColorMode = "color") {
     gamma800: currentDisplayGamma("800"),
     colorMode,
     rotationDeg: canvasState.rotationDeg || 0,   // straighten the displayed composite
+    enabledChannels: enabledChannels(),          // a channel switched off contributes nothing
   };
   // Send the black/white points in raw counts, and only once /channel-stats has told us
   // what this blot's counts look like. Omitting them is meaningful: the backend then
@@ -6441,6 +6594,7 @@ async function saveScan(blotId) {
     backgroundStat: backgroundConfig.stat,
     settings: {
       colorMode: document.getElementById("colorMode")?.value ?? "color",
+      enabledChannels: enabledChannels(),
       // Raw-count display window, or null when the channel is on its automatic window.
       displayMin700: currentDisplayWindow("700")?.low ?? null,
       displayMax700: currentDisplayWindow("700")?.high ?? null,

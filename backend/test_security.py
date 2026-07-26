@@ -501,6 +501,97 @@ class StatelessSessionBackendTests(unittest.TestCase):
             span = float(truth.max() - truth.min()) or 1.0
             self.assertLess(float(np.abs(decoded - truth).max()) / span, 1e-4)
 
+    def test_disabled_channel_is_dropped_from_the_composite(self):
+        blot = self.upload_blot()
+
+        def render(enabled):
+            payload = {"sessionId": SESSION_ID, "blot": blot, "colorMode": "color"}
+            if enabled is not None:
+                payload["enabledChannels"] = enabled
+            response = self.client.post("/render-composite", json=payload)
+            self.assertEqual(response.status_code, 200, response.data[:200])
+            return np.asarray(Image.open(io.BytesIO(response.data)).convert("RGB"))
+
+        both = render(None)
+        self.assertGreater(both[:, :, 0].max(), 0)
+        self.assertGreater(both[:, :, 1].max(), 0)
+
+        only_700 = render(["700"])
+        self.assertGreater(only_700[:, :, 0].max(), 0)
+        self.assertEqual(only_700[:, :, 1].max(), 0, "800nm should contribute nothing")
+        # The kept channel must be untouched, not merely present — disabling one channel is
+        # a view change and must not alter how the other is rendered.
+        np.testing.assert_array_equal(only_700[:, :, 0], both[:, :, 0])
+
+        only_800 = render(["800"])
+        self.assertEqual(only_800[:, :, 0].max(), 0)
+        np.testing.assert_array_equal(only_800[:, :, 1], both[:, :, 1])
+
+        # Never render a blank frame: an empty or malformed selection falls back to both.
+        for bogus in ([], "700", {"700": True}, ["999"]):
+            np.testing.assert_array_equal(render(bogus), both)
+
+    def test_disabling_a_channel_does_not_resize_the_composite(self):
+        # Box coordinates live in composite space, and composite size is max(700, 800) per
+        # axis. If switching a channel off shrank the frame to the other channel's size,
+        # every drawn box would silently move relative to the pixels it measures.
+        b700 = io.BytesIO(); tifffile.imwrite(b700, np.arange(40 * 60, dtype=np.uint16).reshape(40, 60))
+        b800 = io.BytesIO(); tifffile.imwrite(b800, np.arange(70 * 30, dtype=np.uint16).reshape(70, 30))
+        d700 = backend.store_temp_file(SESSION_ID, "size-blot", "700.tif", b700.getvalue(), "image/tiff")
+        d800 = backend.store_temp_file(SESSION_ID, "size-blot", "800.tif", b800.getvalue(), "image/tiff")
+        blot = {"id": "size-blot", "files": {"700": d700, "800": d800}}
+
+        sizes = set()
+        for enabled in (["700", "800"], ["700"], ["800"]):
+            response = self.client.post(
+                "/render-composite",
+                json={"sessionId": SESSION_ID, "blot": blot, "colorMode": "color",
+                      "enabledChannels": enabled},
+            )
+            self.assertEqual(response.status_code, 200, response.data[:200])
+            sizes.add(Image.open(io.BytesIO(response.data)).size)
+        self.assertEqual(len(sizes), 1, f"composite size changed with the enabled set: {sizes}")
+        self.assertEqual(sizes.pop(), (60, 70))   # max width, max height
+
+    def test_single_channel_blot_renders_and_reports_one_channel(self):
+        # Previously a 404: a blot with only one TIF could not be viewed at all.
+        archive = make_single_channel_zip()
+        upload = self.client.post(
+            "/upload-zip",
+            data={"sessionId": SESSION_ID, "file": (archive, "single.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 200, upload.get_json())
+        blot = upload.get_json()["blots"][0]
+
+        composite = self.client.post(
+            "/render-composite",
+            json={"sessionId": SESSION_ID, "blot": blot, "colorMode": "color"},
+        )
+        self.assertEqual(composite.status_code, 200, composite.data[:200])
+        rendered = np.asarray(Image.open(io.BytesIO(composite.data)).convert("RGB"))
+        self.assertEqual(rendered[:, :, 0].max(), 0, "absent 700nm must be black, not noise")
+        self.assertGreater(rendered[:, :, 1].max(), 0)
+
+        # The client decides availability from /channel-stats, so it must list only the
+        # channel that exists — that is what stops the missing one being switched on.
+        stats = self.client.post("/channel-stats", json={"sessionId": SESSION_ID, "blot": blot})
+        self.assertEqual(set(stats.get_json()["channels"]), {"800"})
+
+        pixels = self.client.post("/channel-pixels", json={"sessionId": SESSION_ID, "blot": blot})
+        self.assertEqual(pixels.status_code, 200)
+        width, height, channels = struct.unpack_from("<III", pixels.data, 4)
+        self.assertEqual(channels, 2, "buffer always carries two channels, absent one zeroed")
+        raw = np.frombuffer(pixels.data, dtype="<u2", offset=32).reshape(2, height, width)
+        self.assertEqual(raw[0].max(), 0)
+
+    def test_blot_with_no_channels_is_rejected(self):
+        response = self.client.post(
+            "/render-composite",
+            json={"sessionId": SESSION_ID, "blot": {"id": "empty", "files": {}}},
+        )
+        self.assertEqual(response.status_code, 404)
+
     def test_channel_pixels_refuses_oversized_blots(self):
         # Above the cap the client must be told to fall back to server rendering rather than
         # being handed a multi-megabyte buffer.
