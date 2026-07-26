@@ -1,6 +1,7 @@
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -205,6 +206,48 @@ class StatelessSessionBackendTests(unittest.TestCase):
             self.assertFalse(os.path.isdir(upload_dir))
             self.assertTrue(os.path.isdir(session_dir), "session TTL must not be shortened")
 
+    def test_uploads_are_swept_before_sessions_so_they_cannot_be_starved(self):
+        # Both roots share one max_deletes budget. Sweeping sessions/ first meant a store
+        # expiring more than the cap in session objects — about a busy week of uploads — used
+        # up the budget before uploads/ was ever listed, so the abandoned-ZIP leak this sweep
+        # was added to close would never actually be closed.
+        with tempfile.TemporaryDirectory() as isolated:
+            for index in range(5):
+                os.makedirs(os.path.join(isolated, "sessions", f"s{index}"))
+                with open(os.path.join(isolated, "sessions", f"s{index}", "700.tif"), "wb") as handle:
+                    handle.write(b"x")
+            os.makedirs(os.path.join(isolated, "uploads", "abandoned"))
+            with open(os.path.join(isolated, "uploads", "abandoned", "x.zip"), "wb") as handle:
+                handle.write(b"x")
+            with mock.patch.object(backend, "LOCAL_TEMP_DIR", isolated):
+                backend.sweep_expired_local_files(
+                    cutoff_epoch=time.time() + 60,
+                    upload_cutoff_epoch=time.time() + 60,
+                    exclude_session_id=None,
+                    max_deletes=2,      # smaller than the sessions/ backlog
+                )
+            self.assertFalse(
+                os.path.isdir(os.path.join(isolated, "uploads", "abandoned")),
+                "uploads/ must not be starved by a sessions/ backlog",
+            )
+
+    def test_a_zero_upload_ttl_disables_it_rather_than_expiring_everything(self):
+        # max_age_seconds <= 0 already means "TTL off", so 0 here reads as "no separate
+        # uploads TTL". Unguarded it inverted into the most destructive setting available:
+        # min(..., 0) put the cutoff at now, expiring every upload including one being
+        # streamed right then by another session's /process-upload.
+        with tempfile.TemporaryDirectory() as isolated:
+            in_flight = os.path.join(isolated, "uploads", "streaming-now")
+            os.makedirs(in_flight)
+            with open(os.path.join(in_flight, "x.zip"), "wb") as handle:
+                handle.write(b"x")
+            with mock.patch.object(backend, "LOCAL_TEMP_DIR", isolated), \
+                 mock.patch.object(backend, "UPLOAD_FILE_TTL_SECONDS", 0), \
+                 mock.patch.object(backend, "USE_VERCEL_BLOB", False):
+                backend.sweep_expired_temp_files(max_age_seconds=86400, max_deletes=50, force=True)
+            self.assertTrue(os.path.isdir(in_flight),
+                            "a 0 upload TTL must disable it, not expire everything")
+
     def test_expired_session_blobs_selects_both_roots(self):
         page = [
             {"pathname": f"uploads/{SESSION_ID}/abandoned.zip", "url": "https://x/u",
@@ -254,6 +297,100 @@ class StatelessSessionBackendTests(unittest.TestCase):
         header_names = {name.lower() for name in moved.headers}
         self.assertNotIn("authorization", header_names)
         self.assertIn("x-api-version", header_names, "only credentials should be dropped")
+
+    def test_redirects_on_the_api_host_are_not_treated_as_off_host(self):
+        # Half of all blob traffic starts at vercel.com/api/blob (put, list, delete), whose
+        # host is deliberately NOT in the object allowlist. Checking only that suffix turned
+        # an ordinary same-host canonicalising redirect there into a hard 502 — including on
+        # the sweep's own list call, which would then fail every cron run.
+        handler = backend.BlobRedirectHandler()
+        api = backend.Request(f"{backend.BLOB_API_BASE_URL}?limit=1000",
+                              headers={"Authorization": "Bearer secret"})
+        moved = handler.redirect_request(
+            api, None, 302, "Found", {}, f"{backend.BLOB_API_BASE_URL}/?limit=1000",
+        )
+        self.assertIsNotNone(moved)
+        self.assertTrue(any(v == "Bearer secret" for v in moved.headers.values()),
+                        "a same-host API hop should keep its credentials")
+        # ...but the API host must not become a bridge to an object host, or vice versa.
+        with self.assertRaises(backend.PublicError):
+            handler.redirect_request(api, None, 302, "Found", {},
+                                     "https://store.public.blob.vercel-storage.com/sessions/s/b/700.tif")
+        obj = backend.Request("https://store.public.blob.vercel-storage.com/sessions/s/b/700.tif")
+        with self.assertRaises(backend.PublicError):
+            handler.redirect_request(obj, None, 302, "Found", {}, backend.BLOB_API_BASE_URL)
+
+    def test_a_pin_rejection_is_not_swallowed_as_a_skipped_descriptor(self):
+        # vercel_blob_delete skips malformed descriptors on purpose. A pin mismatch is a
+        # CONFIG problem, and swallowing it the same way meant every URL got skipped, 0 was
+        # returned (not None), and /cron-cleanup reported a healthy "removed: 0" forever
+        # while nothing was ever reclaimed — the exact blindness the None/500 return killed.
+        foreign = [({"url": "https://not-ours.public.blob.vercel-storage.com/sessions/s/b/700.tif"},
+                    "sessions/s/b/700.tif")]
+        with mock.patch.object(backend, "vercel_blob_store_id", return_value="ourstore"), \
+             mock.patch.object(backend, "BLOB_HOST_PIN", "enforce"):
+            with self.assertRaises(backend.BlobHostPinError):
+                backend.vercel_blob_delete(foreign)
+        # A genuinely malformed descriptor is still skipped rather than raised.
+        with mock.patch.object(backend, "BLOB_HOST_PIN", "off"):
+            self.assertEqual(backend.vercel_blob_delete([({"url": "not-a-url"}, "sessions/s/b/700.tif")]), 0)
+
+    def test_expired_session_blobs_can_be_confined_to_one_root(self):
+        # The caller applies a DIFFERENT cutoff per root (uploads 1h, sessions 24h), so
+        # without this filter both rest entirely on the remote listing honouring `prefix`.
+        # Drop or mistype that prefix and the 1h upload cutoff hits sessions/, deleting every
+        # other session's live blot files.
+        page = [
+            {"pathname": f"uploads/{SESSION_ID}/a.zip", "url": "https://x/u", "uploadedAt": "2020-01-01T00:00:00Z"},
+            {"pathname": f"sessions/{SESSION_ID}/b/700.tif", "url": "https://x/s", "uploadedAt": "2020-01-01T00:00:00Z"},
+        ]
+        uploads_only = backend.expired_session_blobs(page, time.time(), root="uploads")
+        self.assertEqual([entry["pathname"] for entry in uploads_only], [f"uploads/{SESSION_ID}/a.zip"])
+        sessions_only = backend.expired_session_blobs(page, time.time(), root="sessions")
+        self.assertEqual([entry["pathname"] for entry in sessions_only], [f"sessions/{SESSION_ID}/b/700.tif"])
+
+    def test_a_failing_list_page_keeps_the_earlier_root_deletions(self):
+        # to_delete used to accumulate across every page of BOTH roots and only delete at the
+        # end, so one 429 on a later list call discarded everything already collected: zero
+        # objects reclaimed for the whole run. Two prefixes doubled the list calls, so it
+        # doubled the chance of hitting that.
+        deleted_batches = []
+
+        def fake_list(prefix=None, cursor=None, limit=1000):
+            if prefix == "uploads/":
+                return {"blobs": [{"pathname": f"uploads/{SESSION_ID}/a.zip",
+                                   "url": "https://x/u", "uploadedAt": "2020-01-01T00:00:00Z"}],
+                        "hasMore": False}
+            raise backend.PublicError("Temporary Blob storage request failed.", 502)
+
+        def fake_delete(batch):
+            deleted_batches.append([path for _descriptor, path in batch])
+            return len(batch)
+
+        with mock.patch.object(backend, "vercel_blob_list", side_effect=fake_list), \
+             mock.patch.object(backend, "vercel_blob_delete", side_effect=fake_delete):
+            with self.assertRaises(backend.PublicError):
+                backend.sweep_expired_vercel_blobs(time.time(), time.time(), None, 500)
+        self.assertEqual(deleted_batches, [[f"uploads/{SESSION_ID}/a.zip"]],
+                         "the uploads batch must already be deleted when sessions/ fails")
+
+    def test_an_unknown_blob_host_pin_value_is_rejected_at_import(self):
+        # "enforced" instead of "enforce" used to degrade silently to log-only, so an operator
+        # would believe the pin was on while it was merely observing. Checked in a subprocess:
+        # importlib.reload would rebuild the Flask app and temp-dir config this suite's client
+        # is bound to, breaking every later test.
+        def probe(value):
+            env = {**os.environ, "BLOB_HOST_PIN": value,
+                   "BLOT_TEMP_STORAGE": "local", "RATELIMIT_ENABLED": "false"}
+            return subprocess.run(
+                [sys.executable, "-c", "import app"],
+                cwd=os.path.dirname(__file__), env=env, capture_output=True, text=True,
+            )
+        bad = probe("enforced")
+        self.assertNotEqual(bad.returncode, 0, "a typo'd pin mode must not import cleanly")
+        self.assertIn("BLOB_HOST_PIN must be", bad.stderr)
+        for good in ("log", "enforce", "off"):
+            self.assertEqual(probe(good).returncode, 0, f"{good} should be accepted")
 
     def test_blob_host_pin_logs_by_default_and_can_enforce(self):
         # Descriptor URLs are host-checked only against *.blob.vercel-storage.com, so one can

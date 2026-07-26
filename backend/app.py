@@ -321,6 +321,12 @@ UPLOAD_FILE_TTL_SECONDS = int(os.environ.get("UPLOAD_FILE_TTL_SECONDS", 60 * 60)
 # "log" (default) | "enforce" | "off" — see enforce_blob_host_pin. Ships as log-only so the
 # pin can be shown silent against real traffic before it can reject anything.
 BLOB_HOST_PIN = (os.environ.get("BLOB_HOST_PIN", "log") or "log").strip().lower()
+if BLOB_HOST_PIN not in ("log", "enforce", "off"):
+    # Fail loudly at import rather than silently degrading to "log". An operator who typed
+    # "enforced" would otherwise believe the pin was on while it was only observing.
+    raise RuntimeError(
+        f"BLOB_HOST_PIN must be 'log', 'enforce', or 'off' (got {BLOB_HOST_PIN!r})."
+    )
 TEMP_SWEEP_MAX_DELETES = int(os.environ.get("TEMP_SWEEP_MAX_DELETES", 500))
 TEMP_SWEEP_MAX_PAGES = int(os.environ.get("TEMP_SWEEP_MAX_PAGES", 10))
 TEMP_SWEEP_ON_UPLOAD = env_flag("TEMP_SWEEP_ON_UPLOAD", default=not USE_VERCEL_BLOB)
@@ -528,6 +534,9 @@ def vercel_blob_store_id():
 
 
 SENSITIVE_BLOB_HEADERS = ("authorization", "x-vercel-blob-store-id", "x-api-blob-request-id")
+# Host of BLOB_API_BASE_URL. Object reads use *.blob.vercel-storage.com; the control-plane
+# calls (put/list/delete) use this instead, and the two allowlists are not interchangeable.
+VERCEL_BLOB_API_HOST = "vercel.com"
 
 
 class BlobRedirectHandler(HTTPRedirectHandler):
@@ -547,12 +556,23 @@ class BlobRedirectHandler(HTTPRedirectHandler):
         new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_request is None:
             return None
-        if not is_allowed_vercel_blob_host(urlparse(newurl).hostname):
+        old_host = urlparse(req.full_url).hostname
+        new_host = urlparse(newurl).hostname
+        # Apply the allowlist the ORIGINAL url passed, not the object-host one unconditionally.
+        # Half of all blob traffic starts at vercel.com/api/blob (put, list, delete), whose
+        # host is deliberately NOT in the object allowlist — so checking only that suffix
+        # turned an ordinary same-host canonicalising redirect there into a hard 502,
+        # including on the sweep's own list call. Fail-closed, but a self-inflicted outage.
+        if old_host == VERCEL_BLOB_API_HOST:
+            allowed = new_host == VERCEL_BLOB_API_HOST
+        else:
+            allowed = is_allowed_vercel_blob_host(new_host)
+        if not allowed:
             raise PublicError("Temporary storage redirected off-host.", 502)
         # Same-host hops keep their credentials; anything else is stripped. Compared on the
         # full host, so a redirect to a DIFFERENT store under the allowed suffix also loses
         # the token rather than handing it to a store we do not own.
-        if urlparse(newurl).hostname != urlparse(req.full_url).hostname:
+        if new_host != old_host:
             for header in SENSITIVE_BLOB_HEADERS:
                 new_request.headers.pop(header.capitalize(), None)
                 new_request.headers.pop(header, None)
@@ -623,7 +643,7 @@ def enforce_blob_host_pin(url, parsed):
         })
     )
     if BLOB_HOST_PIN == "enforce":
-        raise PublicError("Invalid temporary file reference.")
+        raise BlobHostPinError("Invalid temporary file reference.")
 
 
 def validate_vercel_blob_url(url, expected_path=None):
@@ -843,6 +863,11 @@ def vercel_blob_delete(descriptor_paths):
             continue
         try:
             urls.append(validate_vercel_blob_url(descriptor["url"], path))
+        except BlobHostPinError:
+            # Deliberately NOT swallowed. Skipping is right for a malformed or
+            # attacker-shaped descriptor; a pin mismatch is a configuration problem, and
+            # silently skipping every URL would report a healthy "removed: 0" forever.
+            raise
         except PublicError:
             continue
     if not urls:
@@ -1013,10 +1038,17 @@ def session_id_from_temp_path(path):
     return parts[1]
 
 
-def expired_session_blobs(blobs, cutoff_epoch, exclude_session_id=None):
+def expired_session_blobs(blobs, cutoff_epoch, exclude_session_id=None, root=None):
     """Pure selector: from a Vercel Blob list page, return the {pathname, url}
     entries under sessions/ or uploads/ that were uploaded at or before `cutoff_epoch`
-    and do not belong to the excluded session. Side-effect free for unit testing."""
+    and do not belong to the excluded session. Side-effect free for unit testing.
+
+    `root` restricts selection to one temp root, and it is what makes the caller's per-root
+    cutoffs safe. The caller applies a DIFFERENT cutoff to each root (uploads expire in an
+    hour, sessions in a day), so without this check the correctness of both rests entirely
+    on the remote listing honouring its `prefix` argument. Any change that dropped or
+    mistyped that prefix would apply the one-hour upload cutoff to sessions/ and delete
+    every other session's live blot files. Cheap invariant; catastrophic to be missing."""
     excluded = safe_id(exclude_session_id) if exclude_session_id else None
     expired = []
     for blob in blobs or []:
@@ -1024,6 +1056,8 @@ def expired_session_blobs(blobs, cutoff_epoch, exclude_session_id=None):
             continue
         pathname = blob.get("pathname") or blob.get("path") or ""
         url = blob.get("url")
+        if root is not None and not pathname.startswith(f"{root}/"):
+            continue
         session_id = session_id_from_temp_path(pathname)
         if not session_id or not isinstance(url, str):
             continue
@@ -1057,7 +1091,8 @@ def sweep_expired_local_files(cutoff_epoch, upload_cutoff_epoch, exclude_session
     for why that root cannot be left to process_storage_upload's `finally`."""
     excluded = safe_id(exclude_session_id) if exclude_session_id else None
     removed = 0
-    for root, root_cutoff in (("sessions", cutoff_epoch), ("uploads", upload_cutoff_epoch)):
+    # uploads/ first, for the starvation reason documented in sweep_expired_vercel_blobs.
+    for root, root_cutoff in (("uploads", upload_cutoff_epoch), ("sessions", cutoff_epoch)):
         base = os.path.join(os.path.abspath(LOCAL_TEMP_DIR), root)
         if not os.path.isdir(base):
             continue
@@ -1104,12 +1139,26 @@ def sweep_expired_vercel_blobs(cutoff_epoch, upload_cutoff_epoch, exclude_sessio
 
     uploads/ gets a much shorter cutoff because it is consumed inside a single request;
     anything older than UPLOAD_FILE_TTL_SECONDS is abandoned by definition."""
-    to_delete = []  # (descriptor, validated_path)
-    for prefix, prefix_cutoff in (("sessions/", cutoff_epoch), ("uploads/", upload_cutoff_epoch)):
+    removed = 0
+    budget = max_deletes
+    # uploads/ FIRST, and the order is load-bearing. Both roots share one delete budget, so
+    # sweeping sessions/ first meant a store expiring more than TEMP_SWEEP_MAX_DELETES
+    # session objects in a day — roughly a busy week of uploads, at 3 objects a blot — would
+    # exhaust the budget before uploads/ was ever listed, and the abandoned-ZIP leak this
+    # function exists to close would persist untouched, in steady state rather than as a
+    # delay (list order is deterministic by pathname, so there is no eventual rotation).
+    # uploads/ holds few objects but the largest ones, so going first costs sessions/ almost
+    # nothing, and a session backlog catches up over successive daily runs.
+    for root, prefix_cutoff in (("uploads", upload_cutoff_epoch), ("sessions", cutoff_epoch)):
+        if budget <= 0:
+            break
+        to_delete = []  # (descriptor, validated_path) — per root, see the delete below
         cursor = None
         for _page in range(TEMP_SWEEP_MAX_PAGES):
-            page = vercel_blob_list(prefix=prefix, cursor=cursor) or {}
-            for blob in expired_session_blobs(page.get("blobs", []), prefix_cutoff, exclude_session_id):
+            page = vercel_blob_list(prefix=f"{root}/", cursor=cursor) or {}
+            for blob in expired_session_blobs(
+                page.get("blobs", []), prefix_cutoff, exclude_session_id, root=root
+            ):
                 try:
                     # allow_uploads: this is the sweep's own listing, not a client-supplied
                     # descriptor, and uploads/<session>/<id>.zip is a shape it must accept.
@@ -1117,18 +1166,23 @@ def sweep_expired_vercel_blobs(cutoff_epoch, upload_cutoff_epoch, exclude_sessio
                 except PublicError:
                     continue
                 to_delete.append(({"url": blob["url"], "pathname": path}, path))
-                if len(to_delete) >= max_deletes:
+                if len(to_delete) >= budget:
                     break
-            if len(to_delete) >= max_deletes or not page.get("hasMore"):
+            if len(to_delete) >= budget or not page.get("hasMore"):
                 break
             cursor = page.get("cursor")
             if not cursor:
                 break
-        if len(to_delete) >= max_deletes:
-            break
-    if not to_delete:
-        return 0
-    return vercel_blob_delete(to_delete)
+        # Delete per root rather than accumulating everything and issuing one call at the
+        # end. vercel_blob_list raises after its own retries on a 429/5xx, and that used to
+        # discard every deletion already collected — zero progress for the whole run, no
+        # partial credit. This range doubled the number of list calls (two prefixes), so it
+        # doubled the chance of hitting that. Now a later failure keeps the earlier root's work.
+        if to_delete:
+            deleted = vercel_blob_delete(to_delete)
+            removed += deleted
+            budget -= deleted
+    return removed
 
 
 _last_temp_sweep_monotonic = None
@@ -1167,7 +1221,15 @@ def sweep_expired_temp_files(
     cutoff_epoch = time.time() - max_age_seconds
     # An abandoned upload is dead the moment its one /process-upload call does not arrive,
     # so it does not need the session TTL's grace. Never longer than the session cutoff.
-    upload_cutoff_epoch = max(cutoff_epoch, time.time() - min(max_age_seconds, UPLOAD_FILE_TTL_SECONDS))
+    # UPLOAD_FILE_TTL_SECONDS <= 0 means "no separate uploads TTL", matching the
+    # max_age_seconds <= 0 convention above. Without that guard it inverted into the most
+    # destructive possible setting: min(..., 0) put the cutoff at now, expiring EVERY upload
+    # including one being streamed by an in-flight /process-upload in another session.
+    upload_cutoff_epoch = cutoff_epoch
+    if UPLOAD_FILE_TTL_SECONDS > 0:
+        upload_cutoff_epoch = max(
+            cutoff_epoch, time.time() - min(max_age_seconds, UPLOAD_FILE_TTL_SECONDS)
+        )
     try:
         if USE_VERCEL_BLOB:
             removed = sweep_expired_vercel_blobs(
@@ -1610,6 +1672,18 @@ class PublicError(Exception):
     def __init__(self, message, status=400):
         super().__init__(message)
         self.status = status
+
+
+class BlobHostPinError(PublicError):
+    """A descriptor URL named a store this deployment does not own, with BLOB_HOST_PIN
+    enforcing. Distinct from PublicError so that callers which intentionally skip malformed
+    descriptors do NOT also skip a configuration problem: vercel_blob_delete's
+    `except PublicError: continue` would otherwise turn a host-shape mismatch into "every
+    URL skipped, 0 deleted, status ok" on every sweep forever — exactly the
+    indistinguishable-from-healthy state the None/500 return was added to eliminate.
+
+    Defined here rather than beside the blob helpers above because it needs PublicError at
+    class-creation time; those helpers only reference it inside function bodies."""
 
 
 def error_response(error, fallback):
