@@ -4,11 +4,11 @@ import { handleUpload, handleUploadPresigned } from "@vercel/blob/client";
 const MAX_UPLOAD_ENV_KEYS = ["MAX_ZIP_BYTES", "MAX_ZIP_UPLOAD_BYTES"];
 const TOKEN_RATE_LIMIT_ENV_KEYS = ["BLOB_UPLOAD_TOKEN_RATE_LIMIT"];
 const DEFAULT_MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
-const DEFAULT_TOKEN_WINDOW_LIMIT = 30;
+const DEFAULT_TOKEN_WINDOW_LIMIT = 6;
 const MAX_TOKEN_BODY_BYTES = 64 * 1024;
 const TOKEN_WINDOW_MS = 60 * 1000;
 const MAX_RATE_LIMIT_CLIENTS = 1000;
-const UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000;
+const UPLOAD_TOKEN_TTL_MS = 5 * 60 * 1000;
 const MAX_UPLOAD_BYTES = positiveIntegerEnv(MAX_UPLOAD_ENV_KEYS, DEFAULT_MAX_UPLOAD_BYTES);
 const TOKEN_WINDOW_LIMIT = positiveIntegerEnv(TOKEN_RATE_LIMIT_ENV_KEYS, DEFAULT_TOKEN_WINDOW_LIMIT);
 const ALLOWED_UPLOAD_CONTENT_TYPES = ["application/zip", "application/x-zip-compressed", "application/octet-stream"];
@@ -66,9 +66,12 @@ function sessionIdFromTokenPayload(tokenPayload) {
 }
 
 function requestIp(request) {
-  return (request.headers.get("x-forwarded-for") || "")
+  const forwarded = process.env.VERCEL === "1"
+    ? request.headers.get("x-vercel-forwarded-for") || request.headers.get("x-forwarded-for") || request.headers.get("x-real-ip")
+    : "";
+  return (forwarded || "")
     .split(",")[0]
-    .trim() || request.headers.get("x-real-ip") || "unknown";
+    .trim() || "unknown";
 }
 
 function pruneUploadTokenHits(cutoff) {
@@ -115,8 +118,19 @@ function isValidUploadPath(pathname, sessionId) {
     && parts[2].toLowerCase().endsWith(".zip");
 }
 
+function envFlag(name) {
+  return ["true", "1", "yes"].includes(String(process.env[name] || "").trim().toLowerCase());
+}
+
 function blobAccess() {
-  return process.env.BLOB_ACCESS === "public" ? "public" : "private";
+  if (String(process.env.BLOB_ACCESS || "").trim().toLowerCase() !== "public") {
+    return "private";
+  }
+  if (!envFlag("BLOB_PUBLIC_ACCESS_ACK")) {
+    logEvent("blob_upload_public_access_blocked");
+    return "private";
+  }
+  return "public";
 }
 
 function publicErrorMessage(error) {

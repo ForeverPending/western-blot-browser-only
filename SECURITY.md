@@ -8,9 +8,14 @@
   store.
 - A random browser-session id is stored in `sessionStorage` and used only to
   namespace temporary upload paths.
-- Blots and scans are not durable application data. Reloading the page clears the
-  visible workspace; temporary backend objects are cleaned up on blot deletion or
-  page close when the browser can send the cleanup request.
+- Blots and scans are not durable application data. The frontend mirrors the
+  workspace to `sessionStorage` so a same-tab reload can recover it, but it is
+  still tied to the browser session. Temporary backend objects are cleaned up on
+  blot deletion, explicit workspace clearing, or the backend TTL sweep. The sweep
+  covers both temp roots — per-blot files under `sessions/` at the normal TTL, and
+  directly uploaded ZIPs under `uploads/` at a shorter one, since an upload is
+  consumed inside a single request and a browser that never calls
+  `/process-upload` leaves nothing else to delete it.
 
 ## Authorization stance
 
@@ -43,8 +48,8 @@
 ## No durable storage guarantee
 
 - This is intentionally not a storage product. Do not rely on the app to preserve
-  blots, scans, or results after reload, tab close, failed cleanup, deployment, or
-  provider lifecycle events.
+  blots, scans, or results after tab close, session storage eviction, failed
+  cleanup, deployment, or provider lifecycle events.
 - Temporary Blob objects may remain if a browser closes before cleanup completes.
   Use provider lifecycle/retention tooling if production needs guaranteed
   expiration.
@@ -59,9 +64,23 @@
   backend/Vercel environment variables.
 - Do not put Blob tokens, backend secrets, or private object URLs in
   `frontend/config.js`.
+- `BLOB_HOST_PIN` ships as `log`. Descriptor URLs are host-checked against
+  `*.blob.vercel-storage.com`, which does not pin the *store*, so a request can
+  name a store this deployment does not own. In `log` mode a mismatch is reported
+  as `blob_host_pin_mismatch` and allowed; every legitimate descriptor is one your
+  own store minted, so the expected count is zero. Once a full traffic cycle
+  confirms that, set `BLOB_HOST_PIN=enforce`.
 - Keep `MAX_ZIP_BYTES`, `MAX_ZIP_UPLOAD_BYTES`, and
   `BLOB_UPLOAD_TOKEN_RATE_LIMIT` aligned with your hosting memory and cost
   limits.
 - Configure Vercel WAF or platform rate limiting for public API routes. The
   in-app rate limits are useful guardrails, not a replacement for edge-level
   abuse controls.
+- Configure `RATELIMIT_STORAGE_URI` with shared Redis/Upstash. Production refuses
+  the in-memory backend unless `ALLOW_IN_MEMORY_RATE_LIMITS=true` explicitly
+  acknowledges equivalent edge controls.
+- Set `CRON_SECRET` to protect the daily `/api/cron-cleanup` request. Vercel sends
+  it in the `Authorization` header; the endpoint fails closed when it is absent.
+- Keep per-client request, concurrent-processing, and uploaded-byte quotas at the
+  edge. The anonymous Blob-token endpoint's in-process limiter is only a local
+  burst guardrail across warm invocations.

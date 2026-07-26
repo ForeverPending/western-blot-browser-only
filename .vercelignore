@@ -1,0 +1,61 @@
+# Kept out of the deployment: none of it is imported at runtime, so shipping it only grows
+# the bundle and widens what the static handler can serve. The root is deployed as-is (see
+# README), and the `/:path*` -> `/frontend/:path*` rewrite runs AFTER the filesystem check,
+# so any real file at a requested path is served verbatim.
+#
+# backend/ is deliberately NOT listed. Every api/*.py function does `from app import ...`,
+# resolved through api/index.py's sys.path insert into backend/ — excluding it would 404 the
+# entire API. Because it ships, everything inside it is potentially fetchable, so the .env
+# rules below are not redundant with .gitignore: .gitignore governs what reaches a
+# git-connected deploy, THIS file governs `vercel --prod` from a working tree, and the CLI's
+# own defaults cover .env.local / .env.*.local but not a plain .env. README tells every
+# developer to create backend/.env, and it holds BLOB_READ_WRITE_TOKEN — read/write/delete
+# on the whole blob store, across every session. Never let it ship.
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+backend/data/
+
+tests/
+docs/
+test_blots/
+test-blots/
+
+venv/
+.venv/
+backend/venv/
+backend/test_security.py
+
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Rebuilt by the install step from package.json + package-lock.json, which DO ship — the
+# @vercel/blob import in api/blob-upload.js resolves from that install, not from an upload.
+node_modules/
+
+# Written by `vercel link` / the first CLI deploy. Holds projectId and orgId; no reason for
+# it to make the round trip back up.
+.vercel/
+
+# macOS writes these into every directory it browses, and each one lists the directory's
+# contents — including names of files since deleted. Three exist in this tree today.
+.DS_Store
+**/.DS_Store
+
+# Local-only data and scratch output, all gitignored, none of it runtime input.
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+.pre-commit-config.yaml
+.claude/
+.vscode/
+.idea/

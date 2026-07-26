@@ -10,24 +10,42 @@ const BLOB_UPLOAD_TIMEOUT_MS = 240000;
 const ZIP_PROCESSING_TIMEOUT_MS = 270000;
 const IMAGE_RENDER_TIMEOUT_MS = 120000;
 const SIGNAL_EXTRACTION_TIMEOUT_MS = 120000;
-const PPTX_EXPORT_TIMEOUT_MS = 180000;
 const DEFAULT_ZIP_UPLOAD_BYTES = 250 * 1024 * 1024;
 const DEFAULT_TABULAR_UPLOAD_BYTES = 25 * 1024 * 1024;
 const JPEG_MIME_TYPE = "image/jpeg";
 const CHART_JPEG_QUALITY = 0.95;
-const PPTX_JPEG_QUALITY = 0.92;
-const PPTX_IMAGE_SLIDE_TYPE = "images";
-const PPTX_GRAPH_SLIDE_TYPE = "graphs";
 const MAX_CANVAS_BOXES = 200;
 const MAX_WORKBOOK_EXPORT_ROWS = 50000;
 const SIGNAL_NUMBER_PATTERN = /^[+-]?(?:(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
 let runtimeConfigPromise = null;
+let sessionRecoveryAvailable = true;
+let sessionStartupWarning = "";
+
+function secureClientId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  throw new Error("This browser cannot create a secure temporary workspace id.");
+}
 
 function browserSessionId() {
-  let sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
-  if (!sessionId) {
-    sessionId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  let sessionId = "";
+  try {
+    sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY) || "";
+    if (!sessionId) {
+      sessionId = secureClientId();
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    }
+  } catch (_error) {
+    sessionRecoveryAvailable = false;
+    sessionStartupWarning = "Tab recovery is unavailable in this browser. Export results before leaving.";
+    sessionId = secureClientId();
   }
   return sessionId;
 }
@@ -38,8 +56,18 @@ function apiUrl(path) {
   return `${BACKEND_URL}${path}`;
 }
 
+// getComputedStyle() forces a style flush and allocates a CSSStyleDeclaration on
+// every call, and these tokens are read many times per canvas/chart frame. The
+// values only change when the theme flips, so cache them and clear on toggleTheme().
+const themeTokenCache = new Map();
+
 function themeToken(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  let value = themeTokenCache.get(name);
+  if (value === undefined) {
+    value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    themeTokenCache.set(name, value);
+  }
+  return value;
 }
 
 function themeFont(weight, size, familyToken = "--font-sans") {
@@ -60,7 +88,11 @@ const state = {
   activeSampleIndex: 0,
   pairedSets: [],
   pairedAnalyses: [],
+  // Custom comparison-chart title ("" = use the generated one). Chart-level rather than
+  // per-analysis, since one comparison chart spans every pair.
+  comparisonTitle: "",
   comparisonCustomGroups: [],
+  replicateRows: [],
 };
 
 const blotState = {
@@ -74,12 +106,21 @@ function delay(ms) {
   return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
+function showUserMessage(message) {
+  window.alert(message);
+}
+
+function confirmUserAction(message) {
+  return window.confirm(message);
+}
+
 async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
   const headers = new Headers(fetchOptions.headers || {});
   headers.set("X-Blot-Session", activeSessionId);
   let timeoutId = null;
   let abortController = null;
   let removeAbortListener = null;
+  let timedOut = false;
   const requestOptions = { ...fetchOptions, headers };
 
   if (timeoutMs > 0) {
@@ -90,7 +131,10 @@ async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
       fetchOptions.signal.addEventListener("abort", abortFromSource, { once: true });
       removeAbortListener = () => fetchOptions.signal.removeEventListener("abort", abortFromSource);
     }
-    timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      abortController.abort();
+    }, timeoutMs);
     requestOptions.signal = abortController.signal;
   }
 
@@ -99,7 +143,7 @@ async function fetchWithTimeout(url, fetchOptions, timeoutMs) {
       ...requestOptions,
     });
   } catch (error) {
-    if (abortController?.signal.aborted && timeoutMs > 0) {
+    if (timedOut) {
       throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
     }
     throw error;
@@ -158,9 +202,11 @@ async function apiJson(url, options = {}, fallback = "Request failed.") {
 
 async function runtimeConfig() {
   if (!runtimeConfigPromise) {
-    runtimeConfigPromise = CONFIG.USE_VERCEL_BLOB_UPLOADS
-      ? apiJson(apiUrl("/client-config"), { timeoutMs: SETUP_API_TIMEOUT_MS, retry: 1 }, "Could not load deployment config.")
-      : Promise.resolve({});
+    runtimeConfigPromise = apiJson(
+      apiUrl("/client-config"),
+      { timeoutMs: SETUP_API_TIMEOUT_MS, retry: 1 },
+      "Could not load deployment config.",
+    );
     runtimeConfigPromise = runtimeConfigPromise.catch(error => {
       runtimeConfigPromise = null;
       throw error;
@@ -212,6 +258,7 @@ const els = {
   resultTableBody: document.querySelector("#resultTableBody"),
   labelPanel: document.querySelector("#labelPanel"),
   labelEditor: document.querySelector("#labelEditor"),
+  graphTitleInput: document.querySelector("#graphTitleInput"),
   groupPanel: document.querySelector("#groupPanel"),
   customGroupingPanel: document.querySelector("#customGroupingPanel"),
   customGroups: document.querySelector("#customGroups"),
@@ -222,6 +269,7 @@ const els = {
   comparisonLabelEditor: document.querySelector("#comparisonLabelEditor"),
   comparisonChartPanel: document.querySelector("#comparisonChartPanel"),
   comparisonChartTitle: document.querySelector("#comparisonChartTitle"),
+  comparisonTitleInput: document.querySelector("#comparisonTitleInput"),
   comparisonChart: document.querySelector("#comparisonChart"),
   downloadComparisonChartButton: document.querySelector("#downloadComparisonChartButton"),
   downloadComparisonWorkbookButton: document.querySelector("#downloadComparisonWorkbookButton"),
@@ -231,6 +279,17 @@ const els = {
   addComparisonCustomGroupButton: document.querySelector("#addComparisonCustomGroupButton"),
   comparisonGroupSummary: document.querySelector("#comparisonGroupSummary"),
   comparisonGroupedCharts: document.querySelector("#comparisonGroupedCharts"),
+  replicatePanel: document.querySelector("#replicatePanel"),
+  enableReplicateStats: document.querySelector("#enableReplicateStats"),
+  replicateBody: document.querySelector("#replicateBody"),
+  replicateHint: document.querySelector("#replicateHint"),
+  replicateTableBody: document.querySelector("#replicateTableBody"),
+  replicateChart: document.querySelector("#replicateChart"),
+  replicateLaneA: document.querySelector("#replicateLaneA"),
+  replicateLaneB: document.querySelector("#replicateLaneB"),
+  replicateTestResult: document.querySelector("#replicateTestResult"),
+  downloadReplicateChartButton: document.querySelector("#downloadReplicateChartButton"),
+  downloadReplicateCsvButton: document.querySelector("#downloadReplicateCsvButton"),
 };
 
 let sharedSampleControls = [];
@@ -284,6 +343,8 @@ els.groupMode.addEventListener("change", () => {
 });
 els.groupSize.addEventListener("input", renderCurrentGrouping);
 els.labelEditor.addEventListener("input", updateSharedLaneLabel);
+els.graphTitleInput.addEventListener("input", updateGraphTitle);
+els.comparisonTitleInput.addEventListener("input", updateComparisonTitle);
 els.sampleTabs.addEventListener("click", selectSampleTab);
 els.customGroups.addEventListener("input", updateCustomGroups);
 els.customGroups.addEventListener("change", updateCustomGroups);
@@ -296,7 +357,13 @@ els.blockGraphs.addEventListener("click", downloadGeneratedChart);
 els.comparisonGroupedCharts.addEventListener("click", downloadGeneratedChart);
 document.addEventListener("click", handleDocumentClick);
 document.addEventListener("change", handleDocumentChange);
-document.querySelector("#generatePptxButton")?.addEventListener("click", generatePptx);
+
+// Feature 3 — replicate statistics panel.
+els.enableReplicateStats?.addEventListener("change", renderReplicatePanel);
+els.replicateLaneA?.addEventListener("change", renderReplicateTest);
+els.replicateLaneB?.addEventListener("change", renderReplicateTest);
+els.downloadReplicateChartButton?.addEventListener("click", () => downloadCanvasJpeg(els.replicateChart, "replicate-means.jpg"));
+els.downloadReplicateCsvButton?.addEventListener("click", downloadReplicateCsv);
 
 renderSharedSampleInputs(1);
 renderPairInputs(2);
@@ -316,9 +383,13 @@ function createAnalysisState(name, title, results, metadata = {}) {
   return {
     name,
     title,
+    // The generated title is kept so clearing the Graph title field can restore it. Both
+    // are per-analysis, so each sample tab carries its own title.
+    autoTitle: title,
     results,
     normalizationLane: metadata.normalizationLane || "",
     loadingControlAdjusted: metadata.loadingControlAdjusted !== false,
+    controlLabel: metadata.controlLabel || "",
     sources: Array.isArray(metadata.sources) ? metadata.sources : [],
     customGroups: createDefaultCustomGroups(results, analysisRowKey),
   };
@@ -1118,6 +1189,11 @@ function invalidateAnalyses() {
   state.pairedAnalyses = [];
   state.comparisonCustomGroups = [];
   state.activeSampleIndex = 0;
+  // A custom title belongs to the run that produced it; new inputs get a fresh auto title.
+  // (Shared-mode titles reset for free, since their analyses are rebuilt.)
+  state.comparisonTitle = "";
+  if (els.comparisonTitleInput) els.comparisonTitleInput.value = "";
+  if (els.graphTitleInput) els.graphTitleInput.value = "";
 
   els.sampleTabsPanel.hidden = true;
   els.sampleTabs.innerHTML = "";
@@ -1128,11 +1204,12 @@ function invalidateAnalyses() {
   els.downloadComparisonWorkbookButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
+  if (els.replicatePanel) els.replicatePanel.hidden = true;
+  state.replicateRows = [];
   els.comparisonLabelPanel.hidden = true;
   els.comparisonChartPanel.hidden = true;
   els.comparisonGroupPanel.hidden = true;
   els.comparisonCustomGroupingPanel.hidden = true;
-  document.getElementById("pptxPanel").hidden = true;
 
   els.chartTitle.textContent = "Upload files to begin";
   els.comparisonChartTitle.textContent = "Comparison graph";
@@ -1218,6 +1295,9 @@ function renderCurrentGrouping() {
 
 function runSharedAnalysis() {
   try {
+    // The loading control is optional and drives normalization implicitly: load a
+    // control and each lane's target is divided by it (relative to the reference
+    // lane); load none and results are the raw target signal relative to reference.
     const controlSource = getSharedControlSource();
     const controlRows = controlSource ? buildSharedRows(controlSource, controlSource.label) : null;
     if (controlSource && !controlRows.length) throw new Error("The control needs readable lanes and signals.");
@@ -1344,6 +1424,7 @@ function buildSharedAnalysis(sampleDataset, index, controlSource, controlRows, n
     computeFoldChange(sampleRows, controlRows, normalizationLane, sampleSource.label, controlLabel),
     {
       normalizationLane,
+      controlLabel,
       loadingControlAdjusted: Boolean(controlSource),
       sources,
     },
@@ -1436,6 +1517,11 @@ function computeFoldChange(sampleRows, controlRows, normalizationLane, sampleLab
   const hasControlRows = Array.isArray(controlRows) && controlRows.length > 0;
   if (hasControlRows) assertUniqueLanes(controlRows, controlLabel);
 
+  // A loading control is optional and drives normalization implicitly: with one,
+  // foldChange = (S_i/L_i) / (S_ref/L_ref); without one, foldChange = S_i / S_ref.
+  // The control may be a housekeeping band (GAPDH, actin…) or a total-protein stain
+  // (REVERT/Ponceau/stain-free) — the math is identical, so which one it is is
+  // recorded via the control's name rather than as a separate mode.
   const sampleMap = new Map(sampleRows.map((row) => [row.lane, row]));
   const controlMap = hasControlRows ? new Map(controlRows.map((row) => [row.lane, row])) : new Map();
   const baselineSample = sampleMap.get(normalizationLane);
@@ -1515,13 +1601,14 @@ function renderActiveSharedAnalysis() {
   els.chartTitle.textContent = analysis.title;
   drawBarChart(els.foldChart, analysis.results, analysis.title);
   renderResultTable(analysis.results);
+  renderGraphTitleField(analysis);
   renderLabelEditor(analysis.results);
   renderGroupedGraphs();
+  renderReplicatePanel();
   els.downloadChartButton.disabled = false;
   els.downloadCsvButton.disabled = false;
   els.downloadWorkbookButton.disabled = false;
   els.labelPanel.hidden = false;
-  document.getElementById("pptxPanel").hidden = false;
   renderWorkflowState();
 }
 
@@ -1609,7 +1696,10 @@ function drawTitle(ctx, canvas, title) {
   ctx.font = themeFont(600, 19);
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
-  ctx.fillText(title, canvas.width / 2, 8);
+  // maxWidth condenses an over-long title instead of letting it spill past the canvas edge
+  // (titles are user-editable, so this is reachable). Condensing keeps every character
+  // visible, unlike clipping or an ellipsis.
+  ctx.fillText(title, canvas.width / 2, 8, canvas.width - 24);
 }
 
 function drawValueLabel(ctx, value, x, y) {
@@ -1628,6 +1718,299 @@ function drawAngledLabel(ctx, text, x, y) {
   ctx.font = themeFont(600, 12);
   ctx.fillText(text, 0, 0);
   ctx.restore();
+}
+
+// ─── Feature 3: replicate statistics (core math) ──────────────────────────────
+// Descriptive stats + an error-bar chart + a Welch t-test. The "Replicates"
+// grouping (renderReplicatePanel) pools same-target sample analyses via
+// buildReplicateRows() and renders drawBarChartWithError(). Descriptive-first:
+// the built-in Welch test is an in-app screen — the UI labels its p-value
+// "confirm in Prism/R" rather than treating it as final.
+function summarizeReplicates(values) {
+  const xs = values.filter((v) => Number.isFinite(v));
+  const n = xs.length;
+  if (!n) return { n: 0, mean: NaN, sd: 0, sem: 0, ci95: 0 };
+  const mean = xs.reduce((a, b) => a + b, 0) / n;
+  const variance = n > 1 ? xs.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0;
+  const sd = Math.sqrt(variance);
+  const sem = n > 1 ? sd / Math.sqrt(n) : 0;
+  return { n, mean, sd, sem, ci95: n > 1 ? tCritical95(n - 1) * sem : 0 };
+}
+
+const T_TABLE_95 = { 1: 12.71, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+  7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086,
+  30: 2.042, 60: 2.0, 120: 1.98 };
+// Two-tailed t critical value at 95%. For a df between tabulated points we linearly
+// interpolate between the two bracketing entries rather than snapping to the next
+// higher df (which biased the CI slightly too narrow — anti-conservative). Exact at
+// df 1-10; beyond the last row (120) it converges to the normal approximation.
+function tCritical95(df) {
+  if (df <= 0) return NaN;
+  const keys = Object.keys(T_TABLE_95).map(Number).sort((a, b) => a - b);
+  if (df <= keys[0]) return T_TABLE_95[keys[0]];
+  if (df >= keys[keys.length - 1]) return 1.96;
+  for (let i = 1; i < keys.length; i += 1) {
+    const hi = keys[i];
+    if (df <= hi) {
+      const lo = keys[i - 1];
+      if (df === hi) return T_TABLE_95[hi];
+      const frac = (df - lo) / (hi - lo);
+      return T_TABLE_95[lo] + frac * (T_TABLE_95[hi] - T_TABLE_95[lo]);
+    }
+  }
+  return 1.96;
+}
+
+// Group replicate analyses by lane label → per-lane mean/SD/SEM/CI over n reps.
+function buildReplicateRows(analyses) {
+  const maps = analyses.map((a) => new Map(a.results.map((r) => [r.displayLane || r.lane, r.foldChange])));
+  if (!maps.length) return [];
+  const labels = [...maps[0].keys()].filter((label) => maps.every((m) => m.has(label)));
+  return labels.map((label) => {
+    const values = maps.map((m) => m.get(label));
+    return { label, values, ...summarizeReplicates(values) };
+  });
+}
+
+function drawBarChartWithError(canvas, rows, title) {
+  const ctx = canvas.getContext("2d");
+  const padding = { top: 42, right: 32, bottom: 92, left: 72 };
+  const plotWidth = canvas.width - padding.left - padding.right;
+  const plotHeight = canvas.height - padding.top - padding.bottom;
+  const maxValue = Math.max(1.2, ...rows.map((r) => r.mean + (r.ci95 || 0))) * 1.16;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = themeToken("--surface");
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid(ctx, canvas, padding, plotHeight, maxValue);
+  const band = plotWidth / Math.max(rows.length, 1);
+  const barWidth = Math.min(56, band * 0.56);
+  rows.forEach((row, index) => {
+    const x = padding.left + band * index + (band - barWidth) / 2;
+    const cx = x + barWidth / 2;
+    const barHeight = (row.mean / maxValue) * plotHeight;
+    const yTop = padding.top + plotHeight - barHeight;
+    ctx.fillStyle = themeToken("--chart-series-1");
+    ctx.fillRect(x, yTop, barWidth, barHeight);
+    if (row.n > 1 && row.ci95) {
+      const hi = padding.top + plotHeight - ((row.mean + row.ci95) / maxValue) * plotHeight;
+      const lo = padding.top + plotHeight - ((row.mean - row.ci95) / maxValue) * plotHeight;
+      ctx.strokeStyle = themeToken("--text");
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(cx, hi); ctx.lineTo(cx, lo);
+      ctx.moveTo(cx - 5, hi); ctx.lineTo(cx + 5, hi);
+      ctx.moveTo(cx - 5, lo); ctx.lineTo(cx + 5, lo);
+      ctx.stroke();
+    }
+    drawValueLabel(ctx, row.mean, cx, yTop - 12);
+    drawAngledLabel(ctx, `${row.label} (n=${row.n})`, cx, padding.top + plotHeight + 18);
+  });
+  drawAxes(ctx, canvas, padding, plotHeight);
+  drawTitle(ctx, canvas, title);
+}
+
+// Welch's unequal-variance t-test (two-tailed p via the regularized incomplete
+// beta). Label any in-tool p-value "confirm in Prism/R" — see Feature 3 notes.
+function welchTTest(a, b) {
+  const A = a.filter(Number.isFinite), B = b.filter(Number.isFinite);
+  const na = A.length, nb = B.length;
+  if (na < 2 || nb < 2) return { t: NaN, df: NaN, p: NaN };
+  const ma = A.reduce((x, y) => x + y, 0) / na;
+  const mb = B.reduce((x, y) => x + y, 0) / nb;
+  const va = A.reduce((x, y) => x + (y - ma) ** 2, 0) / (na - 1);
+  const vb = B.reduce((x, y) => x + (y - mb) ** 2, 0) / (nb - 1);
+  const se = Math.sqrt(va / na + vb / nb);
+  if (se === 0) return { t: NaN, df: NaN, p: NaN };
+  const t = (ma - mb) / se;
+  const df = (va / na + vb / nb) ** 2 /
+    ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1));
+  return { t, df, p: betai(df / 2, 0.5, df / (df + t * t)) };
+}
+function betai(a, b, x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bt = Math.exp(gammaln(a + b) - gammaln(a) - gammaln(b) + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2)
+    ? bt * betacf(a, b, x) / a
+    : 1 - bt * betacf(b, a, 1 - x) / b;
+}
+function betacf(a, b, x) {
+  const MAXIT = 200, EPS = 3e-12, FPMIN = 1e-300;
+  const qab = a + b, qap = a + 1, qam = a - 1;
+  let c = 1, d = 1 - qab * x / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAXIT; m++) {
+    const m2 = 2 * m;
+    let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d; h *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d; const del = d * c; h *= del;
+    if (Math.abs(del - 1) < EPS) break;
+  }
+  return h;
+}
+function gammaln(x) {
+  const cof = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+    -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+  let y = x;
+  let tmp = x + 5.5;
+  tmp -= (x + 0.5) * Math.log(tmp);
+  let ser = 1.000000000190015;
+  for (let j = 0; j < 6; j++) ser += cof[j] / ++y;
+  return -tmp + Math.log(2.5066282746310005 * ser / x);
+}
+
+// ─── Feature 3: replicate statistics UI ───────────────────────────────────────
+// Pools the loaded sample-file analyses (one replicate each) into per-lane
+// mean ± 95% CI, an error-bar chart, and an opt-in Welch t-test between two lanes.
+function setReplicateExportEnabled(enabled) {
+  if (els.downloadReplicateChartButton) els.downloadReplicateChartButton.disabled = !enabled;
+  if (els.downloadReplicateCsvButton) els.downloadReplicateCsvButton.disabled = !enabled;
+}
+
+function renderReplicatePanel() {
+  const panel = els.replicatePanel;
+  if (!panel) return;
+  const analyses = state.sharedAnalyses;
+  const canReplicate = state.mode === "shared" && analyses.length >= 2;
+  panel.hidden = !canReplicate;
+  if (!canReplicate) {
+    state.replicateRows = [];
+    return;
+  }
+
+  const enabled = els.enableReplicateStats.checked;
+  els.replicateBody.hidden = !enabled;
+  if (!enabled) {
+    els.replicateHint.textContent =
+      `${analyses.length} sample files are loaded. Enable this to pool them as replicates and show mean ± 95% CI per lane.`;
+    state.replicateRows = [];
+    setReplicateExportEnabled(false);
+    return;
+  }
+
+  const rows = buildReplicateRows(analyses);
+  state.replicateRows = rows;
+  if (!rows.length) {
+    els.replicateHint.textContent =
+      "No lane label is shared across every sample file, so replicates can't be pooled. Align lane names first.";
+    els.replicateTableBody.innerHTML = `<tr><td colspan="6">No shared lanes.</td></tr>`;
+    drawChartMessage(els.replicateChart, "No shared lanes across replicates");
+    populateReplicateLaneSelects([]);
+    els.replicateTestResult.textContent = "";
+    setReplicateExportEnabled(false);
+    return;
+  }
+
+  els.replicateHint.textContent =
+    `Pooled across ${analyses.length} replicates (each loaded sample file counts as one replicate). ` +
+    `Values are fold changes relative to lane "${analyses[0].normalizationLane}".`;
+  renderReplicateTable(rows);
+  drawBarChartWithError(els.replicateChart, rows, "Replicate mean fold change (95% CI)");
+  populateReplicateLaneSelects(rows);
+  renderReplicateTest();
+  setReplicateExportEnabled(true);
+}
+
+function renderReplicateTable(rows) {
+  els.replicateTableBody.innerHTML = rows
+    .map(
+      (row) => `
+        <tr>
+          <td>${escapeHtml(row.label)}</td>
+          <td>${row.n}</td>
+          <td><strong>${formatNumber(row.mean)}</strong></td>
+          <td>${formatNumber(row.sd)}</td>
+          <td>${formatNumber(row.sem)}</td>
+          <td>${row.n > 1 ? formatNumber(row.ci95) : "N/A"}</td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function populateReplicateLaneSelects(rows) {
+  const labels = rows.map((row) => row.label);
+  const options = labels
+    .map((label) => `<option value="${escapeHtml(label)}">${escapeHtml(label)}</option>`)
+    .join("");
+  [els.replicateLaneA, els.replicateLaneB].forEach((select, index) => {
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = options;
+    if (labels.includes(previous)) select.value = previous;
+    else if (labels.length > index) select.value = labels[index];
+  });
+}
+
+function renderReplicateTest() {
+  if (!els.replicateTestResult) return;
+  const rows = state.replicateRows;
+  if (!rows || rows.length < 2) {
+    els.replicateTestResult.textContent = "Load at least two lanes to compare.";
+    return;
+  }
+  const a = rows.find((row) => row.label === els.replicateLaneA.value);
+  const b = rows.find((row) => row.label === els.replicateLaneB.value);
+  if (!a || !b) {
+    els.replicateTestResult.textContent = "";
+    return;
+  }
+  if (a.label === b.label) {
+    els.replicateTestResult.textContent = "Pick two different lanes to compare.";
+    return;
+  }
+  const result = welchTTest(a.values, b.values);
+  if (!Number.isFinite(result.p)) {
+    els.replicateTestResult.textContent =
+      `Need at least 2 replicates with variance in both "${a.label}" and "${b.label}" to run a t-test.`;
+    return;
+  }
+  els.replicateTestResult.textContent =
+    `${a.label} vs ${b.label}: t(${result.df.toFixed(1)}) = ${result.t.toFixed(3)}, p = ${formatPValue(result.p)}.`;
+}
+
+function formatPValue(p) {
+  if (!Number.isFinite(p)) return "N/A";
+  if (p < 0.0001) return "< 0.0001";
+  return p.toFixed(4);
+}
+
+function downloadReplicateCsv() {
+  const rows = state.replicateRows;
+  if (!rows || !rows.length) return;
+  const maxReps = Math.max(...rows.map((row) => row.values.length));
+  const repHeaders = Array.from({ length: maxReps }, (_, i) => `Rep ${i + 1}`);
+  const header = ["Lane", "n", "Mean", "SD", "SEM", "95% CI", ...repHeaders].map(csvCell).join(",");
+  const lines = [
+    header,
+    ...rows.map((row) =>
+      [
+        row.label,
+        row.n,
+        formatNumber(row.mean),
+        formatNumber(row.sd),
+        formatNumber(row.sem),
+        row.n > 1 ? formatNumber(row.ci95) : "N/A",
+        ...row.values.map((v) => formatNumber(v)),
+      ]
+        .map(csvCell)
+        .join(","),
+    ),
+  ];
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "replicate-summary.csv";
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function renderResultTable(rows) {
@@ -1668,6 +2051,25 @@ function updateSharedLaneLabel(event) {
   drawBarChart(els.foldChart, analysis.results, analysis.title);
   renderResultTable(analysis.results);
   renderGroupedGraphs();
+}
+
+// Shows the active analysis's title, with the generated one as the placeholder so it is
+// obvious what clearing the field falls back to. Called on every tab switch, since the
+// title is per-analysis.
+function renderGraphTitleField(analysis) {
+  if (!els.graphTitleInput) return;
+  els.graphTitleInput.value = analysis.title === analysis.autoTitle ? "" : analysis.title;
+  els.graphTitleInput.placeholder = analysis.autoTitle || "";
+}
+
+function updateGraphTitle(event) {
+  const analysis = activeAnalysis();
+  if (!analysis) return;
+  // Blank restores the generated title rather than leaving the chart untitled. The canvas
+  // title is redrawn here so the exported JPG matches what is on screen.
+  analysis.title = event.target.value.trim() || analysis.autoTitle;
+  els.chartTitle.textContent = analysis.title;
+  drawBarChart(els.foldChart, analysis.results, analysis.title);
 }
 
 function renderGroupedGraphs() {
@@ -1924,19 +2326,61 @@ function updateComparisonLaneLabel(event) {
   renderComparisonChart();
 }
 
+// The generated title tracks the chart type, matching what the draw functions used as their
+// own defaults — so an unedited chart exports exactly the same text as before.
+function comparisonAutoTitle() {
+  return els.comparisonChartType.value === "points"
+    ? "Average with individual points"
+    : "Grouped bar comparison";
+}
+
+function currentComparisonTitle() {
+  return state.comparisonTitle || comparisonAutoTitle();
+}
+
+// One title feeds both the heading and the canvas; they used to disagree (the heading said
+// "Common lane comparison" while the exported JPG said "Grouped bar comparison").
+function drawComparisonInto(canvas, rows, title) {
+  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
+  if (els.comparisonChartType.value === "points") {
+    drawAveragePointChart(canvas, rows, seriesNames, title);
+  } else {
+    drawGroupedComparisonChart(canvas, rows, seriesNames, title);
+  }
+}
+
+function renderComparisonTitleField() {
+  if (!els.comparisonTitleInput) return;
+  els.comparisonTitleInput.value = state.comparisonTitle;
+  els.comparisonTitleInput.placeholder = comparisonAutoTitle();
+}
+
+function updateComparisonTitle(event) {
+  state.comparisonTitle = event.target.value.trim();
+  if (!state.pairedAnalyses.length) return;
+  let rows;
+  try {
+    rows = buildComparisonRows();
+  } catch {
+    return;   // renderComparisonChart owns error reporting; a keystroke shouldn't throw
+  }
+  // With no shared lanes the heading carries a status message, not a title — leave it.
+  if (!rows.length) return;
+  const title = currentComparisonTitle();
+  els.comparisonChartTitle.textContent = title;
+  drawComparisonInto(els.comparisonChart, rows, title);
+  // Grouped graphs below are titled by group name, so they need no redraw here.
+}
+
 function renderComparisonChart() {
   if (!state.pairedAnalyses.length) return false;
   try {
     const rows = buildComparisonRows();
-    els.comparisonChartTitle.textContent = rows.length
-      ? "Common lane comparison"
-      : "No shared lane labels found";
+    renderComparisonTitleField();   // keeps the placeholder in step with the chart type
+    const title = currentComparisonTitle();
+    els.comparisonChartTitle.textContent = rows.length ? title : "No shared lane labels found";
 
-    if (els.comparisonChartType.value === "points") {
-      drawAveragePointChart(els.comparisonChart, rows, state.pairedAnalyses.map((analysis) => analysis.name));
-    } else {
-      drawGroupedComparisonChart(els.comparisonChart, rows, state.pairedAnalyses.map((analysis) => analysis.name));
-    }
+    drawComparisonInto(els.comparisonChart, rows, title);
 
     els.downloadComparisonChartButton.disabled = false;
     els.downloadComparisonWorkbookButton.disabled = false;
@@ -2016,7 +2460,6 @@ function renderComparisonGroupSummary(groups) {
 }
 
 function renderComparisonMiniCharts(groups) {
-  const seriesNames = state.pairedAnalyses.map((analysis) => analysis.name);
   els.comparisonGroupedCharts.innerHTML = groups
     .map(
       (group, index) => `
@@ -2029,13 +2472,9 @@ function renderComparisonMiniCharts(groups) {
     )
     .join("");
 
+  // Each grouped graph is titled by its group name, independent of the main chart title.
   groups.forEach((group, index) => {
-    const canvas = document.querySelector(`#comparisonGroupChart${index}`);
-    if (els.comparisonChartType.value === "points") {
-      drawAveragePointChart(canvas, group.rows, seriesNames, group.name);
-    } else {
-      drawGroupedComparisonChart(canvas, group.rows, seriesNames, group.name);
-    }
+    drawComparisonInto(document.querySelector(`#comparisonGroupChart${index}`), group.rows, group.name);
   });
 }
 
@@ -2215,42 +2654,34 @@ function downloadSharedCsv() {
 function downloadSharedWorkbook() {
   if (!state.sharedAnalyses.length || !ensureWorkbookExporter()) return;
   if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.sharedAnalyses))) return;
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Summary", sharedWorkbookSummaryRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Fold changes", sharedWorkbookResultRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", sharedWorkbookInputRows());
-
-    const groupRows = sharedWorkbookGroupRows();
-    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
-
-    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.sharedAnalyses));
-    downloadWorkbookFile(workbook, "western-blot-shared-analysis.xlsx");
-  } catch (error) {
-    alert(`Workbook export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: "western-blot-shared-analysis.xlsx",
+    sheets: [
+      { name: "Summary", rows: sharedWorkbookSummaryRows() },
+      { name: "Fold changes", rows: sharedWorkbookResultRows() },
+      { name: "Input signals", rows: sharedWorkbookInputRows() },
+      { name: "Grouped values", rows: sharedWorkbookGroupRows(), optional: true },
+    ],
+    scanRefs: scanRefsForAnalyses(state.sharedAnalyses),
+    errorPrefix: "Workbook export failed",
+  });
 }
 
 function downloadComparisonWorkbook() {
   if (!state.pairedAnalyses.length || !ensureWorkbookExporter()) return;
   if (!ensureWorkbookRowBudget(estimateWorkbookRows(state.pairedAnalyses))) return;
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Summary", comparisonWorkbookSummaryRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Common lanes", comparisonWorkbookCommonRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Pair fold changes", comparisonWorkbookPairRows());
-    appendWorkbookSheet(workbook, usedSheetNames, "Input signals", comparisonWorkbookInputRows());
-
-    const groupRows = comparisonWorkbookGroupRows();
-    if (groupRows.length) appendWorkbookSheet(workbook, usedSheetNames, "Grouped values", groupRows);
-
-    appendScanSheets(workbook, usedSheetNames, scanRefsForAnalyses(state.pairedAnalyses));
-    downloadWorkbookFile(workbook, "western-blot-comparison-analysis.xlsx");
-  } catch (error) {
-    alert(`Workbook export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: "western-blot-comparison-analysis.xlsx",
+    sheets: [
+      { name: "Summary", rows: comparisonWorkbookSummaryRows() },
+      { name: "Common lanes", rows: comparisonWorkbookCommonRows() },
+      { name: "Pair fold changes", rows: comparisonWorkbookPairRows() },
+      { name: "Input signals", rows: comparisonWorkbookInputRows() },
+      { name: "Grouped values", rows: comparisonWorkbookGroupRows(), optional: true },
+    ],
+    scanRefs: scanRefsForAnalyses(state.pairedAnalyses),
+    errorPrefix: "Workbook export failed",
+  });
 }
 
 function downloadScanAuditWorkbook(blotId, scanIndex) {
@@ -2259,27 +2690,41 @@ function downloadScanAuditWorkbook(blotId, scanIndex) {
   const scan = scansForBlot(blotId)[scanIndex];
   if (!blot || !scan) return;
 
-  try {
-    const workbook = XLSX.utils.book_new();
-    const usedSheetNames = new Set();
-    appendWorkbookSheet(workbook, usedSheetNames, "Scan metadata", scanMetadataRows({ blotId, scanId: scan.id }));
-    appendWorkbookSheet(workbook, usedSheetNames, "Extraction audit", scanAuditRows({ blotId, scanId: scan.id }));
-    downloadWorkbookFile(workbook, `${filenameSafe(blot.name)}-${filenameSafe(scan.proteinName)}-audit.xlsx`);
-  } catch (error) {
-    alert(`Audit export failed: ${error.message}`);
-  }
+  downloadWorkbookSheets({
+    filename: `${filenameSafe(blot.name)}-${filenameSafe(scan.proteinName)}-audit.xlsx`,
+    sheets: [
+      { name: "Scan metadata", rows: scanMetadataRows({ blotId, scanId: scan.id }) },
+      { name: "Extraction audit", rows: scanAuditRows({ blotId, scanId: scan.id }) },
+    ],
+    errorPrefix: "Audit export failed",
+  });
 }
 
 function ensureWorkbookExporter() {
   if (window.XLSX?.utils?.book_new && window.XLSX?.writeFile) return true;
-  alert("The Excel exporter has not loaded yet. Check the network connection and retry.");
+  showUserMessage("The Excel exporter has not loaded yet. Check the network connection and retry.");
   return false;
 }
 
 function ensureWorkbookRowBudget(rowCount) {
   if (rowCount <= MAX_WORKBOOK_EXPORT_ROWS) return true;
-  alert(`Workbook export is too large (${rowCount.toLocaleString()} rows). Reduce inputs or export smaller pieces before trying again.`);
+  showUserMessage(`Workbook export is too large (${rowCount.toLocaleString()} rows). Reduce inputs or export smaller pieces before trying again.`);
   return false;
+}
+
+function downloadWorkbookSheets({ filename, sheets, scanRefs = [], errorPrefix = "Workbook export failed" }) {
+  try {
+    const workbook = XLSX.utils.book_new();
+    const usedSheetNames = new Set();
+    sheets.forEach(({ name, rows, optional = false }) => {
+      if (optional && !rows.length) return;
+      appendWorkbookSheet(workbook, usedSheetNames, name, rows);
+    });
+    if (scanRefs.length) appendScanSheets(workbook, usedSheetNames, scanRefs);
+    downloadWorkbookFile(workbook, filename);
+  } catch (error) {
+    showUserMessage(`${errorPrefix}: ${error.message}`);
+  }
 }
 
 function estimateWorkbookRows(analyses) {
@@ -2339,11 +2784,13 @@ function sharedWorkbookSummaryRows() {
   const loadingControlModes = [...new Set(state.sharedAnalyses.map((analysis) =>
     analysis.loadingControlAdjusted ? "Applied" : "Skipped",
   ))];
+  const controlLabels = [...new Set(state.sharedAnalyses.map((analysis) => analysis.controlLabel).filter(Boolean))];
   return [
     { Setting: "Generated at", Value: new Date().toISOString() },
     { Setting: "Mode", Value: "Multiple samples, optional control" },
     { Setting: "Normalization lane", Value: normalizationLanes.join(", ") },
     { Setting: "Loading control adjustment", Value: loadingControlModes.join(", ") },
+    { Setting: "Loading control", Value: controlLabels.join(", ") || "None" },
     { Setting: "Analyses", Value: state.sharedAnalyses.length },
     { Setting: "Active analysis", Value: activeAnalysis()?.name || "" },
     { Setting: "Grouped graphs", Value: els.enableGroupedGraphs.checked ? "Enabled" : "Disabled" },
@@ -2540,16 +2987,33 @@ function scanMetadataRows(filters = {}) {
     "Scan ID": scan.id,
     "Saved at": scan.createdAt || "",
     Channel: `${scan.channel}nm`,
-    Background: scan.backgroundAxis,
+    Background: scan.backgroundSides ?? scan.backgroundAxis,
+    "Border px": scan.borderWidth ?? 3,
+    "Background stat": scan.backgroundStat ?? "median",
     Lanes: scan.lanes.length,
     "Color mode": scan.settings?.colorMode || "",
-    "Brightness 700": scan.settings?.brightness700 ?? "",
-    "Contrast 700": scan.settings?.contrast700 ?? "",
-    "Gamma 700": scan.settings?.gamma700 ?? "",
-    "Brightness 800": scan.settings?.brightness800 ?? "",
-    "Contrast 800": scan.settings?.contrast800 ?? "",
-    "Gamma 800": scan.settings?.gamma800 ?? "",
+    ...displaySettingColumns(scan),
   }));
+}
+
+// Display-window provenance for exports, in raw counts. Replaces the old Brightness /
+// Contrast columns, which described a control that no longer exists. Blank means the
+// channel was left on its automatic window.
+function displaySettingColumns(scan) {
+  const settings = scan.settings || {};
+  return {
+    // Which channels were actually visible, so a saved scan records that e.g. 800nm was
+    // switched off rather than leaving its window values looking meaningful.
+    "Channels shown": Array.isArray(settings.enabledChannels)
+      ? settings.enabledChannels.map((channel) => `${channel}nm`).join(" + ")
+      : "",
+    "Black point 700": settings.displayMin700 ?? "",
+    "White point 700": settings.displayMax700 ?? "",
+    "Gamma 700": settings.gamma700 ?? "",
+    "Black point 800": settings.displayMin800 ?? "",
+    "White point 800": settings.displayMax800 ?? "",
+    "Gamma 800": settings.gamma800 ?? "",
+  };
 }
 
 function scanAuditRows(filters = {}) {
@@ -2562,24 +3026,29 @@ function scanAuditRows(filters = {}) {
       "Scan ID": scan.id,
       "Saved at": scan.createdAt || "",
       Channel: `${scan.channel}nm`,
-      Background: scan.backgroundAxis,
+      Background: scan.backgroundSides ?? scan.backgroundAxis,
+      "Border px": scan.borderWidth ?? 3,
+      "Background stat": scan.backgroundStat ?? "median",
       "Lane #": laneIndex + 1,
       Lane: lane.name,
       "Adjusted signal": lane.adjustedSignal ?? lane.signal,
       "Raw signal": lane.rawSignal ?? "",
       "Background signal": lane.backgroundSignal ?? "",
+      "Background per px": lane.backgroundPerPixel ?? "",
+      // Without this the two cells above read "0" for a lane that was never subtracted,
+      // identical to one measured against a genuinely zero background. The save-time
+      // confirm makes it a decision; this is what makes the decision auditable afterwards.
+      "Background subtracted": lane.backgroundMissing ? "No" : "Yes",
+      "Saturated px": lane.saturatedPixels ?? 0,
+      "Saturated fraction": lane.saturatedFraction ?? 0,
+      "Max pixel": lane.maxPixel ?? "",
       X: lane.x ?? "",
       Y: lane.y ?? "",
       W: lane.w ?? "",
       H: lane.h ?? "",
       "Area px2": lane.area ?? "",
       "Color mode": scan.settings?.colorMode || "",
-      "Brightness 700": scan.settings?.brightness700 ?? "",
-      "Contrast 700": scan.settings?.contrast700 ?? "",
-      "Gamma 700": scan.settings?.gamma700 ?? "",
-      "Brightness 800": scan.settings?.brightness800 ?? "",
-      "Contrast 800": scan.settings?.contrast800 ?? "",
-      "Gamma 800": scan.settings?.gamma800 ?? "",
+      ...displaySettingColumns(scan),
     })),
   );
 }
@@ -2613,7 +3082,7 @@ function showSharedError(message) {
   els.downloadWorkbookButton.disabled = true;
   els.labelPanel.hidden = true;
   els.groupPanel.hidden = true;
-  document.getElementById("pptxPanel").hidden = true;
+  if (els.replicatePanel) els.replicatePanel.hidden = true;
 }
 
 function downloadGeneratedChart(event) {
@@ -2766,6 +3235,7 @@ function toggleTheme() {
   const next = activeTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   try { window.localStorage.setItem("blot-theme", next); } catch (_error) { /* ignore */ }
+  themeTokenCache.clear();  // tokens differ per theme; drop the stale cache
   syncThemeToggle();
   redrawThemedViews();
 }
@@ -2788,12 +3258,49 @@ function createCanvasState() {
     isDrawing: false,
     startX: 0,
     startY: 0,
+    drawCurrentX: 0,
+    drawCurrentY: 0,
     lastPanX: 0,
     lastPanY: 0,
     selectedBoxIndex: null,
     currentBlotId: null,
     imageWidth: 0,
     imageHeight: 0,
+    rotationDeg: 0,           // per-blot straighten angle (deg); applied to display + detect + extract
+    // Automatic band detection (/detect-bands). All coordinates below live in the same
+    // composite space as `boxes`, so previews and committed boxes need no remapping.
+    detection: null,          // { laneProfile, imageWidth, candidates, activeId } after a detect call
+    detectionPreview: null,   // composite-space boxes drawn dashed before the user commits
+    lanePreview: null,        // [{x, w}] full-height lane columns for the live lane-split slider
+    laneThreshold: null,      // last lane-threshold slider value (0..1)
+    // Lanes-first editing (stage A): the user confirms/edits the lane split before bands
+    // are detected. lanes are full-height composite-space columns [{x, w}].
+    laneEdit: null,           // { lanes:[{x,w}], profile:[...], imageWidth, selected:number|null }
+    laneDrag: null,           // { kind:'move'|'resize-l'|'resize-r'|'new', index, grabX } during a drag
+    // Mouse resize (handle) / move (body) of a drawn box. Holds the grab point and the
+    // box's geometry as of the press, so every pointermove recomputes from the original
+    // rect rather than accumulating deltas (which drifts).
+    boxDrag: null,            // { index, kind:'nw'|…|'w'|'move', grabX, grabY, startX, startY, startW, startH }
+    // Raw-count statistics per channel from /channel-stats, used to label and bound the
+    // display-window sliders in real intensity units. null until the fetch lands; the
+    // backend renders its own auto window in the meantime.
+    channelStats: null,       // { "700": {min,max,autoMin,autoMax,…}, "800": {…} }
+    // Live display-window preview. pixelBuffer holds both channels' raw intensities in
+    // composite space (/channel-pixels) so a slider drag recomposites locally instead of
+    // waiting on a server render; previewCanvas is the offscreen result renderCanvas draws.
+    pixelBuffer: null,        // { width, height, channels: { 700: {data,scale}, 800: {…} } }
+    previewCanvas: null,      // offscreen canvas at composite size, or null to use `image`
+    previewDirty: false,      // true once a local preview has diverged from the server image
+    histograms: null,         // { "700": Float64Array, "800": Float64Array } binned counts
+    // Per-channel on/off. A disabled channel is dropped from the composite AND from the
+    // Quantify channel choices, so it cannot be measured while switched off. Composite
+    // dimensions are unaffected (see prepare_composite_channels), so boxes never move.
+    enabledChannels: { 700: true, 800: true },
+    // Red/green vs black & white is ONE shared setting, not per channel: the composite is a
+    // single image, so two channels shown at once cannot be in different looks. Each
+    // channel's Off / colour / B&W select writes here and the most recent pick wins for
+    // both, which is why there is no per-channel colorMode.
+    colorMode: "color",       // "color" | "grayscale"
   };
 }
 
@@ -2801,29 +3308,69 @@ let canvasState = createCanvasState();
 let canvasReloadTimer = null;
 let canvasImageController = null;
 let canvasImageRequestId = 0;
+let detectionRequestId = 0;
+let canvasResizeObserver = null;
 const signalExtractionControllers = new Set();
 const blotListElement = document.querySelector("#blotList");
 const blotScrollUpButton = document.querySelector("#blotScrollUp");
 const blotScrollDownButton = document.querySelector("#blotScrollDown");
+const cancelZipUploadButton = document.querySelector("#cancelZipUploadButton");
+let activeZipUploadController = null;
+let zipUploadQueueItems = [];
 
 document.querySelector("#zipFileInput")?.addEventListener("change", async (event) => {
   const files = Array.from(event.target.files);
-  for (const file of files) {
-    await uploadZip(file);
+  zipUploadQueueItems = files.map(file => ({ file, status: "Queued", error: "" }));
+  renderZipUploadQueue();
+  for (const item of zipUploadQueueItems) {
+    const controller = new AbortController();
+    activeZipUploadController = controller;
+    cancelZipUploadButton.hidden = false;
+    item.status = "Processing";
+    renderZipUploadQueue();
+    const result = await uploadZip(item.file, controller.signal);
+    item.status = result.ok ? "Imported" : (result.cancelled ? "Cancelled" : "Failed");
+    item.error = result.error || "";
+    renderZipUploadQueue();
   }
+  activeZipUploadController = null;
+  cancelZipUploadButton.hidden = true;
+  const imported = zipUploadQueueItems.filter(item => item.status === "Imported").length;
+  const failed = zipUploadQueueItems.length - imported;
+  setZipUploadStatus(
+    failed ? `${imported} ZIP file(s) imported; ${failed} not imported.` : `${imported} ZIP file(s) imported.`,
+    failed === 0,
+  );
   event.target.value = "";
 });
 
-document.querySelector("#blotList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-blot-index]");
-  if (!button) return;
-  selectBlot(Number(button.dataset.blotIndex));
-});
+cancelZipUploadButton?.addEventListener("click", () => activeZipUploadController?.abort());
+
+function renderZipUploadQueue() {
+  const list = document.querySelector("#zipUploadQueue");
+  if (!list) return;
+  list.replaceChildren(...zipUploadQueueItems.map(item => {
+    const row = document.createElement("li");
+    row.className = `upload-queue-item status-${item.status.toLowerCase()}`;
+    const name = document.createElement("span");
+    name.textContent = item.file.name;
+    const stateLabel = document.createElement("span");
+    stateLabel.textContent = item.error ? `${item.status}: ${item.error}` : item.status;
+    row.append(name, stateLabel);
+    return row;
+  }));
+  list.hidden = zipUploadQueueItems.length === 0;
+}
 
 document.querySelector("#blotList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-blot-delete]");
-  if (!button) return;
-  deleteBlot(Number(button.dataset.blotDelete), button);
+  const deleteButton = event.target.closest("[data-blot-delete]");
+  if (deleteButton) {
+    deleteBlot(Number(deleteButton.dataset.blotDelete), deleteButton);
+    return;
+  }
+
+  const selectButton = event.target.closest("[data-blot-index]");
+  if (selectButton) selectBlot(Number(selectButton.dataset.blotIndex));
 });
 
 blotScrollUpButton?.addEventListener("click", () => scrollBlotList(-1));
@@ -2834,10 +3381,24 @@ if (window.ResizeObserver && blotListElement) {
 }
 document.querySelectorAll("[data-blot-analysis-tab]").forEach(button => {
   button.addEventListener("click", () => setBlotAnalysisTab(button.dataset.blotAnalysisTab));
+  button.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = Array.from(document.querySelectorAll("[data-blot-analysis-tab]"));
+    const current = tabs.indexOf(event.currentTarget);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const next = tabs[nextIndex];
+    setBlotAnalysisTab(next.dataset.blotAnalysisTab);
+    next.focus();
+  });
 });
 
 function clientId(prefix) {
-  return `${prefix}-${window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+  return `${prefix}-${secureClientId()}`;
 }
 
 function normalizeBlot(blot) {
@@ -2851,18 +3412,48 @@ function normalizeBlot(blot) {
     ? blot.files
     : {};
   const createdAt = typeof blot.createdAt === "string" ? blot.createdAt : "";
-  return { ...blot, id, name, files, createdAt };
+  const fingerprint = typeof blot.fingerprint === "string" ? blot.fingerprint.trim() : "";
+  return { ...blot, id, name, files, createdAt, fingerprint };
 }
 
+// Content hash of a blot's measured channels, or "" when unknown. Blots saved by an older
+// version have no fingerprint, and "" must NEVER count as a match — otherwise every
+// legacy blot would look identical to every other one.
+function blotFingerprint(blot) {
+  return typeof blot?.fingerprint === "string" ? blot.fingerprint.trim() : "";
+}
+
+function findBlotByFingerprint(fingerprint, pool) {
+  if (!fingerprint) return null;
+  return pool.find((candidate) => blotFingerprint(candidate) === fingerprint) || null;
+}
+
+// Merges uploaded blots into state, skipping any whose content is already loaded. Blot ids
+// are regenerated on every upload, so re-uploading the same ZIP would otherwise stack up
+// identical copies. Returns { added, duplicates } — the caller is responsible for releasing
+// the skipped blots' temp files, which the backend has already stored by this point.
 function mergeBlots(blots) {
   if (!Array.isArray(blots)) throw new Error("ZIP processing returned invalid blot data.");
   const activeBlotId = blotState.blots[blotState.activeBlotIndex]?.id;
+  const added = [];
+  const duplicates = [];
   blots.map(normalizeBlot).forEach((blot) => {
     const existingIndex = blotState.blots.findIndex((candidate) => candidate.id === blot.id);
     if (existingIndex >= 0) {
+      // Same id: a refresh of a blot we already have, not a duplicate. Keep the merge
+      // behaviour so re-processing an upload can fill in fields.
       blotState.blots[existingIndex] = { ...blotState.blots[existingIndex], ...blot };
     } else {
+      // Check against what is already loaded AND against earlier blots in this same batch,
+      // so a ZIP containing the same folder twice collapses to one too.
+      const twin = findBlotByFingerprint(blotFingerprint(blot), blotState.blots)
+        || findBlotByFingerprint(blotFingerprint(blot), added);
+      if (twin) {
+        duplicates.push({ blot, existing: twin });
+        return;
+      }
       blotState.blots.push(blot);
+      added.push(blot);
     }
     if (!blotState.scans[blot.id]) blotState.scans[blot.id] = [];
   });
@@ -2871,6 +3462,21 @@ function mergeBlots(blots) {
     ? blotState.blots.findIndex((blot) => blot.id === activeBlotId)
     : -1;
   blotState.activeBlotIndex = activeIndex >= 0 ? activeIndex : null;
+  return { added, duplicates };
+}
+
+// One line describing what a merge skipped, naming the blot it already had so the user can
+// tell an accidental re-upload from two genuinely different scans.
+function duplicateSkipMessage(duplicates) {
+  if (!duplicates.length) return "";
+  if (duplicates.length === 1) {
+    const { blot, existing } = duplicates[0];
+    const sameName = blot.name === existing.name;
+    return sameName
+      ? `Skipped "${blot.name}" — already loaded.`
+      : `Skipped "${blot.name}" — same image data as "${existing.name}", already loaded.`;
+  }
+  return `Skipped ${duplicates.length} blots already loaded.`;
 }
 
 function sortBlotsByCreatedAt() {
@@ -2960,7 +3566,7 @@ function ensureActiveBlotVisible() {
 
 async function deleteBlot(index, button) {
   const blot = blotState.blots[index];
-  if (!blot || !window.confirm(`Remove “${blot.name}” and its session scans? This cannot be undone.`)) return;
+  if (!blot || !confirmUserAction(`Remove “${blot.name}” and its session scans? This cannot be undone.`)) return;
 
   button.disabled = true;
   button.textContent = "Deleting…";
@@ -3101,6 +3707,11 @@ function normalizeScan(scan) {
         adjustedSignal: signal,
         rawSignal: finiteNumberOrNull(lane.rawSignal),
         backgroundSignal: finiteNumberOrNull(lane.backgroundSignal),
+        backgroundPerPixel: finiteNumberOrNull(lane.backgroundPerPixel),
+        backgroundMissing: lane.backgroundMissing === true,
+        saturatedPixels: finiteNumberOrNull(lane.saturatedPixels) ?? 0,
+        saturatedFraction: finiteNumberOrNull(lane.saturatedFraction) ?? 0,
+        maxPixel: finiteNumberOrNull(lane.maxPixel),
         x,
         y,
         w,
@@ -3112,7 +3723,12 @@ function normalizeScan(scan) {
   if (!lanes.length) return null;
   const id = typeof scan.id === "string" && scan.id.trim() ? scan.id.trim() : clientId("scan");
   const channel = ["700", "800"].includes(String(scan.channel)) ? String(scan.channel) : "700";
-  const backgroundAxis = ["leftright", "topbottom"].includes(String(scan.backgroundAxis)) ? String(scan.backgroundAxis) : "leftright";
+  const backgroundSides = ["leftright", "topbottom", "allsides"].includes(String(scan.backgroundSides))
+    ? String(scan.backgroundSides)
+    : (["leftright", "topbottom", "allsides"].includes(String(scan.backgroundAxis)) ? String(scan.backgroundAxis) : "leftright");
+  const backgroundAxis = ["leftright", "topbottom"].includes(backgroundSides) ? backgroundSides : "leftright";
+  const borderWidth = Math.max(1, Math.min(5, Number(scan.borderWidth) || 3));
+  const backgroundStat = ["median", "mean"].includes(String(scan.backgroundStat)) ? String(scan.backgroundStat) : "median";
   const createdAt = typeof scan.createdAt === "string" ? scan.createdAt : "";
   const settings = scan.settings && typeof scan.settings === "object" && !Array.isArray(scan.settings)
     ? scan.settings
@@ -3123,6 +3739,9 @@ function normalizeScan(scan) {
     proteinName: String(scan.proteinName ?? "Untitled scan").trim() || "Untitled scan",
     channel,
     backgroundAxis,
+    backgroundSides,
+    borderWidth,
+    backgroundStat,
     createdAt,
     settings,
     lanes,
@@ -3197,48 +3816,73 @@ function refreshScanDropdown(role, index) {
   refreshNormalizationLanes();
 }
 
-async function uploadZip(file) {
-  const maxBytes = Number(CONFIG.MAX_ZIP_UPLOAD_BYTES || DEFAULT_ZIP_UPLOAD_BYTES);
+async function uploadZip(file, signal) {
+  let deploymentConfig;
+  try {
+    deploymentConfig = await runtimeConfig();
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  const configuredMax = CONFIG.USE_VERCEL_BLOB_UPLOADS
+    ? deploymentConfig.maxZipUploadBytes
+    : deploymentConfig.maxDirectUploadBytes;
+  const maxBytes = Number(configuredMax || CONFIG.MAX_ZIP_UPLOAD_BYTES || DEFAULT_ZIP_UPLOAD_BYTES);
   const mimeType = String(file.type || "").toLowerCase();
   if (!file.name.toLowerCase().endsWith(".zip") || !ALLOWED_ZIP_MIME_TYPES.has(mimeType)) {
-    alert("Please select a ZIP file.");
-    return;
+    return { ok: false, error: "Please select a ZIP file." };
   }
   if (file.size > maxBytes) {
-    alert(`ZIP is too large. Maximum size is ${Math.floor(maxBytes / 1024 / 1024)} MB.`);
-    return;
+    return { ok: false, error: `ZIP is too large. Maximum size is ${Math.floor(maxBytes / 1024 / 1024)} MB.` };
   }
 
   try {
     setZipUploadStatus(`Processing ${file.name}...`);
-    const data = await processZipFile(file);
+    const data = await processZipFile(file, signal);
 
-    mergeBlots(data.blots || []);
+    const { added, duplicates } = mergeBlots(data.blots || []);
     if (data.scans) {
       Object.entries(data.scans).forEach(([blotId, scans]) => {
         setScansForBlot(blotId, scans);
       });
     }
+    // The backend stored these before we knew they were duplicates, so release them rather
+    // than leaving orphaned temp files behind until the session sweep.
+    if (duplicates.length) {
+      void cleanupBlots(duplicates.map((entry) => entry.blot));
+    }
     renderBlotList();
     refreshBlotDependentControls();
     saveWorkspace();
-    setZipUploadStatus(`${file.name} imported.`, true);
+    const skipped = duplicateSkipMessage(duplicates);
+    if (added.length) {
+      setZipUploadStatus(
+        skipped ? `${file.name} imported (${added.length} added). ${skipped}` : `${file.name} imported.`,
+        true,
+      );
+    } else if (skipped) {
+      // Nothing new: say so plainly instead of reporting a successful import.
+      setZipUploadStatus(`Nothing to import from ${file.name}. ${skipped}`, true);
+    } else {
+      setZipUploadStatus(`${file.name} imported.`, true);
+    }
+    return { ok: true };
   } catch (error) {
-    setZipUploadStatus("");
-    alert(`Failed to load ZIP: ${error.message}`);
+    const cancelled = signal?.aborted || error.name === "AbortError" || /cancelled/i.test(error.message);
+    return { ok: false, cancelled, error: cancelled ? "Cancelled by user." : error.message };
   }
 }
 
-async function processZipFile(file) {
+async function processZipFile(file, signal) {
   if (CONFIG.USE_VERCEL_BLOB_UPLOADS) {
     setZipUploadStatus(`Uploading ${file.name}...`);
-    const blob = await uploadZipToVercelBlob(file);
+    const blob = await uploadZipToVercelBlob(file, signal);
     setZipUploadStatus(`Processing ${file.name}...`);
     return apiJson(apiUrl("/process-upload"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: activeSessionId, upload: blob }),
       timeoutMs: ZIP_PROCESSING_TIMEOUT_MS,
+      signal,
     }, "ZIP processing failed.");
   }
 
@@ -3249,19 +3893,22 @@ async function processZipFile(file) {
     method: "POST",
     body: form,
     timeoutMs: ZIP_PROCESSING_TIMEOUT_MS,
+    signal,
   }, "ZIP processing failed.");
 }
 
-async function uploadZipToVercelBlob(file) {
+async function uploadZipToVercelBlob(file, sourceSignal) {
   const [config, uploadStatus] = await Promise.all([
     runtimeConfig(),
     blobUploadStatus(),
   ]);
-  const uploadId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const uploadId = secureClientId();
   const configuredAccess = uploadStatus.blobAccess || config.blobAccess || CONFIG.BLOB_ACCESS;
   const blobAccess = configuredAccess === "public" ? "public" : "private";
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), BLOB_UPLOAD_TIMEOUT_MS);
+  const abortFromSource = () => controller.abort();
+  sourceSignal?.addEventListener("abort", abortFromSource, { once: true });
 
   try {
     return await manualPresignedUpload(`uploads/${activeSessionId}/${uploadId}.zip`, file, {
@@ -3270,11 +3917,14 @@ async function uploadZipToVercelBlob(file) {
     });
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new Error("Blob upload timed out before Vercel returned a stored file reference.");
+      throw new Error(sourceSignal?.aborted
+        ? "Blob upload was cancelled."
+        : "Blob upload timed out before Vercel returned a stored file reference.");
     }
     throw error;
   } finally {
     window.clearTimeout(timeoutId);
+    sourceSignal?.removeEventListener("abort", abortFromSource);
   }
 }
 
@@ -3405,7 +4055,7 @@ function uploadFileWithProgress(url, file, options) {
     xhr.setRequestHeader("x-content-type", options.contentType);
     xhr.setRequestHeader("x-vercel-blob-access", options.access);
     xhr.setRequestHeader("x-vercel-blob-store-id", options.storeId);
-    xhr.setRequestHeader("x-api-blob-request-id", `${options.storeId}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
+    xhr.setRequestHeader("x-api-blob-request-id", `${options.storeId}:${Date.now()}:${secureClientId()}`);
     xhr.setRequestHeader("x-api-blob-request-attempt", "0");
     xhr.send(file);
   });
@@ -3469,6 +4119,10 @@ async function selectBlot(index) {
     renderBlotAnalysis(blot.id);
     initCanvas(blot.id);
     bindBlotViewerControls(blot.id);
+    // Both fire-and-forget: the sliders read "auto" and the backend renders its own window
+    // until these land, so the first paint is never blocked on either. Stats first — the
+    // histogram and the LUT both need the channel's raw range to bin and window against.
+    void loadChannelStats(blot.id).then(() => loadChannelPixels(blot.id));
   } catch (error) {
     preview.innerHTML = `<p class="blot-empty-state">Failed to load blot: ${escapeHtml(error.message)}</p>`;
     renderBlotAnalysisEmpty(`Failed to load blot: ${error.message}`);
@@ -3479,7 +4133,8 @@ function blotViewerHtml() {
   return `
     <div class="blot-viewer">
       <div class="blot-canvas-wrap">
-        <canvas id="blotCanvas" role="img" aria-label="Blot image viewer. Draw boxes over lanes to quantify them; drawn boxes and their signals are listed in the Drawn boxes tab."></canvas>
+        <p class="visually-hidden" id="blotCanvasInstructions">Use pointer drag to pan or draw. In pan mode, drag a box to move it, or drag any of the eight square handles on the selected box's edges and corners to resize it. Keyboard users can press A to add a centered box, arrow keys to move the selected box, plus or minus to zoom, and Delete to remove it.</p>
+        <canvas id="blotCanvas" tabindex="0" aria-describedby="blotCanvasInstructions" aria-label="Interactive blot image viewer"></canvas>
       </div>
     </div>
   `;
@@ -3491,18 +4146,10 @@ function renderBlotAnalysis(blotId) {
   if (toolsPanel) {
     toolsPanel.innerHTML = `
       <div class="blot-controls-bar">
-        ${analysisSectionHtml("Measurement", blotModeControlsHtml(), { hint: "affects results", open: true })}
-        ${analysisSectionHtml(
-          "Display",
-          channelAdjustmentControlsHtml("red", "700") + channelAdjustmentControlsHtml("green", "800"),
-          { hint: "view only" },
-        )}
+        ${analysisSectionHtml("Background", backgroundControlsHtml())}
+        ${analysisSectionHtml("Display", displayControlsHtml())}
         ${analysisSectionHtml("Boxes", boxToolControlsHtml(), { open: true })}
-        ${analysisSectionHtml("Selected box", boxLayoutControlsHtml(), {
-          id: "selectedBoxSection",
-          open: true,
-          hidden: true,
-        })}
+        ${analysisSectionHtml("Detect bands", detectionControlsHtml(), { id: "detectionSection" })}
       </div>
     `;
   }
@@ -3541,6 +4188,7 @@ function setBlotAnalysisTab(tabName) {
     const isActive = button.dataset.blotAnalysisTab === nextTab;
     button.classList.toggle("active", isActive);
     button.setAttribute("aria-selected", String(isActive));
+    button.tabIndex = isActive ? 0 : -1;
   });
   document.querySelectorAll("[data-blot-analysis-panel]").forEach(panel => {
     panel.hidden = panel.dataset.blotAnalysisPanel !== nextTab;
@@ -3548,11 +4196,10 @@ function setBlotAnalysisTab(tabName) {
 }
 
 // Wraps a group of analysis controls in a collapsible <details> section so the
-// panel reads as a few labelled headers instead of one long flat list. `hidden`
-// keeps a section (e.g. "Selected box") out of the DOM flow until it's relevant.
-function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = "", hidden = false } = {}) {
+// panel reads as a few labelled headers instead of one long flat list.
+function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = "" } = {}) {
   return `
-    <details class="blot-control-section"${id ? ` id="${id}"` : ""}${open ? " open" : ""}${hidden ? " hidden" : ""}>
+    <details class="blot-control-section"${id ? ` id="${id}"` : ""}${open ? " open" : ""}>
       <summary class="blot-section-summary">
         <span class="blot-section-title">${title}</span>
         ${hint ? `<span class="blot-section-hint">${hint}</span>` : ""}
@@ -3565,135 +4212,745 @@ function analysisSectionHtml(title, bodyHtml, { hint = "", open = false, id = ""
   `;
 }
 
-function blotModeControlsHtml() {
+// Which strips flanking each box get sampled as its background reference, how wide they
+// are, and how they are reduced to one number. All three feed currentBackgroundConfig(),
+// so they change the measured signal — they are not view-only settings.
+function backgroundControlsHtml() {
   return `
     <div class="blot-control-group">
-      <label>Color mode
-        <select id="colorMode">
-          <option value="color">Red / Green</option>
-          <option value="grayscale">Black & White</option>
+      <p class="control-hint">Sampled from strips just outside each box, then subtracted from its signal. The dotted outlines on the image show exactly what gets measured.</p>
+      <label>Sides
+        <select id="backgroundAxis">
+          <option value="leftright">Left & Right</option>
+          <option value="topbottom">Top & Bottom</option>
+          <option value="allsides">All sides</option>
         </select>
       </label>
+      <label>Border px
+        <select id="backgroundBorderWidth">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3" selected>3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+        </select>
+      </label>
+      <label>Background stat
+        <select id="backgroundStat">
+          <option value="median" selected>Median</option>
+          <option value="mean">Mean</option>
+        </select>
+      </label>
+    </div>
+  `;
+}
+
+// Display window controls, per channel. This is Image Studio's model rather than the
+// brightness/contrast pair it replaced: the black and white points are absolute cuts on
+// RAW COUNTS, so moving the white point past a band's core is what reveals its shape, and
+// pulling it down is what makes faint bands visible. Brightness/contrast could not do
+// either — contrast pivoted at mid-gray while a blot's median pixel sits near 0.015 of
+// the range, so one step above 1.0 crushed the whole image to black, and brightness was
+// an additive pedestal that lifted band and background equally.
+//
+// The two sliders carry raw-count values, but the range they span is only known per blot
+// (see /channel-stats), so they run on a unit 0..1000 track and DISPLAY_SLIDER_CURVE maps
+// position -> counts. The mapping is deliberately non-linear: a blot's useful window is a
+// few hundred counts inside a range whose top end is set by a handful of hot pixels, so a
+// linear track would bury every usable setting in its first 3%.
+const DISPLAY_SLIDER_STEPS = 1000;
+const DISPLAY_SLIDER_CURVE = 2;
+const DEFAULT_DISPLAY_GAMMA = 1;
+
+// One select per channel replaces the old on/off checkbox plus the separate global "Color
+// mode" dropdown: a checkbox said whether a channel was on but not what it would look like,
+// and the two controls together made "800nm off, grayscale" take two widgets to read. The
+// colour option is named for the channel's own colour (700nm renders red, 800nm green)
+// because with the other channel off that is literally all you see.
+function channelAdjustmentControlsHtml(colorClass, channel) {
+  const colorName = colorClass === "red" ? "Red" : "Green";
+  return `
+    <div class="blot-control-group" data-channel="${channel}">
+      <label class="channel-toggle">
+        <span class="channel-label ${colorClass}">${channel}nm</span>
+        <select id="channelMode${channel}">
+          <option value="off">Off</option>
+          <option value="color">${colorName}</option>
+          <option value="grayscale">Black &amp; White</option>
+        </select>
+      </label>
+      <div class="channel-body" id="channelBody${channel}">
+        <canvas class="display-histogram" id="histogram${channel}" width="240" height="40" hidden
+                role="img" aria-label="${channel}nm intensity distribution with the current black and white points marked"></canvas>
+        <label>
+          <span class="display-window-head">Black point
+            <span class="display-window-value" id="displayMinValue${channel}">auto</span>
+          </span>
+          <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="0"
+                 id="displayMin${channel}" aria-label="${channel}nm black point" />
+        </label>
+        <label>
+          <span class="display-window-head">White point
+            <span class="display-window-value" id="displayMaxValue${channel}">auto</span>
+          </span>
+          <input type="range" min="0" max="${DISPLAY_SLIDER_STEPS}" step="1" value="${DISPLAY_SLIDER_STEPS}"
+                 id="displayMax${channel}" aria-label="${channel}nm white point" />
+        </label>
+        <label>
+          <span class="display-window-head">Gamma
+            <span class="display-window-value" id="gammaValue${channel}">1.00</span>
+          </span>
+          <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
+        </label>
+        <button class="ghost-button" id="autoWindow${channel}" type="button"
+                data-channel="${channel}">Auto ${channel}nm</button>
+      </div>
+    </div>
+  `;
+}
+
+// ── Channel enable/disable ───────────────────────────────────────────────────────
+// Two separate ideas, kept distinct on purpose:
+//   AVAILABLE — this blot actually has that TIF. /channel-stats only reports channels it
+//     could read, so a single-channel blot has one available channel and the other can
+//     never be switched on.
+//   ENABLED — the user wants it shown. Only meaningful for available channels.
+const ALL_CHANNELS = ["700", "800"];
+
+function availableChannels() {
+  // Before /channel-stats lands, assume both: the server renders both by default, and
+  // guessing "one" here would briefly hide a channel that does exist.
+  if (!canvasState.channelStats) return [...ALL_CHANNELS];
+  return ALL_CHANNELS.filter((channel) => canvasState.channelStats[channel]);
+}
+
+function isChannelEnabled(channel) {
+  return availableChannels().includes(channel) && canvasState.enabledChannels?.[channel] !== false;
+}
+
+function enabledChannels() {
+  return availableChannels().filter(isChannelEnabled);
+}
+
+// Force-disable channels this blot does not have, so enabledChannels() can never name a
+// channel with no pixels behind it.
+function syncChannelAvailability() {
+  ALL_CHANNELS.forEach((channel) => {
+    if (!availableChannels().includes(channel)) canvasState.enabledChannels[channel] = false;
+  });
+}
+
+// Rebuild the Quantify channel options from the enabled set. Returns true when the
+// selected channel had to change, which the caller must follow up on: the boxes' signals
+// were measured against the old channel and are stale the moment it switches.
+function syncQuantChannelOptions() {
+  const select = document.getElementById("quantChannel");
+  if (!select) return false;
+  const enabled = enabledChannels();
+  if (!enabled.length) return false;
+  const previous = select.value;
+  select.innerHTML = enabled
+    .map((channel) => `<option value="${channel}">${channel}nm</option>`)
+    .join("");
+  if (enabled.includes(previous)) {
+    select.value = previous;
+    return false;
+  }
+  select.value = enabled[0];
+  return true;
+}
+
+function currentColorMode() {
+  return canvasState.colorMode === "grayscale" ? "grayscale" : "color";
+}
+
+// Reflect the enabled set AND the shared look in the controls: a disabled channel's window
+// sliders and histogram are hidden (they would adjust something invisible), and the last
+// remaining channel cannot be switched off so the frame can never go completely blank.
+// Note only the "Off" option is disabled there, not the whole select — a single-channel
+// view still has to be switchable between colour and black & white.
+function syncChannelControls() {
+  const enabled = enabledChannels();
+  const available = availableChannels();
+  ALL_CHANNELS.forEach((channel) => {
+    const select = document.getElementById(`channelMode${channel}`);
+    const body = document.getElementById(`channelBody${channel}`);
+    const on = isChannelEnabled(channel);
+    if (select) {
+      // An "on" channel always shows the shared mode, so flipping one select to B&W is
+      // what visibly drags the other one with it.
+      select.value = on ? currentColorMode() : "off";
+      select.disabled = !available.includes(channel);   // no pixels behind it at all
+      const offOption = select.querySelector('option[value="off"]');
+      if (offOption) offOption.disabled = on && enabled.length === 1;
+    }
+    if (body) body.hidden = !on;
+  });
+}
+
+function setChannelStatus(message) {
+  const status = document.getElementById("channelStatus");
+  if (status) status.textContent = message;
+}
+
+function onChannelModeChange(channel, blotId) {
+  const select = document.getElementById(`channelMode${channel}`);
+  const wanted = select?.value ?? "off";
+  if (wanted === "off") {
+    if (enabledChannels().length <= 1) {
+      // Belt and braces: syncChannelControls already disables this option.
+      if (select) select.value = currentColorMode();
+      setChannelStatus("At least one channel has to stay on.");
+      return;
+    }
+    canvasState.enabledChannels[channel] = false;
+  } else {
+    canvasState.enabledChannels[channel] = true;
+    // Picking a look here sets it for the whole composite, so if the other channel is also
+    // on it follows — syncChannelControls() pulls its select into line. Two channels shown
+    // at once cannot disagree about colour.
+    canvasState.colorMode = wanted;
+  }
+  applyChannelEnablement(blotId, { announce: true });
+}
+
+// Single place that pushes the enabled set through everything that depends on it.
+function applyChannelEnablement(blotId, { announce = false } = {}) {
+  syncChannelAvailability();
+  syncChannelControls();
+  const quantChanged = syncQuantChannelOptions();
+  const active = enabledChannels();
+
+  if (quantChanged) {
+    const channel = document.getElementById("quantChannel")?.value ?? active[0];
+    // Detection results and lane edits belong to the old channel; reuse the same handling
+    // as a manual channel switch rather than leaving stale lanes on screen.
+    if (canvasState.detection) {
+      cancelDetection(blotId);
+    } else if (canvasState.laneEdit) {
+      void redetectLanesAtThreshold(blotId, { note: `Quantify channel is now ${channel}nm.` });
+    }
+    // Re-measure: every box's signal came from the channel that just went away.
+    if (canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+    }
+    if (announce) {
+      setChannelStatus(`${channel}nm is now the quantify channel; boxes re-measured.`);
+    }
+  } else if (announce) {
+    const off = ALL_CHANNELS.filter((channel) => !isChannelEnabled(channel));
+    const look = currentColorMode() === "grayscale" ? "black & white" : "colour";
+    setChannelStatus(off.length
+      ? `${off.join("nm and ")}nm hidden; ${look} view.`
+      : `Both channels shown in ${look}.`);
+  }
+
+  refreshDisplayPreview();                    // instant, from the local pixel buffer
+  scheduleCanvasImageReload(blotId, true);    // authoritative server render
+}
+
+// ── Display window: slider track <-> raw counts ─────────────────────────────────
+function channelStatsFor(channel) {
+  return canvasState.channelStats?.[channel] || null;
+}
+
+function displaySliderToCount(position, stats) {
+  const t = Math.min(1, Math.max(0, Number(position) / DISPLAY_SLIDER_STEPS));
+  return stats.min + (stats.max - stats.min) * Math.pow(t, DISPLAY_SLIDER_CURVE);
+}
+
+function displayCountToSlider(count, stats) {
+  const span = stats.max - stats.min;
+  if (!(span > 0)) return 0;
+  const fraction = Math.min(1, Math.max(0, (Number(count) - stats.min) / span));
+  return Math.round(Math.pow(fraction, 1 / DISPLAY_SLIDER_CURVE) * DISPLAY_SLIDER_STEPS);
+}
+
+function formatCount(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 100) return String(Math.round(value));
+  if (Math.abs(value) >= 10) return value.toFixed(1);
+  return value.toFixed(2);
+}
+
+// The window each channel is currently displaying, in raw counts. Returns null before
+// /channel-stats lands so buildCompositePayload can omit the keys and let the backend
+// apply its own auto window — the first paint must not wait on the stats round trip.
+function currentDisplayWindow(channel) {
+  const stats = channelStatsFor(channel);
+  if (!stats) return null;
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (!minInput || !maxInput) return null;
+  const low = displaySliderToCount(minInput.value, stats);
+  const high = displaySliderToCount(maxInput.value, stats);
+  // A degenerate pair would render a blank frame, so keep a floor of one slider step.
+  if (!(high > low)) return null;
+  return { low, high };
+}
+
+function currentDisplayGamma(channel) {
+  const value = Number(document.getElementById(`gamma${channel}`)?.value);
+  return Number.isFinite(value) ? value : DEFAULT_DISPLAY_GAMMA;
+}
+
+function updateDisplayWindowReadout(channel) {
+  const stats = channelStatsFor(channel);
+  const gammaLabel = document.getElementById(`gammaValue${channel}`);
+  if (gammaLabel) gammaLabel.textContent = currentDisplayGamma(channel).toFixed(2);
+  const window = stats ? currentDisplayWindow(channel) : null;
+  // The slider's own value is a position on an abstract 0..1000 track, which would be
+  // meaningless read aloud, so aria-valuetext carries the raw count instead.
+  [["displayMin", window && window.low], ["displayMax", window && window.high]].forEach(([prefix, count]) => {
+    const label = document.getElementById(`${prefix}Value${channel}`);
+    const text = Number.isFinite(count) ? `${formatCount(count)} counts` : "auto";
+    if (label) label.textContent = Number.isFinite(count) ? formatCount(count) : "auto";
+    document.getElementById(`${prefix}${channel}`)?.setAttribute("aria-valuetext", text);
+  });
+}
+
+// Puts both sliders on this channel's auto window. Called when stats first arrive and by
+// the per-channel Auto button, so "Auto" always means the same thing the backend would
+// have picked on its own.
+function applyAutoDisplayWindow(channel) {
+  const stats = channelStatsFor(channel);
+  if (!stats) return;
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (minInput) minInput.value = String(displayCountToSlider(stats.autoMin, stats));
+  if (maxInput) maxInput.value = String(displayCountToSlider(stats.autoMax, stats));
+  updateDisplayWindowReadout(channel);
+}
+
+// Keeps the black point strictly below the white point. Whichever slider the user moved
+// wins; the other is pushed one step out of the way rather than snapping to it, so a
+// drag never collapses the window into a blank image.
+function enforceWindowOrder(channel, movedId) {
+  const minInput = document.getElementById(`displayMin${channel}`);
+  const maxInput = document.getElementById(`displayMax${channel}`);
+  if (!minInput || !maxInput) return;
+  const low = Number(minInput.value);
+  const high = Number(maxInput.value);
+  if (low < high) return;
+  if (movedId === minInput.id) maxInput.value = String(Math.min(DISPLAY_SLIDER_STEPS, low + 1));
+  else minInput.value = String(Math.max(0, high - 1));
+}
+
+// ── Live display-window preview ──────────────────────────────────────────────────
+// /channel-pixels hands over both channels' intensities in composite space, so dragging a
+// slider recomposites locally in ~1ms instead of waiting on a render round trip. The
+// debounced server render still runs and replaces this preview when it lands: the server
+// is authoritative (it is what exports use), and the local path quantizes counts to uint16
+// so the two can differ by at most one 8-bit level.
+const PIXEL_BUFFER_MAGIC = "WBP1";
+const PIXEL_BUFFER_HEADER_BYTES = 32;
+const PIXEL_QUANTIZE_CURVE = 2;   // must match PIXEL_QUANTIZE_CURVE in backend/app.py
+const QUANTIZE_MAX = 65535;
+const HISTOGRAM_BINS = 256;
+
+function parsePixelBuffer(bytes) {
+  if (bytes.byteLength < PIXEL_BUFFER_HEADER_BYTES) throw new Error("Pixel buffer is truncated.");
+  const view = new DataView(bytes);
+  const magic = String.fromCharCode(...new Uint8Array(bytes, 0, 4));
+  if (magic !== PIXEL_BUFFER_MAGIC) throw new Error("Unexpected pixel buffer format.");
+  const width = view.getUint32(4, true);
+  const height = view.getUint32(8, true);
+  const channelCount = view.getUint32(12, true);
+  if (channelCount !== 2) throw new Error("Expected two channels.");
+  const pixels = width * height;
+  const expected = PIXEL_BUFFER_HEADER_BYTES + pixels * channelCount * 2;
+  if (!pixels || bytes.byteLength !== expected) throw new Error("Pixel buffer size mismatch.");
+  const scales = [
+    { min: view.getFloat32(16, true), max: view.getFloat32(20, true) },
+    { min: view.getFloat32(24, true), max: view.getFloat32(28, true) },
+  ];
+  return {
+    width,
+    height,
+    channels: {
+      700: { data: new Uint16Array(bytes, PIXEL_BUFFER_HEADER_BYTES, pixels), scale: scales[0] },
+      800: { data: new Uint16Array(bytes, PIXEL_BUFFER_HEADER_BYTES + pixels * 2, pixels), scale: scales[1] },
+    },
+  };
+}
+
+// Decode one quantized sample back to raw counts. The inverse of the backend's curve.
+function decodeQuantized(step, scale) {
+  const t = step / QUANTIZE_MAX;
+  return scale.min + (scale.max - scale.min) * Math.pow(t, PIXEL_QUANTIZE_CURVE);
+}
+
+// A 65536-entry quantized-value -> 8-bit lookup, so compositing costs one array read per
+// pixel rather than a pow() per pixel. Rebuilt per slider event; the table is what makes
+// the live preview cheap enough to run on every input event.
+function buildDisplayLut(channel) {
+  const buffer = canvasState.pixelBuffer?.channels?.[channel];
+  if (!buffer) return null;
+  // A disabled channel maps everything to 0, which is exactly what build_composite does
+  // server-side (it zeroes the array). Doing it in the LUT keeps the compositing loop
+  // branch-free and makes toggling a channel a local repaint with no refetch.
+  if (!isChannelEnabled(channel)) return new Uint8Array(QUANTIZE_MAX + 1);
+  const stats = channelStatsFor(channel);
+  const window = currentDisplayWindow(channel)
+    || (stats ? { low: stats.autoMin, high: stats.autoMax } : null);
+  if (!window) return null;
+  const gamma = currentDisplayGamma(channel);
+  const span = window.high - window.low;
+  if (!(span > 0)) return null;
+  const lut = new Uint8Array(QUANTIZE_MAX + 1);
+  for (let step = 0; step <= QUANTIZE_MAX; step += 1) {
+    const counts = decodeQuantized(step, buffer.scale);
+    let normalized = (counts - window.low) / span;
+    normalized = normalized < 0 ? 0 : normalized > 1 ? 1 : normalized;
+    if (gamma !== 1) normalized = Math.pow(normalized, gamma);
+    lut[step] = Math.round(normalized * 255);
+  }
+  return lut;
+}
+
+// Recomposite both channels into the offscreen preview canvas that renderCanvas draws.
+// Returns false when there is no pixel buffer yet, so callers can fall back to the server.
+function renderLocalPreview() {
+  const buffer = canvasState.pixelBuffer;
+  if (!buffer) return false;
+  const lut700 = buildDisplayLut("700");
+  const lut800 = buildDisplayLut("800");
+  if (!lut700 || !lut800) return false;
+
+  const { width, height } = buffer;
+  let target = canvasState.previewCanvas;
+  if (!target || target.width !== width || target.height !== height) {
+    target = document.createElement("canvas");
+    target.width = width;
+    target.height = height;
+    canvasState.previewCanvas = target;
+  }
+  const ctx = target.getContext("2d", { willReadFrequently: true });
+  const image = ctx.createImageData(width, height);
+  const out = image.data;
+  const src700 = buffer.channels[700].data;
+  const src800 = buffer.channels[800].data;
+  const grayscale = currentColorMode() === "grayscale";
+
+  for (let i = 0, p = 0; i < src700.length; i += 1, p += 4) {
+    const r = lut700[src700[i]];
+    const g = lut800[src800[i]];
+    if (grayscale) {
+      // Server-side equivalent: 1 - clip(a + b). Rounding through the two 8-bit LUTs
+      // instead of summing floats can differ by a level; the server render corrects it.
+      const sum = r + g;
+      const gray = 255 - (sum > 255 ? 255 : sum);
+      out[p] = gray; out[p + 1] = gray; out[p + 2] = gray;
+    } else {
+      out[p] = r; out[p + 1] = g; out[p + 2] = 0;
+    }
+    out[p + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  canvasState.previewDirty = true;
+  return true;
+}
+
+// Repaint from the local buffer if we can, otherwise leave the current image alone and let
+// the debounced server render catch up.
+function refreshDisplayPreview() {
+  // Only preview once the server image has established the composite dimensions the rest
+  // of the viewer works in (zoom, pan, box coords). Substituting a differently sized source
+  // before then would draw boxes against the wrong frame.
+  const buffer = canvasState.pixelBuffer;
+  if (!buffer || canvasState.imageWidth !== buffer.width || canvasState.imageHeight !== buffer.height) {
+    return;
+  }
+  if (renderLocalPreview()) renderCanvas();
+}
+
+async function loadChannelPixels(blotId) {
+  const blot = blotById(blotId);
+  if (!blot) return;
+  const rotationDeg = canvasState.rotationDeg || 0;
+  try {
+    const response = await apiFetch(apiUrl("/channel-pixels"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSessionId, blot, rotationDeg }),
+      timeoutMs: IMAGE_RENDER_TIMEOUT_MS,
+    });
+    if (!response.ok) {
+      // 413 (blot too large) is expected and benign — the server keeps rendering instead.
+      canvasState.pixelBuffer = null;
+      return;
+    }
+    const parsed = parsePixelBuffer(await response.arrayBuffer());
+    // Rotation or blot may have changed while this was in flight; a stale buffer would be
+    // in the wrong frame and shift the preview out of register with the boxes.
+    if (canvasState.currentBlotId !== blotId) return;
+    if ((canvasState.rotationDeg || 0) !== rotationDeg) return;
+    canvasState.pixelBuffer = parsed;
+    drawAllHistograms();
+  } catch (error) {
+    canvasState.pixelBuffer = null;
+    console.warn("Live display adjustment unavailable; using server rendering", error);
+  }
+}
+
+// ── Histogram ────────────────────────────────────────────────────────────────────
+// Where a channel's pixels actually sit, which is the other thing Image Studio gives you
+// and this app did not: without it, setting a window is guesswork.
+function channelHistogram(channel) {
+  const buffer = canvasState.pixelBuffer?.channels?.[channel];
+  const stats = channelStatsFor(channel);
+  if (!buffer || !stats) return null;
+  const span = stats.max - stats.min;
+  if (!(span > 0)) return null;
+  const bins = new Float64Array(HISTOGRAM_BINS);
+  const data = buffer.data;
+  for (let i = 0; i < data.length; i += 1) {
+    const counts = decodeQuantized(data[i], buffer.scale);
+    // Bin on the same curve the sliders use, so a bar sits under the thumb that selects it.
+    const fraction = Math.pow(Math.min(1, Math.max(0, (counts - stats.min) / span)), 1 / DISPLAY_SLIDER_CURVE);
+    bins[Math.min(HISTOGRAM_BINS - 1, Math.floor(fraction * HISTOGRAM_BINS))] += 1;
+  }
+  return bins;
+}
+
+function drawHistogram(channel) {
+  const canvas = document.getElementById(`histogram${channel}`);
+  if (!canvas) return;
+  const bins = canvasState.histograms?.[channel] || null;
+  // Stay hidden rather than showing an empty bordered box: there is no histogram until the
+  // pixel buffer lands, and on a blot over MAX_INTERACTIVE_PIXELS it never will.
+  canvas.hidden = !bins;
+  if (!bins) return;
+  const width = canvas.clientWidth || canvas.width;
+  const height = canvas.height;
+  if (canvas.width !== width) canvas.width = width;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, height);
+
+  // Log counts: a blot is overwhelmingly background, so on a linear axis the background
+  // spike is the only visible bar and the bands — the part you are windowing for — vanish.
+  let peak = 0;
+  for (let i = 0; i < bins.length; i += 1) peak = Math.max(peak, bins[i]);
+  if (peak <= 0) return;
+  const logPeak = Math.log1p(peak);
+  ctx.fillStyle = themeToken("--histogram-bar") || themeToken("--text-secondary") || "#64748b";
+  const barWidth = canvas.width / bins.length;
+  for (let i = 0; i < bins.length; i += 1) {
+    if (!bins[i]) continue;
+    const barHeight = (Math.log1p(bins[i]) / logPeak) * height;
+    ctx.fillRect(i * barWidth, height - barHeight, Math.max(1, barWidth), barHeight);
+  }
+
+  // Black and white point markers, on the same curve as the bars.
+  const stats = channelStatsFor(channel);
+  const window = currentDisplayWindow(channel);
+  if (!stats || !window) return;
+  ctx.fillStyle = themeToken("--primary") || "#2563eb";
+  [window.low, window.high].forEach((counts) => {
+    const x = (displayCountToSlider(counts, stats) / DISPLAY_SLIDER_STEPS) * canvas.width;
+    ctx.fillRect(Math.min(canvas.width - 2, Math.max(0, x - 1)), 0, 2, height);
+  });
+}
+
+// Binning walks every pixel, so cache per channel and only redraw the markers on a drag.
+function drawAllHistograms() {
+  canvasState.histograms = {};
+  ["700", "800"].forEach((channel) => {
+    const bins = channelHistogram(channel);
+    if (bins) canvasState.histograms[channel] = bins;
+    drawHistogram(channel);
+  });
+}
+
+async function loadChannelStats(blotId) {
+  const blot = blotById(blotId);
+  if (!blot) return;
+  try {
+    const response = await apiFetch(apiUrl("/channel-stats"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSessionId, blot }),
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    if (canvasState.currentBlotId !== blotId) return;   // user moved on mid-flight
+    canvasState.channelStats = payload.channels || null;
+    ["700", "800"].forEach((channel) => {
+      if (canvasState.channelStats?.[channel]) applyAutoDisplayWindow(channel);
+    });
+    // Now that we know which channels this blot actually has, force-disable any it does
+    // not — a single-channel blot must not offer the missing one for display or
+    // quantification. No announcement: the user did not do anything.
+    syncChannelAvailability();
+    syncChannelControls();
+    if (syncQuantChannelOptions() && canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+    }
+  } catch (error) {
+    // Non-fatal: the sliders stay on "auto" and the backend keeps choosing the window.
+    console.warn("Could not load channel statistics", error);
+  }
+}
+
+function boxToolControlsHtml() {
+  return `
+    <div class="blot-control-group">
       <label>Quantify channel
         <select id="quantChannel">
           <option value="700">700nm</option>
           <option value="800">800nm</option>
         </select>
       </label>
-      <label>Background
-        <select id="backgroundAxis">
-          <option value="leftright">Left & Right</option>
-          <option value="topbottom">Top & Bottom</option>
-        </select>
-      </label>
-    </div>
-  `;
-}
-
-function channelAdjustmentControlsHtml(colorClass, channel) {
-  return `
-    <div class="blot-control-group">
-      <span class="channel-label ${colorClass}">${channel}nm</span>
-      <label>Brightness
-        <input type="range" min="0.1" max="3" step="0.05" value="1" id="brightness${channel}" />
-      </label>
-      <label>Contrast
-        <input type="range" min="0.1" max="10" step="0.1" value="1" id="contrast${channel}" />
-      </label>
-      <label>Gamma <span class="control-hint">lower = reveal faint</span>
-        <input type="range" min="0.2" max="3" step="0.05" value="1" id="gamma${channel}" />
-      </label>
-    </div>
-  `;
-}
-
-function boxToolControlsHtml() {
-  return `
-    <div class="blot-control-group">
-      <label>Mode
-        <div class="mode-toggle">
-          <button class="mode-button active" id="modePan" type="button">Pan</button>
-          <button class="mode-button" id="modeDraw" type="button">Draw</button>
-        </div>
-      </label>
+      <div class="switch-control">
+        <span class="switch-caption" id="modeDrawLabel">Draw</span>
+        <button class="switch" id="modeDraw" type="button" role="switch" aria-checked="false"
+                aria-labelledby="modeDrawLabel">
+          <span class="switch-track"><span class="switch-knob"></span></span>
+        </button>
+        <span class="switch-state" id="modeDrawState">Off</span>
+      </div>
       <button class="ghost-button" id="extractSignalsButton" type="button">Refresh signals</button>
       <button class="ghost-button" id="clearBoxesButton" type="button">Clear all</button>
     </div>
   `;
 }
 
-function boxLayoutControlsHtml() {
+// Mostly view-only, with two exceptions. Pan is one half of the canvas mode toggle — Draw
+// is the other half and lives under "Boxes"; setCanvasMode() keeps them mutually exclusive
+// wherever they are rendered. Rotate is the other: its angle is sent to /render-composite,
+// /detect-bands and /extract alike, so the rotated view and the measured native pixels
+// always agree — but rotate BEFORE drawing or detecting boxes, since rotating afterwards
+// shifts the image underneath them.
+function displayControlsHtml() {
   return `
-    <div class="blot-control-group box-layout-tools">
-      <span class="channel-label">Box layout</span>
-      <p class="box-selected-status" id="selectedBoxStatus">Select a box below.</p>
-      <div class="box-tool-row">
-        <label>Copies
-          <input id="duplicateBoxCount" type="number" min="1" max="48" step="1" value="1" />
-        </label>
-        <label>Gap px
-          <input id="duplicateBoxGap" type="number" min="-2000" max="2000" step="1" value="8" />
-        </label>
-        <label>Direction
-          <select id="duplicateBoxDirection">
-            <option value="right">Right</option>
-            <option value="left">Left</option>
-            <option value="down">Down</option>
-            <option value="up">Up</option>
-          </select>
-        </label>
-        <button class="ghost-button box-button" id="duplicateBoxButton" type="button">Duplicate</button>
+    <div class="blot-control-group">
+      <div class="mode-toggle">
+        <button class="mode-button active" id="modePan" type="button" aria-pressed="true">Pan</button>
       </div>
-      <div class="box-button-grid" aria-label="Align boxes to selected box">
-        <button class="ghost-button box-button" type="button" data-box-align="left">Left</button>
-        <button class="ghost-button box-button" type="button" data-box-align="centerX">Center X</button>
-        <button class="ghost-button box-button" type="button" data-box-align="right">Right</button>
-        <button class="ghost-button box-button" type="button" data-box-align="top">Top</button>
-        <button class="ghost-button box-button" type="button" data-box-align="centerY">Center Y</button>
-        <button class="ghost-button box-button" type="button" data-box-align="bottom">Bottom</button>
-      </div>
-      <div class="box-tool-row">
-        <button class="ghost-button box-button" id="matchBoxSizeButton" type="button">Match size</button>
-        <label>Step px
-          <input id="boxNudgeStep" type="number" min="1" max="100" step="1" value="1" />
+    </div>
+    ${channelAdjustmentControlsHtml("red", "700")}
+    ${channelAdjustmentControlsHtml("green", "800")}
+    <p class="control-hint" id="channelStatus" role="status" aria-live="polite"></p>
+    <div class="blot-control-group">
+      <label class="straighten-control">Rotate <span class="straighten-value" id="straightenValue">0°</span>
+        <input type="range" id="straightenSlider" min="-15" max="15" step="0.5" value="0" />
+        <span class="straighten-actions">
+          <button class="ghost-button" id="autoStraightenButton" type="button">Auto</button>
+          <button class="ghost-button" id="resetStraightenButton" type="button">Reset</button>
+        </span>
+      </label>
+    </div>
+  `;
+}
+
+function detectionControlsHtml() {
+  return `
+    <div class="blot-control-group detection-tools">
+      <p class="detection-hint">Find candidate band boxes automatically, tune <strong>Sensitivity</strong> until the preview looks right, then add them. Detection runs on the current <strong>Quantify channel</strong>.</p>
+      <div class="detection-actions">
+        <button class="primary-button" id="detectBandsButton" type="button">Detect bands</button>
+        <label class="detection-replace">
+          <input type="checkbox" id="detectionReplace" checked />
+          Replace existing boxes
         </label>
-        <div class="box-nudge-grid" aria-label="Nudge selected box">
-          <button class="ghost-button box-button" type="button" data-box-nudge="0,-1" aria-label="Nudge box up">&uarr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="-1,0" aria-label="Nudge box left">&larr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="1,0" aria-label="Nudge box right">&rarr;</button>
-          <button class="ghost-button box-button" type="button" data-box-nudge="0,1" aria-label="Nudge box down">&darr;</button>
-        </div>
       </div>
+      <p class="detection-status" id="detectionStatus" role="status" aria-live="polite"></p>
+      <div class="detection-results" id="detectionResults" hidden></div>
     </div>
   `;
 }
 
 function bindBlotViewerControls(blotId) {
-  ["brightness700", "contrast700", "gamma700", "brightness800", "contrast800", "gamma800", "colorMode"].forEach(id => {
+  // Display window sliders bind "input", not "change": on a range input "change" only
+  // fires when the mouse is RELEASED, so the old binding meant you could not sweep a
+  // slider and watch the blot respond — the single biggest reason these controls felt
+  // worse than Image Studio's. The readout updates on every event and the re-render is
+  // debounced, so dragging shows live numbers with one request when the drag settles.
+  ["displayMin700", "displayMax700", "gamma700", "displayMin800", "displayMax800", "gamma800"].forEach((id) => {
     document.getElementById(id)?.addEventListener("input", () => {
+      const channel = id.endsWith("800") ? "800" : "700";
+      if (id.startsWith("display")) enforceWindowOrder(channel, id);
+      updateDisplayWindowReadout(channel);
+      refreshDisplayPreview();      // instant, from the local pixel buffer
+      drawHistogram(channel);       // move the black/white point markers with the thumb
       scheduleCanvasImageReload(blotId);
     });
-    document.getElementById(id)?.addEventListener("change", () => {
+  });
+  ["700", "800"].forEach((channel) => {
+    document.getElementById(`autoWindow${channel}`)?.addEventListener("click", () => {
+      const gammaInput = document.getElementById(`gamma${channel}`);
+      if (gammaInput) gammaInput.value = String(DEFAULT_DISPLAY_GAMMA);
+      applyAutoDisplayWindow(channel);
+      refreshDisplayPreview();
+      drawHistogram(channel);
       scheduleCanvasImageReload(blotId, true);
     });
   });
-  // Switching the background axis changes which flanking strips are sampled, so
-  // redraw the dotted overlay to match. No image reload is needed.
-  document.getElementById("backgroundAxis")?.addEventListener("change", () => {
-    if (canvasState.image && canvasState.currentBlotId === blotId) renderCanvas();
-  });
-  document.getElementById("duplicateBoxButton")?.addEventListener("click", () => duplicateSelectedBox(blotId));
-  document.getElementById("matchBoxSizeButton")?.addEventListener("click", () => matchBoxesToSelectedSize(blotId));
-  document.querySelectorAll("[data-box-align]").forEach(button => {
-    button.addEventListener("click", () => alignBoxesToSelected(button.dataset.boxAlign, blotId));
-  });
-  document.querySelectorAll("[data-box-nudge]").forEach(button => {
-    button.addEventListener("click", () => {
-      const [dx, dy] = button.dataset.boxNudge.split(",").map(Number);
-      nudgeSelectedBox(dx, dy, blotId);
+  // Off / colour / B&W per channel. applyChannelEnablement() covers both halves: it
+  // repaints the local preview (grayscale is a local recomposite too) and reloads the
+  // server render. Sync first: the freshly injected selects default to their first option
+  // ("Off"), which would misreport both channels until /channel-stats lands.
+  syncChannelControls();
+  ["700", "800"].forEach((channel) => {
+    document.getElementById(`channelMode${channel}`)?.addEventListener("change", () => {
+      onChannelModeChange(channel, blotId);
     });
   });
-  updateBoxToolState();
+  // Per-blot straighten: slider (debounced), Auto (uses the backend skew estimate), Reset.
+  document.getElementById("straightenSlider")?.addEventListener("input", (event) => onStraightenInput(event, blotId));
+  document.getElementById("autoStraightenButton")?.addEventListener("click", () => void autoStraighten(blotId));
+  document.getElementById("resetStraightenButton")?.addEventListener("click", () => setStraighten(0, blotId));
+  // Background axis / border width / statistic change which flanking strips are sampled, so
+  // redraw the dotted overlay to match. No image reload is needed — but a re-measure IS:
+  // these three decide what gets SUBTRACTED, so every existing box's adjustedSignal was
+  // produced by the old settings. Without this the list keeps showing numbers the current
+  // settings never produced, and a later single-box re-extract (finishBoxDrag) would leave
+  // that one lane measured by a different method than its neighbours.
+  ["backgroundAxis", "backgroundBorderWidth", "backgroundStat"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", () => {
+      if (!canvasState.image || canvasState.currentBlotId !== blotId) return;
+      renderCanvas();
+      if (canvasState.boxes.length) {
+        void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+      }
+    });
+  });
+  // Band detection: one delegated handler covers the Detect button plus the accept /
+  // cancel / re-detect controls that renderDetectionResults() injects, and a second covers
+  // the two injected sliders (lane split in stage A, sensitivity in stage B).
+  const detectionSection = document.getElementById("detectionSection");
+  detectionSection?.addEventListener("click", (event) => handleDetectionClick(event, blotId));
+  detectionSection?.addEventListener("input", (event) => {
+    if (event.target?.id === "laneThresholdSlider") onLaneThresholdSliderInput(event, blotId);
+    else if (event.target?.id === "sensitivitySlider") onSensitivitySliderInput(event);
+  });
+  // Detection is channel-specific end to end: the lane profile and every candidate set are
+  // derived from the selected channel's TIF, so whatever is on screen goes stale the moment
+  // the channel changes. The two stages need different handling:
+  //   Stage B (candidate chooser) — clear it. Those boxes and counts measured the old
+  //     channel, and committing them would silently mix channels.
+  //   Stage A (lane editing) — re-detect at the current threshold instead of clearing, so a
+  //     channel switch doesn't eject the user from the editor. Note that the threshold is an
+  //     absolute cut on a per-channel profile, so the same number legitimately yields a
+  //     different split here; the status line says why the lanes moved.
+  document.getElementById("quantChannel")?.addEventListener("change", (event) => {
+    if (canvasState.currentBlotId !== blotId) return;
+    if (canvasState.detection) {
+      cancelDetection(blotId);
+    } else if (canvasState.laneEdit) {
+      const channel = event.target?.value === "800" ? "800" : "700";
+      void redetectLanesAtThreshold(blotId, { note: `Quantify channel is now ${channel}nm.` });
+    }
+    // Committed boxes go stale for exactly the same reason the detection results do: their
+    // signals were integrated over the channel that just went away. applyChannelEnablement()
+    // already re-measures when the quantify channel changes because a channel was switched
+    // OFF; this is the manual path and needs it too. Without it saveScan() happily writes
+    // 700nm numbers under channel:"800", and a box drawn afterwards is genuinely 800nm — one
+    // scan measured on two channels.
+    if (canvasState.boxes.length) {
+      void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });
+    }
+  });
 }
 
 // ─── Blot canvas engine ───────────────────────────────────────────────────────
@@ -3704,7 +4961,16 @@ function initCanvas(blotId) {
   canvasState.panX = 0;
   canvasState.panY = 0;
   canvasState.mode = "pan";
+  canvasState.rotationDeg = 0;
   canvasState.currentBlotId = blotId;
+  // Drop any band-detection results/previews from the previously viewed blot.
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
+  canvasState.laneEdit = null;
+  canvasState.laneDrag = null;
+  canvasState.boxDrag = null;
 
   const canvas = document.getElementById("blotCanvas");
   if (!canvas) return;
@@ -3713,13 +4979,27 @@ function initCanvas(blotId) {
   const wrap = canvas.parentElement;
   canvas.width = wrap.clientWidth || 800;
   canvas.height = 520;
+  if (window.ResizeObserver) {
+    canvasResizeObserver?.disconnect();
+    canvasResizeObserver = new ResizeObserver(() => {
+      const nextWidth = Math.max(320, Math.round(wrap.clientWidth || 800));
+      if (canvas.width === nextWidth) return;
+      canvas.width = nextWidth;
+      renderCanvas();
+    });
+    canvasResizeObserver.observe(wrap);
+  }
 
   // Load composite image onto canvas
   loadCanvasImage(blotId);
 
   // Wire up mode buttons
   document.getElementById("modePan")?.addEventListener("click", () => setCanvasMode("pan"));
-  document.getElementById("modeDraw")?.addEventListener("click", () => setCanvasMode("draw"));
+  // Draw toggles: on -> draw, off -> back to pan. From the lanes editor it always turns on
+  // (setCanvasMode closes the editor), rather than needing two clicks.
+  document.getElementById("modeDraw")?.addEventListener("click", () => {
+    setCanvasMode(canvasState.mode === "draw" ? "pan" : "draw");
+  });
   document.getElementById("clearBoxesButton")?.addEventListener("click", () => {
     canvasState.boxes = [];
     canvasState.selectedBoxIndex = null;
@@ -3729,20 +5009,48 @@ function initCanvas(blotId) {
   document.getElementById("extractSignalsButton")?.addEventListener("click", () => extractSignals(blotId));
   renderBoxList(blotId);
 
-  // Mouse events
-  canvas.addEventListener("mousedown", onMouseDown);
-  canvas.addEventListener("mousemove", onMouseMove);
-  canvas.addEventListener("mouseup", onMouseUp);
-  canvas.addEventListener("mouseleave", onMouseUp);
+  // Pointer events cover mouse, pen, and touch with one coordinate path.
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onMouseMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", cancelPointerInteraction);
+  // Leaving the canvas mid-hover would otherwise strand a resize cursor on it.
+  canvas.addEventListener("pointerleave", (event) => {
+    if (!canvasState.boxDrag) setCanvasDragCursor(event.currentTarget, null);
+  });
   canvas.addEventListener("wheel", onWheel, { passive: false });
+  canvas.addEventListener("keydown", onCanvasKeyDown);
 }
 
 function setCanvasMode(mode) {
+  // Leaving the lanes-first editor via the Pan/Draw toggle cancels it cleanly.
+  if (canvasState.mode === "lanes" && mode !== "lanes" && canvasState.laneEdit) {
+    canvasState.laneEdit = null;
+    canvasState.laneDrag = null;
+    renderCanvas();
+    renderDetectionResults(canvasState.currentBlotId);
+    setDetectionStatus("");
+  }
   canvasState.mode = mode;
   const canvas = document.getElementById("blotCanvas");
-  if (canvas) canvas.style.cursor = mode === "draw" ? "crosshair" : "grab";
-  document.getElementById("modePan")?.classList.toggle("active", mode === "pan");
-  document.getElementById("modeDraw")?.classList.toggle("active", mode === "draw");
+  canvas?.classList.toggle("draw-mode", mode === "draw");
+  canvas?.classList.toggle("lanes-mode", mode === "lanes");
+  // A resize cursor left over from hovering a handle would outrank the new mode's cursor.
+  if (canvas) setCanvasDragCursor(canvas, null);
+  const panButton = document.getElementById("modePan");
+  if (panButton) {
+    // Pan is one of a set of view modes, so it stays a pressed-state button.
+    panButton.classList.toggle("active", mode === "pan");
+    panButton.setAttribute("aria-pressed", String(mode === "pan"));
+  }
+  // Draw is plain on/off, so it is a switch: aria-checked drives both the knob position
+  // (see .switch in styles.css) and the On/Off text, with no .active class in play.
+  const drawSwitch = document.getElementById("modeDraw");
+  if (drawSwitch) {
+    drawSwitch.setAttribute("aria-checked", String(mode === "draw"));
+    const drawState = document.getElementById("modeDrawState");
+    if (drawState) drawState.textContent = mode === "draw" ? "On" : "Off";
+  }
 }
 
 function cancelPendingCanvasImageLoad() {
@@ -3775,6 +5083,8 @@ function disposeCanvasResources() {
     canvasState.image.onerror = null;
     canvasState.image.src = "";
   }
+  canvasResizeObserver?.disconnect();
+  canvasResizeObserver = null;
   canvasState = createCanvasState();
 }
 
@@ -3816,6 +5126,9 @@ async function loadCanvasImage(blotId, options = {}) {
     canvasState.image = img;
     canvasState.imageWidth = img.naturalWidth;
     canvasState.imageHeight = img.naturalHeight;
+    // The server render is authoritative — it is what exports and presentations use — so
+    // stand down the local preview now that it has arrived.
+    canvasState.previewDirty = false;
 
     const canvas = document.getElementById("blotCanvas");
     if (!canvas) return;
@@ -3865,26 +5178,30 @@ function blotById(blotId) {
 
 // Builds one canonical composite payload for the viewer and exported presentations.
 function buildCompositePayload(blotId, defaultColorMode = "color") {
-  const brightness700 = document.getElementById("brightness700")?.value ?? 1;
-  const contrast700   = document.getElementById("contrast700")?.value   ?? 1;
-  const gamma700      = document.getElementById("gamma700")?.value       ?? 1;
-  const brightness800 = document.getElementById("brightness800")?.value ?? 1;
-  const contrast800   = document.getElementById("contrast800")?.value   ?? 1;
-  const gamma800      = document.getElementById("gamma800")?.value       ?? 1;
-  const colorMode     = document.getElementById("colorMode")?.value     ?? defaultColorMode;
+  // Falls back to the caller's default only before a viewer has ever been opened; once the
+  // per-channel selects exist, canvasState.colorMode is the single source of truth.
+  const colorMode = canvasState.colorMode ?? defaultColorMode;
   const blot = blotById(blotId);
   if (!blot) throw new Error("Blot is no longer loaded.");
-  return {
+  const payload = {
     sessionId: activeSessionId,
     blot,
-    brightness700,
-    contrast700,
-    gamma700,
-    brightness800,
-    contrast800,
-    gamma800,
+    gamma700: currentDisplayGamma("700"),
+    gamma800: currentDisplayGamma("800"),
     colorMode,
+    rotationDeg: canvasState.rotationDeg || 0,   // straighten the displayed composite
+    enabledChannels: enabledChannels(),          // a channel switched off contributes nothing
   };
+  // Send the black/white points in raw counts, and only once /channel-stats has told us
+  // what this blot's counts look like. Omitting them is meaningful: the backend then
+  // applies its own auto window, which is exactly what the sliders are showing as "auto".
+  ["700", "800"].forEach((channel) => {
+    const window = currentDisplayWindow(channel);
+    if (!window) return;
+    payload[`displayMin${channel}`] = window.low;
+    payload[`displayMax${channel}`] = window.high;
+  });
+  return payload;
 }
 
 async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
@@ -3901,19 +5218,103 @@ async function renderCompositeBlob(blotId, defaultColorMode = "color", signal) {
   return response.blob();
 }
 
+// ── Per-blot straighten ─────────────────────────────────────────────────────────
+// One angle rotates the displayed composite AND is applied server-side in /detect-bands
+// and /extract, so the straightened view and the measured native pixels always agree.
+// Straighten before drawing/detecting boxes; rotating after shifts the image under them.
+
+let straightenTimer = null;
+function onStraightenInput(event, blotId) {
+  const value = Number(event.target.value);
+  const deg = Number.isFinite(value) ? value : 0;
+  const label = document.getElementById("straightenValue");
+  if (label) label.textContent = `${deg}°`;
+  if (straightenTimer) clearTimeout(straightenTimer);
+  straightenTimer = setTimeout(() => applyStraighten(deg, blotId), 200);   // coalesce drags
+}
+
+function setStraighten(deg, blotId) {
+  const slider = document.getElementById("straightenSlider");
+  if (slider) slider.value = String(deg);
+  const label = document.getElementById("straightenValue");
+  if (label) label.textContent = `${deg}°`;
+  applyStraighten(deg, blotId);
+}
+
+function applyStraighten(deg, blotId) {
+  // Everything below is rotation-derived, so an unchanged angle has nothing to redo. The
+  // early return is not just an optimisation: pressing Reset while already at 0°, or a
+  // slider drag that settles back where it started, would otherwise blank every box's
+  // signal to "Extracting…" and block Save until three no-op requests came back.
+  if (canvasState.rotationDeg === deg) return;
+  canvasState.rotationDeg = deg;
+  // The pixel buffer is rotation-baked (it arrives in composite space), so it is now in the
+  // wrong frame. Drop it immediately rather than previewing from it, and refetch at the new
+  // angle — display sliders fall back to server rendering for the moment in between.
+  canvasState.pixelBuffer = null;
+  canvasState.previewDirty = false;
+  // Detection output is composite-space coordinates found at the OLD angle, and the image
+  // has just moved underneath them: at 5°, content ~900px from centre shifts ~80px, several
+  // band heights. Committing those candidates would quantify membrane instead of band, with
+  // no error. Same split as a quantify-channel switch — drop stage B, re-detect stage A.
+  // The bump also kills a detect that is still IN FLIGHT, which neither branch below would
+  // catch: until it lands both pieces of state are null.
+  detectionRequestId++;
+  if (canvasState.detection) {
+    cancelDetection(blotId);
+  } else if (canvasState.laneEdit) {
+    void redetectLanesAtThreshold(blotId, { note: `Rotation is now ${deg}°.` });
+  } else {
+    // Nothing to clear, but an in-flight detect was just orphaned by the bump above — its
+    // handler is gated on the request id, so it will neither finish nor report. Clearing
+    // the status stops "Finding lanes…" sitting there forever asserting live work.
+    setDetectionStatus("");
+  }
+  scheduleCanvasImageReload(blotId, true);   // re-render the straightened composite (preserves view)
+  void loadChannelPixels(blotId);
+  if (canvasState.boxes.length) {
+    void extractSignalsForBoxes(blotId, canvasState.boxes, { alertOnError: false });   // re-measure
+  }
+}
+
+async function autoStraighten(blotId) {
+  const button = document.getElementById("autoStraightenButton");
+  if (button) button.disabled = true;
+  try {
+    // The lanes stage returns suggestedRotationDeg — the estimated skew of the original blot
+    // — but only when asked for it, since nothing else uses it.
+    const result = await detectBands(blotId, { stage: "lanes", suggestRotation: true });
+    if (canvasState.currentBlotId !== blotId) return;
+    const suggested = Number(result?.suggestedRotationDeg);
+    setStraighten(Number.isFinite(suggested) ? suggested : 0, blotId);
+  } catch (error) {
+    showUserMessage(error.message || "Could not estimate a rotation angle.");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 // Width, in image pixels, of the strips sampled next to each box to estimate
 // local background. Must match `border` in the backend extract_box_signal().
+// Note: the backend applies this border in the target channel's NATIVE pixel grid,
+// while this overlay draws it in COMPOSITE pixels. They coincide whenever the 700
+// and 800 channels share dimensions (the normal case); when they differ, the dotted
+// strip width shown here is a hint — the measured strip is border px in native space.
+// This affects only the visual strip width, never the reported signal.
 const BACKGROUND_BORDER = 3;
 
-function currentBackgroundAxis() {
-  return document.getElementById("backgroundAxis")?.value === "topbottom"
-    ? "topbottom"
-    : "leftright";
+function currentBackgroundConfig() {
+  const sides = document.getElementById("backgroundAxis")?.value;
+  return {
+    sides: ["leftright", "topbottom", "allsides"].includes(sides) ? sides : "leftright",
+    borderWidth: Math.max(1, Math.min(5, Number(document.getElementById("backgroundBorderWidth")?.value) || BACKGROUND_BORDER)),
+    stat: document.getElementById("backgroundStat")?.value === "mean" ? "mean" : "median",
+  };
 }
 
 // The background-reference strips flanking a box, clamped to the image bounds so
 // the dotted overlay matches exactly what the backend measures.
-function backgroundRegionsForBox(box, axis) {
+function backgroundRegionsForBox(box, sides, border = BACKGROUND_BORDER) {
   const imgW = canvasState.imageWidth || canvasState.image?.naturalWidth || 0;
   const imgH = canvasState.imageHeight || canvasState.image?.naturalHeight || 0;
   const x = Math.max(0, box.x);
@@ -3922,19 +5323,740 @@ function backgroundRegionsForBox(box, axis) {
   const y2 = imgH ? Math.min(box.y + box.h, imgH) : box.y + box.h;
   const regions = [];
 
-  if (axis === "topbottom") {
-    const top = Math.max(0, y - BACKGROUND_BORDER);
+  if (sides === "topbottom" || sides === "allsides") {
+    const top = Math.max(0, y - border);
     if (y > top) regions.push({ x, y: top, w: x2 - x, h: y - top });
-    const bottom = imgH ? Math.min(imgH, y2 + BACKGROUND_BORDER) : y2 + BACKGROUND_BORDER;
+    const bottom = imgH ? Math.min(imgH, y2 + border) : y2 + border;
     if (bottom > y2) regions.push({ x, y: y2, w: x2 - x, h: bottom - y2 });
-  } else {
-    const left = Math.max(0, x - BACKGROUND_BORDER);
+  }
+  if (sides === "leftright" || sides === "allsides") {
+    const left = Math.max(0, x - border);
     if (x > left) regions.push({ x: left, y, w: x - left, h: y2 - y });
-    const right = imgW ? Math.min(imgW, x2 + BACKGROUND_BORDER) : x2 + BACKGROUND_BORDER;
+    const right = imgW ? Math.min(imgW, x2 + border) : x2 + border;
     if (right > x2) regions.push({ x: x2, y, w: right - x2, h: y2 - y });
   }
 
   return regions.filter(r => r.w > 0 && r.h > 0);
+}
+
+// Pointer/wheel events can fire several times per frame; coalesce redraws so
+// renderCanvas() runs at most once per animation frame during pan/zoom/draw.
+let renderCanvasScheduled = false;
+function requestRender() {
+  if (renderCanvasScheduled) return;
+  renderCanvasScheduled = true;
+  window.requestAnimationFrame(() => {
+    renderCanvasScheduled = false;
+    renderCanvas();
+  });
+}
+
+// ─── Automatic band detection (frontend for /detect-bands) ──────────────────────
+//
+// Boxes come back from the backend in COMPOSITE coordinates (canvasState.imageWidth/
+// Height space) — the same space the user draws in — so a detected box drops straight
+// into createCanvasBox() with no remapping, and committed boxes flow through the exact
+// extractSignalsForBoxes() path a hand-drawn box uses. All sensitivity sets come back in
+// one response, so the Sensitivity slider switches the preview between them locally (no
+// round-trip) before committing; an advanced lane-split slider re-thresholds lanes live
+// from the returned laneProfile and can re-detect bands at the chosen split.
+
+// Ascending sensitivity, left → right on the Sensitivity slider. The backend already emits
+// its levels in this order, but sort by this rank anyway so the slider stays monotone even
+// if the response order changes. Unknown ids sort after the known ones.
+const SENSITIVITY_ORDER = ["conservative", "balanced", "aggressive"];
+
+function sensitivityRank(id) {
+  const index = SENSITIVITY_ORDER.indexOf(id);
+  return index === -1 ? SENSITIVITY_ORDER.length : index;
+}
+
+function candidateMetaText(candidate) {
+  const lanes = `${candidate.laneCount} lane${candidate.laneCount === 1 ? "" : "s"}`;
+  const bands = `${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}`;
+  return `${lanes} · ${bands}${candidate.truncated ? " · capped" : ""}`;
+}
+
+function setDetectionStatus(message, isError = false) {
+  const status = document.getElementById("detectionStatus");
+  if (!status) return;
+  status.textContent = message || "";
+  status.classList.toggle("is-error", Boolean(isError && message));
+}
+
+async function detectBands(blotId, { sensitivities, laneThreshold, stage, lanes, suggestRotation } = {}) {
+  const blot = blotById(blotId);
+  if (!blot) throw new Error("Blot is no longer loaded.");
+  const channel = document.getElementById("quantChannel")?.value ?? "700";
+  return apiJson(apiUrl("/detect-bands"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    timeoutMs: SIGNAL_EXTRACTION_TIMEOUT_MS,
+    body: JSON.stringify({
+      sessionId: activeSessionId,
+      blot,
+      channel,
+      // Same coordinate contract as /extract: report the composite size so the backend
+      // emits boxes (and interprets our lanes) in the space we draw in. Dropped by
+      // JSON.stringify when unset, and the backend falls back safely.
+      compositeWidth: canvasState.imageWidth || undefined,
+      compositeHeight: canvasState.imageHeight || undefined,
+      sensitivities,   // optional; omit for all three sets
+      laneThreshold,   // optional; the value tuned live via the lane-split slider
+      stage,           // "lanes" -> return the lane split only (lanes-first); else bands
+      lanes,           // optional; user-confirmed composite-space lane columns [{x, w}]
+      // Opt in to the skew estimate. It costs 21 full-frame rotations server-side and only
+      // the "Auto" straighten button reads the answer, so every other call omits it.
+      suggestRotation: suggestRotation === true ? true : undefined,
+      rotationDeg: canvasState.rotationDeg || 0,   // detect in the same straightened frame
+    }),
+  }, "Band detection failed.");
+}
+
+async function onDetectBandsClick(blotId) {
+  if (!canvasState.image || !canvasState.imageWidth) {
+    showUserMessage("Load a blot image before detecting bands.");
+    return;
+  }
+  const button = document.getElementById("detectBandsButton");
+  const requestId = ++detectionRequestId;
+  canvasState.laneThreshold = null;   // a fresh detect uses the default lane split
+  if (button) { button.disabled = true; button.textContent = "Finding lanes…"; }
+  setDetectionStatus("Finding lanes…");
+  try {
+    // Lanes-first: fetch the lane split, let the user confirm/edit it, THEN detect bands.
+    const result = await detectBands(blotId, { stage: "lanes" });
+    if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
+    enterLaneEditing(result, blotId);
+  } catch (error) {
+    if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
+      setDetectionStatus(error.message || "Lane detection failed.", true);
+    }
+  } finally {
+    if (button) { button.disabled = false; button.textContent = "Detect bands"; }
+  }
+}
+
+// ── Lanes-first editing (stage A) ───────────────────────────────────────────────
+// The user confirms/edits the lane split before any band detection. Lanes are stored as
+// full-height composite-space columns [{x, w}] in canvasState.laneEdit and drawn/edited
+// directly on the canvas ("lanes" mode); "Detect bands in these lanes" sends them back.
+
+function enterLaneEditing(result, blotId) {
+  const lanes = Array.isArray(result?.lanes) ? result.lanes.map(l => ({ x: l.x, w: l.w })) : [];
+  canvasState.laneEdit = {
+    lanes,
+    profile: Array.isArray(result?.laneProfile) ? result.laneProfile : [],
+    imageWidth: result?.imageWidth || canvasState.imageWidth,
+    selected: null,
+  };
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  setCanvasMode("lanes");
+  renderCanvas();
+  renderLaneEditor(blotId);
+  setDetectionStatus(lanes.length
+    ? `Found ${lanes.length} lane${lanes.length === 1 ? "" : "s"}.${laneCapNote(result)} Adjust the split, then detect bands.`
+    : "No lanes found. Lower the threshold or add lanes by hand, then detect bands.");
+}
+
+// The backend caps lanes and, since both lists run left to right, drops the RIGHTMOST ones.
+// Unannounced that reads as the right of the blot simply having no lanes — and lowering the
+// threshold, which is meant to find more, is exactly what triggers it.
+function laneCapNote(result) {
+  return result?.lanesTruncated ? " Capped — rightmost lanes dropped; raise the threshold." : "";
+}
+
+function backToLaneEditing(blotId) {
+  const detection = canvasState.detection;
+  enterLaneEditing({
+    lanes: detection?.lanes || [],
+    laneProfile: detection?.laneProfile || [],
+    imageWidth: detection?.imageWidth || canvasState.imageWidth,
+  }, blotId);
+}
+
+function renderLaneEditor(blotId) {
+  const container = document.getElementById("detectionResults");
+  if (!container) return;
+  const laneEdit = canvasState.laneEdit;
+  if (!laneEdit) { container.hidden = true; container.innerHTML = ""; return; }
+  const count = laneEdit.lanes.length;
+  const sliderValue = canvasState.laneThreshold ?? 0.15;
+  container.innerHTML = `
+    <div class="lane-editor">
+      <p class="control-hint">Drag a lane edge to resize, its middle to move, or empty space to pan. Add lane, then position it; Remove or Delete drops the selected lane.</p>
+      <label class="detection-slider">Lane threshold <span class="control-hint">lower = more lanes</span>
+        <input type="range" id="laneThresholdSlider" min="0.02" max="0.6" step="0.01" value="${sliderValue}" />
+      </label>
+      <div class="lane-editor-actions">
+        <button type="button" class="ghost-button" id="addLaneButton">Add lane</button>
+        <button type="button" class="ghost-button" id="removeLaneButton"${laneEdit.selected == null ? " disabled" : ""}>Remove lane</button>
+      </div>
+      <div class="detection-commit">
+        <button type="button" class="primary-button" id="detectBandsInLanesButton"${count ? "" : " disabled"}>Detect bands in ${count} lane${count === 1 ? "" : "s"}</button>
+        <button type="button" class="ghost-button" id="cancelDetectionButton">Cancel</button>
+      </div>
+    </div>
+  `;
+  container.hidden = false;
+}
+
+let laneThresholdTimer = null;
+function onLaneThresholdSliderInput(event, blotId) {
+  const value = Number(event.target.value);
+  canvasState.laneThreshold = Number.isFinite(value) ? value : 0.15;
+  // Slider fires rapidly; debounce the authoritative backend re-detect (it runs the same
+  // baseline-flatten + valley split the committed result will use, so no client/server drift).
+  if (laneThresholdTimer) clearTimeout(laneThresholdTimer);
+  laneThresholdTimer = setTimeout(() => { void redetectLanesAtThreshold(blotId); }, 250);
+}
+
+// `note` prefixes the status line when something other than the slider triggered this (a
+// channel switch), so a lane split that visibly jumps has a stated cause.
+async function redetectLanesAtThreshold(blotId, { note = "" } = {}) {
+  if (!canvasState.laneEdit) return;
+  // Any re-detect supersedes a pending debounced one — /detect-bands is rate limited
+  // (15/min), so a duplicate request for the same split is worth avoiding.
+  if (laneThresholdTimer) {
+    clearTimeout(laneThresholdTimer);
+    laneThresholdTimer = null;
+  }
+  const prefix = note ? `${note} ` : "";
+  const requestId = ++detectionRequestId;
+  setDetectionStatus(`${prefix}Re-detecting lanes…`);
+  try {
+    const result = await detectBands(blotId, {
+      stage: "lanes",
+      laneThreshold: canvasState.laneThreshold ?? undefined,
+    });
+    if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId || !canvasState.laneEdit) return;
+    canvasState.laneEdit.lanes = Array.isArray(result?.lanes) ? result.lanes.map(l => ({ x: l.x, w: l.w })) : [];
+    canvasState.laneEdit.profile = Array.isArray(result?.laneProfile) ? result.laneProfile : canvasState.laneEdit.profile;
+    canvasState.laneEdit.selected = null;
+    renderCanvas();
+    renderLaneEditor(blotId);
+    const n = canvasState.laneEdit.lanes.length;
+    setDetectionStatus(`${prefix}${n} lane${n === 1 ? "" : "s"}.${laneCapNote(result)} Adjust further or detect bands.`);
+  } catch (error) {
+    if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
+      setDetectionStatus(error.message || "Lane detection failed.", true);
+    }
+  }
+}
+
+function addLane(blotId) {
+  const le = canvasState.laneEdit;
+  if (!le) return;
+  const imgW = le.imageWidth || canvasState.imageWidth || 0;
+  if (!imgW) return;
+  const width = Math.max(6, Math.min(imgW * 0.9, imgW * 0.08));
+  const center = viewportCenterImageX();
+  const cx = Number.isFinite(center) ? center : imgW / 2;
+  const lane = { x: Math.max(0, Math.min(imgW - width, cx - width / 2)), w: width };
+  le.lanes.push(lane);
+  le.selected = le.lanes.length - 1;   // no reordering during editing, so the index is stable
+  renderCanvas();
+  renderLaneEditor(blotId);
+  setDetectionStatus("Lane added — drag its edges to fit the lane.");
+}
+
+function removeSelectedLane(blotId) {
+  const le = canvasState.laneEdit;
+  if (!le || le.selected == null) return;
+  le.lanes.splice(le.selected, 1);
+  le.selected = null;
+  renderCanvas();
+  renderLaneEditor(blotId);
+  setDetectionStatus(`${le.lanes.length} lane${le.lanes.length === 1 ? "" : "s"}.`);
+}
+
+async function detectBandsInLanes(blotId) {
+  const le = canvasState.laneEdit;
+  if (!le || !le.lanes.length) return;
+  // Backend re-sorts, but send in visual order so returned lane/band indices read L→R.
+  const lanes = le.lanes.slice().sort((a, b) => a.x - b.x).map(l => ({ x: l.x, w: l.w }));
+  const requestId = ++detectionRequestId;
+  const button = document.getElementById("detectBandsInLanesButton");
+  if (button) { button.disabled = true; button.textContent = "Detecting bands…"; }
+  setDetectionStatus("Detecting bands in the confirmed lanes…");
+  try {
+    const result = await detectBands(blotId, {
+      lanes,
+      laneThreshold: canvasState.laneThreshold ?? undefined,
+    });
+    if (requestId !== detectionRequestId || canvasState.currentBlotId !== blotId) return;
+    canvasState.laneEdit = null;    // leave stage A
+    setCanvasMode("pan");
+    applyDetectionResult(result, blotId);   // stage B: the candidate chooser
+  } catch (error) {
+    if (requestId === detectionRequestId && canvasState.currentBlotId === blotId) {
+      setDetectionStatus(error.message || "Band detection failed.", true);
+      if (button) { button.disabled = false; button.textContent = `Detect bands in ${lanes.length} lanes`; }
+    }
+  }
+}
+
+function applyDetectionResult(result, blotId) {
+  // Sorted least → most sensitive so the slider's left-to-right travel means "more bands".
+  const candidates = (Array.isArray(result?.candidates)
+    ? result.candidates.filter(c => c && Array.isArray(c.boxes))
+    : []
+  ).sort((a, b) => sensitivityRank(a.id) - sensitivityRank(b.id));
+  canvasState.detection = {
+    laneProfile: Array.isArray(result?.laneProfile) ? result.laneProfile : [],
+    lanes: Array.isArray(result?.lanes) ? result.lanes : [],
+    imageWidth: result?.imageWidth || canvasState.imageWidth,
+    candidates,
+    activeId: null,
+  };
+  // laneThreshold + lanes are preserved so "Back to lanes" reopens the editor at the split
+  // these bands came from. A fresh detect resets laneThreshold in onDetectBandsClick.
+  canvasState.laneEdit = null;
+  canvasState.lanePreview = null;
+
+  if (!candidates.length) {
+    canvasState.detectionPreview = null;
+    renderCanvas();
+    renderDetectionResults(blotId);
+    // Detection reads the RAW TIF, so the display window has no effect on it — the old
+    // advice to raise brightness/contrast pointed at controls that cannot change this
+    // result. Sensitivity and the lane split are the two things that actually can.
+    setDetectionStatus("No bands detected. Try a higher sensitivity or a different lane split.");
+    return;
+  }
+
+  // Preview the balanced set by default (fall back to the first returned set).
+  const preferred = candidates.find(c => c.id === "balanced") || candidates[0];
+  canvasState.detection.activeId = preferred.id;
+  renderDetectionResults(blotId);
+  previewDetectionCandidate(preferred);
+  setDetectionStatus(candidates.length > 1
+    ? `Previewing “${preferred.label}”. Drag Sensitivity to compare, then Add boxes.`
+    : `Previewing “${preferred.label}”. Add boxes when it looks right.`);
+}
+
+function renderDetectionResults(blotId) {
+  const container = document.getElementById("detectionResults");
+  if (!container) return;
+  const detection = canvasState.detection;
+  if (!detection || !detection.candidates.length) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+
+  // One discrete stop per returned set, least → most sensitive. Labels/ids are backend-
+  // derived enums, but escape defensively — this is innerHTML.
+  const candidates = detection.candidates;
+  const activeIndex = Math.max(0, candidates.findIndex(c => c.id === detection.activeId));
+  const active = candidates[activeIndex];
+  const activeLabel = String(active.label || active.id);
+  const ticks = candidates
+    .map(c => `<span>${escapeHtml(String(c.label || c.id))}</span>`)
+    .join("");
+
+  container.innerHTML = `
+    <div class="detection-sensitivity">
+      <label class="detection-slider">
+        <span class="detection-slider-head">Sensitivity
+          <span class="detection-sensitivity-name" id="sensitivityName">${escapeHtml(activeLabel)}</span>
+        </span>
+        <input type="range" id="sensitivitySlider" min="0" max="${candidates.length - 1}" step="1"
+               value="${activeIndex}" aria-valuetext="${escapeHtml(activeLabel)}"
+               ${candidates.length > 1 ? "" : "disabled"} />
+      </label>
+      <div class="detection-slider-ticks" aria-hidden="true">${ticks}</div>
+      <span class="detection-candidate-meta" id="sensitivityMeta">${escapeHtml(candidateMetaText(active))}</span>
+    </div>
+    <div class="detection-commit">
+      <button type="button" class="primary-button" id="acceptDetectionButton">Add boxes</button>
+      <button type="button" class="ghost-button" id="backToLanesButton">Back to lanes</button>
+      <button type="button" class="ghost-button" id="cancelDetectionButton">Cancel</button>
+    </div>
+  `;
+  container.hidden = false;
+}
+
+function activeDetectionCandidate() {
+  const detection = canvasState.detection;
+  if (!detection) return null;
+  return detection.candidates.find(c => c.id === detection.activeId) || null;
+}
+
+// Slider stop -> candidate. Every set is already in hand, so switching is a local preview
+// redraw with no request; the slider can be dragged freely.
+function onSensitivitySliderInput(event) {
+  const candidates = canvasState.detection?.candidates;
+  if (!candidates) return;
+  const candidate = candidates[Number(event.target.value)];
+  if (candidate) selectDetectionCandidate(candidate.id);
+}
+
+function selectDetectionCandidate(id) {
+  const detection = canvasState.detection;
+  if (!detection) return;
+  const candidate = detection.candidates.find(c => c.id === id);
+  if (!candidate) return;
+  detection.activeId = id;
+  // Update the readout in place rather than rebuilding the results DOM — cheaper, avoids
+  // flicker, and (crucially) doesn't replace the slider the user is mid-drag on.
+  updateSensitivityReadout();
+  previewDetectionCandidate(candidate);
+  setDetectionStatus(`Previewing “${candidate.label}” — ${candidate.bandCount} band${candidate.bandCount === 1 ? "" : "s"}.`);
+}
+
+function updateSensitivityReadout() {
+  const detection = canvasState.detection;
+  if (!detection) return;
+  const index = detection.candidates.findIndex(c => c.id === detection.activeId);
+  const candidate = detection.candidates[index];
+  if (!candidate) return;
+  const slider = document.getElementById("sensitivitySlider");
+  if (slider) {
+    // Only write back when it differs — keyboard/drag input already moved the thumb.
+    if (slider.value !== String(index)) slider.value = String(index);
+    slider.setAttribute("aria-valuetext", String(candidate.label || candidate.id));
+  }
+  const name = document.getElementById("sensitivityName");
+  if (name) name.textContent = String(candidate.label || candidate.id);
+  const meta = document.getElementById("sensitivityMeta");
+  if (meta) meta.textContent = candidateMetaText(candidate);
+}
+
+function previewDetectionCandidate(candidate) {
+  canvasState.detectionPreview = candidate ? candidate.boxes : null;
+  canvasState.lanePreview = null;   // a candidate preview supersedes the lane-column preview
+  renderCanvas();
+}
+
+function acceptDetectedCandidate(candidate, blotId, { replace = true } = {}) {
+  if (!candidate || !candidate.boxes.length) return;
+  if (replace) {
+    canvasState.boxes = [];
+    canvasState.selectedBoxIndex = null;
+  }
+  const slots = remainingBoxSlots();
+  if (slots <= 0) {
+    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    return;
+  }
+  const chosen = candidate.boxes.slice(0, slots);
+  const newBoxes = chosen.map(box => createCanvasBox({   // clamps to image, adds signal fields
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    laneName: Number.isInteger(box.lane) ? `Lane ${box.lane + 1}` : "",
+  }));
+
+  canvasState.boxes.push(...newBoxes);
+  canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+
+  const dropped = candidate.boxes.length - chosen.length;
+
+  // Commit is terminal: clear the chooser/preview and invalidate any in-flight re-detect
+  // so a late result (or a re-clicked candidate) can't draw a dashed preview back over
+  // the now-committed boxes. Re-detecting is one click on the Detect button.
+  detectionRequestId++;
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
+  canvasState.laneEdit = null;
+  canvasState.laneDrag = null;
+
+  renderCanvas();
+  renderBoxList(blotId);
+  renderDetectionResults(blotId);   // detection is null -> hides the chooser
+
+  setDetectionStatus(dropped > 0 || candidate.truncated
+    ? `Added ${chosen.length} boxes (strongest kept; max ${MAX_CANVAS_BOXES} per scan).`
+    : `Added ${chosen.length} boxes.`);
+
+  void extractSignalsForBoxes(blotId, newBoxes, { alertOnError: false });
+}
+
+function cancelDetection(blotId) {
+  detectionRequestId++;   // invalidate any in-flight detect/re-detect so it can't repopulate
+  const wasEditingLanes = canvasState.mode === "lanes";
+  canvasState.detection = null;
+  canvasState.detectionPreview = null;
+  canvasState.lanePreview = null;
+  canvasState.laneThreshold = null;
+  canvasState.laneEdit = null;
+  canvasState.laneDrag = null;
+  if (wasEditingLanes) setCanvasMode("pan");
+  renderCanvas();
+  renderDetectionResults(blotId);
+  setDetectionStatus("");
+}
+
+// ── Lane-editor canvas interaction ──────────────────────────────────────────────
+// Lanes are full-height columns, so only the x-axis matters. Hit-test priority: an edge
+// (resize) before the body (move); a miss falls through to panning.
+const LANE_EDGE_GRAB_PX = 6;
+
+function viewportCenterImageX() {
+  const canvas = document.getElementById("blotCanvas");
+  if (!canvas) return NaN;
+  return (canvas.width / 2 - canvasState.panX) / canvasState.zoom;
+}
+
+function clampLane(lane, imgW) {
+  const minW = Math.max(2, imgW * 0.005);
+  let w = Math.max(minW, lane.w);
+  let x = Math.max(0, Math.min(imgW - minW, lane.x));
+  if (x + w > imgW) w = imgW - x;
+  lane.x = x;
+  lane.w = w;
+}
+
+function laneHitTest(imgX) {
+  const le = canvasState.laneEdit;
+  if (!le) return null;
+  const grab = LANE_EDGE_GRAB_PX / canvasState.zoom;   // constant screen px regardless of zoom
+  let bodyHit = null;
+  for (let i = 0; i < le.lanes.length; i++) {
+    const lane = le.lanes[i];
+    const x0 = lane.x, x1 = lane.x + lane.w;
+    if (Math.abs(imgX - x0) <= grab) return { kind: "resize-l", index: i };
+    if (Math.abs(imgX - x1) <= grab) return { kind: "resize-r", index: i };
+    if (bodyHit === null && imgX > x0 && imgX < x1) bodyHit = { kind: "move", index: i };
+  }
+  return bodyHit;
+}
+
+function onLaneEditMouseDown(canvas, event) {
+  const le = canvasState.laneEdit;
+  if (!le) return false;
+  const coords = getImageCoords(canvas, event.clientX, event.clientY);
+  const hit = laneHitTest(coords.x);
+  if (!hit) return false;   // empty space -> caller pans
+  const lane = le.lanes[hit.index];
+  le.selected = hit.index;
+  canvasState.laneDrag = { kind: hit.kind, index: hit.index, grabX: coords.x, startX: lane.x, startW: lane.w };
+  renderCanvas();
+  renderLaneEditor(canvasState.currentBlotId);
+  return true;
+}
+
+function updateLaneDrag(imgX) {
+  const le = canvasState.laneEdit;
+  const drag = canvasState.laneDrag;
+  if (!le || !drag) return;
+  const lane = le.lanes[drag.index];
+  if (!lane) return;
+  const imgW = le.imageWidth || canvasState.imageWidth || 0;
+  const minW = Math.max(2, imgW * 0.005);
+  if (drag.kind === "move") {
+    lane.x = drag.startX + (imgX - drag.grabX);
+  } else if (drag.kind === "resize-l") {
+    const right = drag.startX + drag.startW;
+    lane.x = Math.min(imgX, right - minW);
+    lane.w = right - lane.x;
+  } else if (drag.kind === "resize-r") {
+    lane.x = drag.startX;
+    lane.w = Math.max(minW, imgX - drag.startX);
+  }
+  clampLane(lane, imgW);
+}
+
+// ── Box resize / move on the canvas ─────────────────────────────────────────────
+// The selected box gets 8 grab handles (4 corners + 4 edge midpoints) for resizing, and
+// its body drags to move. Sizes below are SCREEN px and divided by canvasState.zoom at
+// use, so a handle stays the same physical size — and stays grabbable — at any zoom.
+const BOX_HANDLE_GRAB_PX = 7;
+const BOX_HANDLE_DRAW_PX = 6;
+const MIN_BOX_SIZE_PX = 2;   // image px; a box can't be dragged smaller than this
+
+// Cursor hints, as classes — this app sets no inline styles anywhere.
+const DRAG_CURSOR_CLASS = {
+  nw: "resize-nwse", se: "resize-nwse",
+  ne: "resize-nesw", sw: "resize-nesw",
+  n: "resize-ns", s: "resize-ns",
+  e: "resize-ew", w: "resize-ew",
+  move: "cursor-move",
+};
+const DRAG_CURSOR_CLASSES = ["resize-nwse", "resize-nesw", "resize-ns", "resize-ew", "cursor-move"];
+
+// Handle anchor points, keyed by the edges each one moves ("nw" moves top + left).
+function boxHandlePoints(box) {
+  const midX = box.x + box.w / 2;
+  const midY = box.y + box.h / 2;
+  const right = box.x + box.w;
+  const bottom = box.y + box.h;
+  return [
+    { kind: "nw", x: box.x, y: box.y },
+    { kind: "ne", x: right, y: box.y },
+    { kind: "se", x: right, y: bottom },
+    { kind: "sw", x: box.x, y: bottom },
+    { kind: "n", x: midX, y: box.y },
+    { kind: "e", x: right, y: midY },
+    { kind: "s", x: midX, y: bottom },
+    { kind: "w", x: box.x, y: midY },
+  ];
+}
+
+// Handles belong to the selected box only — 8 per box would be unreadable on a blot with
+// 20 of them. boxHandlePoints lists corners first so a corner wins where its grab square
+// overlaps an edge handle's on a small box.
+function boxHandleHitTest(imgX, imgY) {
+  const index = canvasState.selectedBoxIndex;
+  const box = Number.isInteger(index) ? canvasState.boxes[index] : null;
+  if (!box) return null;
+  const grab = BOX_HANDLE_GRAB_PX / canvasState.zoom;
+  const point = boxHandlePoints(box).find(
+    p => Math.abs(imgX - p.x) <= grab && Math.abs(imgY - p.y) <= grab,
+  );
+  return point ? { kind: point.kind, index } : null;
+}
+
+// Topmost box containing the point (later boxes draw over earlier ones, so search back).
+function boxBodyHitTest(imgX, imgY) {
+  for (let i = canvasState.boxes.length - 1; i >= 0; i -= 1) {
+    const box = canvasState.boxes[i];
+    if (imgX >= box.x && imgX <= box.x + box.w && imgY >= box.y && imgY <= box.y + box.h) {
+      return i;
+    }
+  }
+  return null;
+}
+
+function setCanvasDragCursor(canvas, kind) {
+  const next = kind ? DRAG_CURSOR_CLASS[kind] : null;
+  DRAG_CURSOR_CLASSES.forEach(cls => canvas.classList.toggle(cls, cls === next));
+}
+
+// Starts a resize (handle) or move (body) drag. Returns true when the press was consumed,
+// so the caller skips pan/draw.
+function onBoxEditMouseDown(canvas, event) {
+  const coords = getImageCoords(canvas, event.clientX, event.clientY);
+  const startDrag = (index, kind) => {
+    const box = canvasState.boxes[index];
+    canvasState.boxDrag = {
+      index,
+      kind,
+      grabX: coords.x,
+      grabY: coords.y,
+      startX: box.x,
+      startY: box.y,
+      startW: box.w,
+      startH: box.h,
+    };
+    setCanvasDragCursor(canvas, kind);   // hold the cursor for the whole drag
+  };
+
+  const handle = boxHandleHitTest(coords.x, coords.y);
+  if (handle) {
+    startDrag(handle.index, handle.kind);
+    return true;
+  }
+  // A press inside a box selects it and begins a move, rather than panning. Draw mode is
+  // left alone — there, dragging always means "new box".
+  if (canvasState.mode === "pan") {
+    const bodyIndex = boxBodyHitTest(coords.x, coords.y);
+    if (bodyIndex !== null) {
+      if (bodyIndex !== canvasState.selectedBoxIndex) selectBox(bodyIndex);
+      startDrag(bodyIndex, "move");
+      return true;
+    }
+  }
+  return false;
+}
+
+function updateBoxDrag(imgX, imgY) {
+  const drag = canvasState.boxDrag;
+  if (!drag) return;
+  const box = canvasState.boxes[drag.index];
+  if (!box) return;
+
+  // Move: translate by the pointer delta and let constrainBoxToImage stop the box at the
+  // border. Deliberately uses the RAW pointer here — clamping it first would freeze the
+  // box as soon as the cursor left the image, not when the box's own edge got there.
+  if (drag.kind === "move") {
+    Object.assign(box, constrainBoxToImage({
+      ...box,
+      x: drag.startX + (imgX - drag.grabX),
+      y: drag.startY + (imgY - drag.grabY),
+    }));
+    return;
+  }
+
+  // Resize: clamp the pointer to the image BEFORE deriving the rect. Letting a dragged
+  // edge run past the border and relying on constrainBoxToImage to fix it up would shove
+  // the opposite edge instead (it preserves width, then slides x back inside).
+  const px = Math.min(Math.max(imgX, 0), canvasState.imageWidth || Infinity);
+  const py = Math.min(Math.max(imgY, 0), canvasState.imageHeight || Infinity);
+
+  // The edges NOT being dragged stay pinned to where they were at press time.
+  const right = drag.startX + drag.startW;
+  const bottom = drag.startY + drag.startH;
+  let { startX: x, startY: y, startW: w, startH: h } = drag;
+
+  if (drag.kind.includes("w")) {
+    x = Math.min(px, right - MIN_BOX_SIZE_PX);
+    w = right - x;
+  } else if (drag.kind.includes("e")) {
+    w = Math.max(MIN_BOX_SIZE_PX, px - drag.startX);
+  }
+  if (drag.kind.includes("n")) {
+    y = Math.min(py, bottom - MIN_BOX_SIZE_PX);
+    h = bottom - y;
+  } else if (drag.kind.includes("s")) {
+    h = Math.max(MIN_BOX_SIZE_PX, py - drag.startY);
+  }
+  Object.assign(box, constrainBoxToImage({ ...box, x, y, w, h }));
+}
+
+// One re-extract per gesture (on release), not per mouse move — a resize or move is a
+// geometry edit, so the box's cached signal is stale until the backend re-measures it.
+function finishBoxDrag(blotId) {
+  const drag = canvasState.boxDrag;
+  canvasState.boxDrag = null;
+  if (!drag) return;
+  const box = canvasState.boxes[drag.index];
+  if (!box) return;
+  const unchanged = box.x === drag.startX && box.y === drag.startY
+    && box.w === drag.startW && box.h === drag.startH;
+  if (unchanged) {   // a plain click (select, or a handle press with no drag) costs nothing
+    renderCanvas();
+    return;
+  }
+  markBoxGeometryChanged(box);
+  renderCanvas();
+  renderBoxList(blotId);   // refreshes the Area readout and shows "Extracting…"
+  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+}
+
+function handleDetectionClick(event, blotId) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  switch (button.id) {
+    case "detectBandsButton":
+      void onDetectBandsClick(blotId);
+      break;
+    case "addLaneButton":
+      addLane(blotId);
+      break;
+    case "removeLaneButton":
+      removeSelectedLane(blotId);
+      break;
+    case "detectBandsInLanesButton":
+      void detectBandsInLanes(blotId);
+      break;
+    case "acceptDetectionButton":
+      acceptDetectedCandidate(activeDetectionCandidate(), blotId, {
+        replace: document.getElementById("detectionReplace")?.checked ?? true,
+      });
+      break;
+    case "backToLanesButton":
+      backToLaneEditing(blotId);
+      break;
+    case "cancelDetectionButton":
+      cancelDetection(blotId);
+      break;
+    default:
+      break;
+  }
 }
 
 function renderCanvas() {
@@ -3948,13 +6070,17 @@ function renderCanvas() {
   ctx.fillStyle = themeToken("--image-canvas");
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  if (canvasState.image) {
+  // Prefer the locally composited preview while a display slider is in play; it is the
+  // same geometry as the server composite (both come from prepare_composite_channels), so
+  // boxes stay in register either way.
+  const source = (canvasState.previewDirty && canvasState.previewCanvas) || canvasState.image;
+  if (source) {
     ctx.save();
     ctx.translate(canvasState.panX, canvasState.panY);
     ctx.scale(canvasState.zoom, canvasState.zoom);
-    ctx.drawImage(canvasState.image, 0, 0);
+    ctx.drawImage(source, 0, 0);
 
-    const backgroundAxis = currentBackgroundAxis();
+    const backgroundConfig = currentBackgroundConfig();
 
     // Draw boxes in image space
     canvasState.boxes.forEach((box, index) => {
@@ -3968,7 +6094,7 @@ function renderCanvas() {
       ctx.strokeRect(box.x, box.y, box.w, box.h);
 
       // Dotted outlines of the background regions sampled for this box.
-      const bgRegions = backgroundRegionsForBox(box, backgroundAxis);
+      const bgRegions = backgroundRegionsForBox(box, backgroundConfig.sides, backgroundConfig.borderWidth);
       if (bgRegions.length) {
         ctx.save();
         ctx.setLineDash([4 / canvasState.zoom, 3 / canvasState.zoom]);
@@ -3982,7 +6108,66 @@ function renderCanvas() {
       ctx.fillStyle = color;
       ctx.font = themeFont(600, 14 / canvasState.zoom, "--font-mono");
       ctx.fillText(index + 1, box.x + 4 / canvasState.zoom, box.y + 16 / canvasState.zoom);
+
+      // Resize handles, on the selected box only. Outlined so they stay visible against
+      // both a saturated band and dark background.
+      if (isSelected) {
+        const size = BOX_HANDLE_DRAW_PX / canvasState.zoom;
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.strokeStyle = themeToken("--surface");
+        ctx.lineWidth = 1 / canvasState.zoom;
+        boxHandlePoints(box).forEach(point => {
+          ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+          ctx.strokeRect(point.x - size / 2, point.y - size / 2, size, size);
+        });
+        ctx.restore();
+      }
     });
+
+    // Live dashed preview of the box being drawn (updated coords live in
+    // canvasState so this render can be coalesced via requestRender()).
+    if (canvasState.isDrawing) {
+      ctx.save();
+      ctx.strokeStyle = themeToken("--annotation");
+      ctx.lineWidth = 2 / canvasState.zoom;
+      ctx.setLineDash([4 / canvasState.zoom, 4 / canvasState.zoom]);
+      ctx.strokeRect(
+        canvasState.startX,
+        canvasState.startY,
+        canvasState.drawCurrentX - canvasState.startX,
+        canvasState.drawCurrentY - canvasState.startY,
+      );
+      ctx.restore();
+    }
+
+    // Editable lane columns (lanes-first stage): full image height, selected lane emphasized.
+    if (canvasState.laneEdit && canvasState.laneEdit.lanes.length) {
+      const laneHeight = canvasState.imageHeight || canvasState.image?.naturalHeight || 0;
+      const primary = themeToken("--annotation-preview") || themeToken("--primary");
+      canvasState.laneEdit.lanes.forEach((lane, i) => {
+        const selected = i === canvasState.laneEdit.selected;
+        ctx.save();
+        ctx.globalAlpha = selected ? 0.22 : 0.10;
+        ctx.fillStyle = primary;
+        ctx.fillRect(lane.x, 0, lane.w, laneHeight);
+        ctx.restore();
+        ctx.strokeStyle = primary;
+        ctx.setLineDash([]);
+        ctx.lineWidth = (selected ? 2 : 1) / canvasState.zoom;
+        ctx.strokeRect(lane.x, 0, lane.w, laneHeight);
+      });
+    }
+
+    // Dashed, non-destructive preview of a detection candidate's boxes before commit.
+    if (canvasState.detectionPreview && canvasState.detectionPreview.length) {
+      ctx.save();
+      ctx.strokeStyle = themeToken("--annotation-preview") || themeToken("--primary");
+      ctx.setLineDash([6 / canvasState.zoom, 4 / canvasState.zoom]);
+      ctx.lineWidth = 1.5 / canvasState.zoom;
+      canvasState.detectionPreview.forEach(box => ctx.strokeRect(box.x, box.y, box.w, box.h));
+      ctx.restore();
+    }
 
     ctx.restore();
   }
@@ -4016,55 +6201,192 @@ function getImageCoords(canvas, clientX, clientY) {
   };
 }
 
+function onPointerDown(event) {
+  if (event.button !== 0) return;
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  event.currentTarget.focus({ preventScroll: true });
+  onMouseDown(event);
+}
+
+function onPointerUp(event) {
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  onMouseUp(event);
+}
+
+function cancelPointerInteraction(event) {
+  event.currentTarget.releasePointerCapture?.(event.pointerId);
+  canvasState.isPanning = false;
+  canvasState.isDrawing = false;
+  canvasState.laneDrag = null;
+  // A cancelled resize keeps whatever size the box reached, but must still re-extract —
+  // otherwise the box shows a signal measured from its old geometry.
+  if (canvasState.boxDrag) finishBoxDrag(canvasState.currentBlotId);
+  event.currentTarget.classList.remove("is-grabbing");
+  setCanvasDragCursor(event.currentTarget, null);
+  renderCanvas();
+}
+
+// Reached only by the "A" key on the canvas now that the button is gone — it is the sole
+// keyboard-accessible way to create a box (drawing one needs a pointer drag).
+function addCenteredBox(blotId = canvasState.currentBlotId) {
+  if (!canvasState.imageWidth || !canvasState.imageHeight) return;
+  if (remainingBoxSlots() <= 0) {
+    showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+    return;
+  }
+  const width = Math.max(8, Math.min(160, canvasState.imageWidth * 0.12));
+  const height = Math.max(8, Math.min(80, canvasState.imageHeight * 0.08));
+  const box = createCanvasBox({
+    x: (canvasState.imageWidth - width) / 2,
+    y: (canvasState.imageHeight - height) / 2,
+    w: width,
+    h: height,
+  });
+  canvasState.boxes.push(box);
+  canvasState.selectedBoxIndex = canvasState.boxes.length - 1;
+  renderCanvas();
+  renderBoxList(blotId);
+  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+}
+
+function onCanvasKeyDown(event) {
+  const blotId = canvasState.currentBlotId;
+  if (!blotId) return;
+  if (event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    addCenteredBox(blotId);
+    return;
+  }
+  if ((event.key === "Delete" || event.key === "Backspace")
+      && canvasState.mode === "lanes" && canvasState.laneEdit && canvasState.laneEdit.selected != null) {
+    event.preventDefault();
+    removeSelectedLane(blotId);
+    return;
+  }
+  if ((event.key === "Delete" || event.key === "Backspace") && selectedBox()) {
+    event.preventDefault();
+    deleteBox(canvasState.selectedBoxIndex, blotId);
+    return;
+  }
+  if (event.key === "+" || event.key === "=" || event.key === "-") {
+    event.preventDefault();
+    const factor = event.key === "-" ? 0.9 : 1.1;
+    const canvas = event.currentTarget;
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    const newZoom = Math.min(20, Math.max(0.1, canvasState.zoom * factor));
+    canvasState.panX = centerX - (centerX - canvasState.panX) * (newZoom / canvasState.zoom);
+    canvasState.panY = centerY - (centerY - canvasState.panY) * (newZoom / canvasState.zoom);
+    canvasState.zoom = newZoom;
+    requestRender();
+    return;
+  }
+  const directions = {
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+  };
+  const direction = directions[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  if (selectedBox()) {
+    nudgeSelectedBox(direction[0], direction[1], blotId);
+  } else {
+    const step = event.shiftKey ? 40 : 12;
+    canvasState.panX += direction[0] * step;
+    canvasState.panY += direction[1] * step;
+    requestRender();
+  }
+}
+
 function onMouseDown(event) {
   const canvas = event.target;
+  if (canvasState.mode === "lanes") {
+    if (onLaneEditMouseDown(canvas, event)) return;
+    // A click that missed every lane pans, so the user can reposition before adding lanes.
+    canvasState.isPanning = true;
+    canvasState.lastPanX = event.clientX;
+    canvasState.lastPanY = event.clientY;
+    canvas.classList.add("is-grabbing");
+    return;
+  }
+  // Resize handles win over pan/draw, so a box can be adjusted without switching modes.
+  if (onBoxEditMouseDown(canvas, event)) return;
   if (canvasState.mode === "pan") {
     canvasState.isPanning = true;
     canvasState.lastPanX = event.clientX;
     canvasState.lastPanY = event.clientY;
-    canvas.style.cursor = "grabbing";
+    canvas.classList.add("is-grabbing");
   } else if (canvasState.mode === "draw") {
     canvasState.isDrawing = true;
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
     canvasState.startX = coords.x;
     canvasState.startY = coords.y;
+    canvasState.drawCurrentX = coords.x;
+    canvasState.drawCurrentY = coords.y;
   }
 }
 
 function onMouseMove(event) {
   const canvas = event.target;
+  if (canvasState.boxDrag) {
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    updateBoxDrag(coords.x, coords.y);
+    requestRender();
+    return;
+  }
+  if (canvasState.laneDrag) {
+    const coords = getImageCoords(canvas, event.clientX, event.clientY);
+    updateLaneDrag(coords.x);
+    requestRender();
+    return;
+  }
   if (canvasState.isPanning) {
     canvasState.panX += event.clientX - canvasState.lastPanX;
     canvasState.panY += event.clientY - canvasState.lastPanY;
     canvasState.lastPanX = event.clientX;
     canvasState.lastPanY = event.clientY;
-    renderCanvas();
+    requestRender();
   } else if (canvasState.isDrawing) {
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
-    // Draw preview box
-    renderCanvas();
-    const ctx = canvas.getContext("2d");
-    ctx.save();
-    ctx.translate(canvasState.panX, canvasState.panY);
-    ctx.scale(canvasState.zoom, canvasState.zoom);
-    ctx.strokeStyle = themeToken("--annotation");
-    ctx.lineWidth = 2 / canvasState.zoom;
-    ctx.setLineDash([4 / canvasState.zoom, 4 / canvasState.zoom]);
-    ctx.strokeRect(
-      canvasState.startX,
-      canvasState.startY,
-      coords.x - canvasState.startX,
-      coords.y - canvasState.startY
-    );
-    ctx.restore();
+    canvasState.drawCurrentX = coords.x;
+    canvasState.drawCurrentY = coords.y;
+    requestRender();  // renderCanvas draws the dashed preview from these coords
+  } else if (canvasState.mode !== "lanes") {
+    // Idle hover: preview the gesture the pointer would start. Skip the
+    // getBoundingClientRect layout read when there is nothing draggable under it at all —
+    // this runs on every pointermove.
+    const canDrag = canvasState.boxes.length > 0;
+    if (!canDrag) {
+      setCanvasDragCursor(canvas, null);
+    } else {
+      const coords = getImageCoords(canvas, event.clientX, event.clientY);
+      // Handles win over the body, matching the press order in onBoxEditMouseDown. Body
+      // moves are pan-mode only, so don't advertise one in draw mode.
+      const kind = boxHandleHitTest(coords.x, coords.y)?.kind
+        ?? (canvasState.mode === "pan" && boxBodyHitTest(coords.x, coords.y) !== null ? "move" : null);
+      setCanvasDragCursor(canvas, kind);
+    }
   }
 }
 
 function onMouseUp(event) {
   const canvas = document.getElementById("blotCanvas");
+  if (canvasState.boxDrag) {
+    finishBoxDrag(canvasState.currentBlotId);
+    return;
+  }
+  if (canvasState.laneDrag) {
+    canvasState.laneDrag = null;
+    canvas?.classList.remove("is-grabbing");
+    renderCanvas();
+    renderLaneEditor(canvasState.currentBlotId);
+    return;
+  }
   if (canvasState.isPanning) {
     canvasState.isPanning = false;
-    if (canvas) canvas.style.cursor = "grab";
+    canvas?.classList.remove("is-grabbing");
   } else if (canvasState.isDrawing) {
     canvasState.isDrawing = false;
     const coords = getImageCoords(canvas, event.clientX, event.clientY);
@@ -4074,7 +6396,7 @@ function onMouseUp(event) {
     // Only reject clicks with no drag at all
     if (Math.abs(w) > 0.5 && Math.abs(h) > 0.5) {
       if (remainingBoxSlots() <= 0) {
-        alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
+        showUserMessage(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
         return;
       }
       const box = createCanvasBox({
@@ -4107,7 +6429,7 @@ function onWheel(event) {
   canvasState.panX = mouseX - (mouseX - canvasState.panX) * (newZoom / canvasState.zoom);
   canvasState.panY = mouseY - (mouseY - canvasState.panY) * (newZoom / canvasState.zoom);
   canvasState.zoom = newZoom;
-  renderCanvas();
+  requestRender();
 }
 
 // ─── Box list ─────────────────────────────────────────────────────────────────
@@ -4116,16 +6438,20 @@ function renderBoxList(blotId) {
   const container = document.getElementById("blotBoxList");
   if (!container) return;
   normalizeSelectedBoxIndex();
+  if (canvasState.boxes.length) {
+    setWorkspaceRecoveryStatus(
+      "Drawn boxes are a draft and are not restored after reload. Save the scan before leaving.",
+      true,
+    );
+  }
 
   if (!canvasState.boxes.length) {
     container.innerHTML = emptyBoxListHtml(blotId);
-    updateBoxToolState();
     return;
   }
 
   container.innerHTML = activeBoxListHtml(blotId);
   bindBoxListInputs(container, blotId);
-  updateBoxToolState();
 }
 
 function emptyBoxListHtml(blotId) {
@@ -4182,10 +6508,23 @@ function boxSignalHtml(box) {
     return `<span class="box-signal error-text" title="${escapeHtml(box.signalError || "Signal extraction failed")}">Extraction failed</span>`;
   }
   if (box.signal !== null) {
+    const sat = Number(box.signal.saturatedPixels) || 0;
+    const satHtml = sat > 0
+      ? `<span class="box-signal-warning" title="${sat.toLocaleString()} saturated pixel${sat === 1 ? "" : "s"} in this box. Saturated bands cannot be accurately quantified — the signal is underestimated. Re-image at a shorter exposure.">⚠ ${sat.toLocaleString()} saturated px</span>`
+      : "";
+    const unevenHtml = box.signal.backgroundUneven
+      ? `<span class="box-signal-warning" title="The background strips on opposite sides differ by more than 2×, which usually means one overlaps a neighbouring band. Move the box or switch the background sides.">⚠ uneven background</span>`
+      : "";
+    // Not a nuance like the two above: this signal is the raw integrated density with
+    // nothing taken off, so it is not comparable to any box that was subtracted.
+    const missingBgHtml = box.signal.backgroundMissing
+      ? `<span class="box-signal-warning" title="No background strip fits beside this box — it reaches the image edge on both sides, so nothing was subtracted and this is the raw signal. Shrink the box or switch the background sides.">⚠ no background subtracted</span>`
+      : "";
     return `
       <span class="box-signal">
         <strong>${box.signal.adjustedSignal.toLocaleString()}</strong>
         <span class="muted-text">(raw: ${box.signal.rawSignal.toLocaleString()})</span>
+        ${satHtml}${unevenHtml}${missingBgHtml}
       </span>
     `;
   }
@@ -4213,16 +6552,16 @@ function bindBoxListInputs(container, blotId) {
 
 function renderSavedScans(blotId) {
   const scans = scansForBlot(blotId);
-  if (!scans.length) return `<p class="blot-empty-state" style="margin-top:12px;">No session scans yet.</p>`;
+  if (!scans.length) return `<p class="blot-empty-state saved-scans-empty">No session scans yet.</p>`;
 
   return `
     <div class="saved-scans">
-      <p class="eyebrow" style="margin: 12px 0 8px;">Session scans</p>
+      <p class="eyebrow">Session scans</p>
       ${scans.map((scan, index) => `
         <div class="saved-scan-item">
           <div class="saved-scan-main">
             <span class="scan-protein">${escapeHtml(scan.proteinName)}</span>
-            <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundAxis}${scan.createdAt ? ` · ${escapeHtml(formatTimestamp(scan.createdAt))}` : ""}</span>
+            <span class="scan-meta">${scan.lanes.length} lanes · ${scan.channel}nm · ${scan.backgroundSides ?? scan.backgroundAxis}${scan.createdAt ? ` · ${escapeHtml(formatTimestamp(scan.createdAt))}` : ""}</span>
             <button class="ghost-button box-button danger" type="button"
               data-scan-delete="${index}">Delete</button>
           </div>
@@ -4271,7 +6610,9 @@ function scanAuditLaneRowHtml(lane) {
       <td>${escapeHtml(lane.name)}</td>
       <td>${formatAuditNumber(lane.adjustedSignal ?? lane.signal)}</td>
       <td>${formatAuditNumber(lane.rawSignal)}</td>
-      <td>${formatAuditNumber(lane.backgroundSignal)}</td>
+      <td>${lane.backgroundMissing
+        ? `<span class="box-signal-warning" title="No background strip fitted beside this box, so nothing was subtracted — this lane's signal is raw integrated density and is not comparable to the others.">none</span>`
+        : formatAuditNumber(lane.backgroundSignal)}</td>
       <td>${formatAuditNumber(lane.x)}</td>
       <td>${formatAuditNumber(lane.y)}</td>
       <td>${formatAuditNumber(lane.w)}</td>
@@ -4284,7 +6625,7 @@ function scanAuditLaneRowHtml(lane) {
 function scanAuditSummary(scan) {
   const settings = scan.settings || {};
   const colorMode = settings.colorMode ? `${settings.colorMode} view` : "viewer settings";
-  return `${scan.channel}nm, ${scan.backgroundAxis}, ${colorMode}`;
+  return `${scan.channel}nm, ${scan.backgroundSides ?? scan.backgroundAxis}, ${colorMode}`;
 }
 
 function formatBoxArea(box) {
@@ -4334,36 +6675,6 @@ function selectBox(index, blotId = canvasState.currentBlotId) {
   renderBoxList(blotId);
 }
 
-function updateBoxToolState() {
-  const selectedIndex = normalizeSelectedBoxIndex();
-  const hasSelection = selectedIndex !== null;
-  const canAlign = hasSelection && canvasState.boxes.length > 1;
-  const hasBoxCapacity = remainingBoxSlots() > 0;
-  const status = document.getElementById("selectedBoxStatus");
-  if (status) {
-    status.textContent = hasSelection
-      ? `Box ${selectedIndex + 1} selected.`
-      : "Select a box below.";
-  }
-
-  // Box layout tools only apply to a selected box, so keep the whole section out
-  // of the panel until there's a selection (and expand it when one appears).
-  const selectedSection = document.getElementById("selectedBoxSection");
-  if (selectedSection) {
-    selectedSection.hidden = !hasSelection;
-    if (hasSelection) selectedSection.open = true;
-  }
-
-  document.getElementById("duplicateBoxButton")?.toggleAttribute("disabled", !hasSelection || !hasBoxCapacity);
-  document.getElementById("matchBoxSizeButton")?.toggleAttribute("disabled", !canAlign);
-  document.querySelectorAll("[data-box-align]").forEach(button => {
-    button.toggleAttribute("disabled", !canAlign);
-  });
-  document.querySelectorAll("[data-box-nudge]").forEach(button => {
-    button.toggleAttribute("disabled", !hasSelection);
-  });
-}
-
 function remainingBoxSlots() {
   return Math.max(0, MAX_CANVAS_BOXES - canvasState.boxes.length);
 }
@@ -4387,153 +6698,97 @@ function constrainBoxToImage(box) {
   return constrained;
 }
 
-function boxOverlapsImage(box) {
-  if (canvasState.imageWidth <= 0 || canvasState.imageHeight <= 0) return true;
-  return box.x < canvasState.imageWidth
-    && box.y < canvasState.imageHeight
-    && box.x + box.w > 0
-    && box.y + box.h > 0;
-}
-
 function markBoxGeometryChanged(box) {
   box.signal = null;
   box.signalStatus = "loading";
   box.signalError = "";
 }
 
-function duplicateSelectedBox(blotId) {
-  const source = selectedBox();
-  const sourceIndex = canvasState.selectedBoxIndex;
-  if (!source) return;
-
-  const remainingSlots = remainingBoxSlots();
-  if (remainingSlots <= 0) {
-    alert(`Maximum ${MAX_CANVAS_BOXES} boxes per blot scan.`);
-    return;
-  }
-  const count = Math.min(
-    remainingSlots,
-    clampInteger(Number(document.getElementById("duplicateBoxCount")?.value), 1, 48, 1),
-  );
-  const gap = clampNumber(Number(document.getElementById("duplicateBoxGap")?.value), -2000, 2000, 8);
-  const direction = document.getElementById("duplicateBoxDirection")?.value || "right";
-  const offsets = {
-    right: [source.w + gap, 0],
-    left: [-(source.w + gap), 0],
-    down: [0, source.h + gap],
-    up: [0, -(source.h + gap)],
-  };
-  const [stepX, stepY] = offsets[direction] || offsets.right;
-  const copies = [];
-
-  for (let copyIndex = 1; copyIndex <= count; copyIndex += 1) {
-    const candidate = {
-      x: source.x + stepX * copyIndex,
-      y: source.y + stepY * copyIndex,
-      w: source.w,
-      h: source.h,
-    };
-    if (!boxOverlapsImage(candidate)) break;
-    copies.push(createCanvasBox(candidate));
-  }
-
-  if (!copies.length) return;
-  canvasState.boxes.splice(sourceIndex + 1, 0, ...copies);
-  canvasState.selectedBoxIndex = sourceIndex + copies.length;
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, copies, { alertOnError: false });
-}
-
-function alignBoxesToSelected(alignment, blotId) {
-  const anchor = selectedBox();
-  if (!anchor || canvasState.boxes.length < 2) return;
-
-  const changedBoxes = [];
-  canvasState.boxes.forEach((box, index) => {
-    if (index === canvasState.selectedBoxIndex) return;
-    if (alignment === "left") box.x = anchor.x;
-    if (alignment === "centerX") box.x = anchor.x + anchor.w / 2 - box.w / 2;
-    if (alignment === "right") box.x = anchor.x + anchor.w - box.w;
-    if (alignment === "top") box.y = anchor.y;
-    if (alignment === "centerY") box.y = anchor.y + anchor.h / 2 - box.h / 2;
-    if (alignment === "bottom") box.y = anchor.y + anchor.h - box.h;
-    Object.assign(box, constrainBoxToImage(box));
-    markBoxGeometryChanged(box);
-    changedBoxes.push(box);
-  });
-
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
-}
-
-function matchBoxesToSelectedSize(blotId) {
-  const anchor = selectedBox();
-  if (!anchor || canvasState.boxes.length < 2) return;
-
-  const changedBoxes = [];
-  canvasState.boxes.forEach((box, index) => {
-    if (index === canvasState.selectedBoxIndex) return;
-    const centerX = box.x + box.w / 2;
-    const centerY = box.y + box.h / 2;
-    box.w = anchor.w;
-    box.h = anchor.h;
-    box.x = centerX - box.w / 2;
-    box.y = centerY - box.h / 2;
-    Object.assign(box, constrainBoxToImage(box));
-    markBoxGeometryChanged(box);
-    changedBoxes.push(box);
-  });
-
-  renderCanvas();
-  void extractSignalsForBoxes(blotId, changedBoxes, { alertOnError: false });
-}
+// Arrow-key nudging on the canvas. One image pixel per press — the same step the removed
+// "Step px" control defaulted to.
+const BOX_NUDGE_STEP_PX = 1;
+// A held arrow key repeats at the OS rate, and one /extract per keypress burns the 30/min
+// limit in about a second — the 429s then mark the box "Extraction failed" and block Save
+// until a manual refresh. Coalesce to one measurement when the key-repeat burst stops,
+// matching finishBoxDrag's one-request-per-gesture rule. The box still moves every frame.
+let nudgeExtractTimer = null;
+const NUDGE_EXTRACT_DELAY_MS = 250;
 
 function nudgeSelectedBox(dx, dy, blotId) {
   const box = selectedBox();
   if (!box) return;
-  const step = clampInteger(Number(document.getElementById("boxNudgeStep")?.value), 1, 100, 1);
-  box.x += dx * step;
-  box.y += dy * step;
+  box.x += dx * BOX_NUDGE_STEP_PX;
+  box.y += dy * BOX_NUDGE_STEP_PX;
   Object.assign(box, constrainBoxToImage(box));
   markBoxGeometryChanged(box);
   renderCanvas();
-  void extractSignalsForBoxes(blotId, [box], { alertOnError: false });
+  if (nudgeExtractTimer) clearTimeout(nudgeExtractTimer);
+  nudgeExtractTimer = setTimeout(() => {
+    nudgeExtractTimer = null;
+    // Re-resolve rather than closing over `box`: the selection (or the blot) may have moved
+    // on during the delay, and re-measuring a box the user is no longer editing is wrong.
+    if (canvasState.currentBlotId !== blotId) return;
+    const target = selectedBox();
+    if (!target) return;
+    void extractSignalsForBoxes(blotId, [target], { alertOnError: false });
+  }, NUDGE_EXTRACT_DELAY_MS);
 }
 
 async function saveScan(blotId) {
   const proteinName = document.getElementById("scanProteinName")?.value.trim();
   if (!proteinName) {
-    alert("Please enter a protein name before saving.");
+    showUserMessage("Please enter a protein name before saving.");
     return;
   }
 
   const hasSignals = canvasState.boxes.every(box => box.signal !== null);
   if (!hasSignals) {
     const isExtracting = canvasState.boxes.some(box => box.signalStatus === "loading");
-    alert(isExtracting
+    showUserMessage(isExtracting
       ? "Please wait for signal extraction to finish before saving."
       : "One or more signals could not be extracted. Use Refresh signals and try again."
     );
     return;
   }
 
+  const saturatedBoxes = canvasState.boxes.filter((b) => (b.signal?.saturatedPixels || 0) > 0);
+  if (saturatedBoxes.length &&
+      !confirmUserAction(`${saturatedBoxes.length} box(es) contain saturated pixels, which cannot be accurately quantified (signal is underestimated). Save anyway?`)) {
+    return;
+  }
+
+  // Same shape as the saturation gate above. A box with no background strip reports raw
+  // integrated density, so saving it alongside subtracted lanes mixes two different
+  // measurements into one fold change — worth a decision rather than a silent number.
+  const unsubtractedBoxes = canvasState.boxes.filter((b) => b.signal?.backgroundMissing);
+  if (unsubtractedBoxes.length &&
+      !confirmUserAction(`${unsubtractedBoxes.length} box(es) had no background strip in bounds, so their signal is NOT background-subtracted and is not comparable to the other lanes. Save anyway?`)) {
+    return;
+  }
+
   const channel = document.getElementById("quantChannel")?.value ?? "700";
-  const backgroundAxis = document.getElementById("backgroundAxis")?.value ?? "leftright";
+  const backgroundConfig = currentBackgroundConfig();
 
   const scan = {
     id: clientId("scan"),
     proteinName,
     createdAt: new Date().toISOString(),
     channel,
-    backgroundAxis,
+    backgroundAxis: backgroundConfig.sides,
+    backgroundSides: backgroundConfig.sides,
+    borderWidth: backgroundConfig.borderWidth,
+    backgroundStat: backgroundConfig.stat,
     settings: {
-      colorMode: document.getElementById("colorMode")?.value ?? "color",
-      brightness700: Number(document.getElementById("brightness700")?.value ?? 1),
-      contrast700: Number(document.getElementById("contrast700")?.value ?? 1),
-      gamma700: Number(document.getElementById("gamma700")?.value ?? 1),
-      brightness800: Number(document.getElementById("brightness800")?.value ?? 1),
-      contrast800: Number(document.getElementById("contrast800")?.value ?? 1),
-      gamma800: Number(document.getElementById("gamma800")?.value ?? 1),
+      colorMode: currentColorMode(),
+      enabledChannels: enabledChannels(),
+      // Raw-count display window, or null when the channel is on its automatic window.
+      displayMin700: currentDisplayWindow("700")?.low ?? null,
+      displayMax700: currentDisplayWindow("700")?.high ?? null,
+      gamma700: currentDisplayGamma("700"),
+      displayMin800: currentDisplayWindow("800")?.low ?? null,
+      displayMax800: currentDisplayWindow("800")?.high ?? null,
+      gamma800: currentDisplayGamma("800"),
+      rotationDeg: canvasState.rotationDeg || 0,
     },
     lanes: canvasState.boxes.map((box, index) => {
       const signal = box.signal || {};
@@ -4545,6 +6800,13 @@ async function saveScan(blotId) {
         adjustedSignal: signal.adjustedSignal,
         rawSignal: signal.rawSignal,
         backgroundSignal: signal.backgroundSignal,
+        backgroundPerPixel: finiteNumberOrNull(signal.backgroundPerPixel),
+        // Provenance: a lane with no subtraction is not comparable to one with it, and the
+        // stored backgroundSignal of 0 does not distinguish the two on its own.
+        backgroundMissing: signal.backgroundMissing === true,
+        saturatedPixels: finiteNumberOrNull(signal.saturatedPixels) ?? 0,
+        saturatedFraction: finiteNumberOrNull(signal.saturatedFraction) ?? 0,
+        maxPixel: finiteNumberOrNull(signal.maxPixel),
         x: finiteNumberOrNull(signal.x) ?? box.x,
         y: finiteNumberOrNull(signal.y) ?? box.y,
         w,
@@ -4604,7 +6866,7 @@ function deleteBox(index, blotId) {
 
 async function extractSignals(blotId) {
   if (!canvasState.boxes.length) {
-    alert("Draw some boxes first.");
+    showUserMessage("Draw some boxes first.");
     return;
   }
 
@@ -4617,7 +6879,7 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
   const controller = new AbortController();
   signalExtractionControllers.add(controller);
   const channel = document.getElementById("quantChannel")?.value ?? "700";
-  const backgroundAxis = document.getElementById("backgroundAxis")?.value ?? "leftright";
+  const backgroundConfig = currentBackgroundConfig();
   const requests = boxes.map((box) => {
     const requestId = (box.signalRequestId || 0) + 1;
     box.signalRequestId = requestId;
@@ -4641,7 +6903,17 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
           blot: blotById(blotId),
           boxes: requestChunk.map(({ box }) => ({ x: box.x, y: box.y, w: box.w, h: box.h })),
           channel,
-          backgroundAxis,
+          backgroundSides: backgroundConfig.sides,
+          borderWidth: backgroundConfig.borderWidth,
+          backgroundStat: backgroundConfig.stat,
+          backgroundAxis: backgroundConfig.sides, // legacy key for older backends
+          // Natural size of the composite these boxes were drawn on. Lets the
+          // backend scale coordinates into a channel's native grid without
+          // re-reading the other channel's TIF header (JSON.stringify drops these
+          // when the image has not loaded yet, so the backend falls back safely).
+          compositeWidth: canvasState.imageWidth || undefined,
+          compositeHeight: canvasState.imageHeight || undefined,
+          rotationDeg: canvasState.rotationDeg || 0,   // measure the straightened native pixels
         }),
       }, "Signal extraction failed.");
 
@@ -4674,7 +6946,7 @@ async function extractSignalsForBoxes(blotId, boxes, { alertOnError = true } = {
       box.signalError = error.message;
     });
     renderBoxList(blotId);
-    if (alertOnError) alert(`Signal extraction failed: ${error.message}`);
+    if (alertOnError) showUserMessage(`Signal extraction failed: ${error.message}`);
   } finally {
     signalExtractionControllers.delete(controller);
   }
@@ -4704,155 +6976,6 @@ function scanToDataset(blotId, scanRef) {
   };
 }
 
-// ─── PowerPoint export ────────────────────────────────────────────────────────
-
-function canvasToImageDataUrl(canvas) {
-  return canvas.toDataURL(JPEG_MIME_TYPE, PPTX_JPEG_QUALITY);
-}
-
-async function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function compositeToImageDataUrl(blotId, defaultColorMode = "grayscale") {
-  return blobToDataUrl(await renderCompositeBlob(blotId, defaultColorMode));
-}
-
-async function generatePptx() {
-  if (!state.sharedAnalyses.length) {
-    alert("Please run an analysis first.");
-    return;
-  }
-
-  const button = document.getElementById("generatePptxButton");
-  if (button) {
-    button.textContent = "Generating...";
-    button.disabled = true;
-  }
-
-  try {
-    const slides = await buildPptxSlides();
-    const blob = await requestPptxBlob(slides);
-    downloadBlob(blob, "western-blot-analysis.pptx");
-  } catch (error) {
-    alert(`PowerPoint generation failed: ${error.message}`);
-  } finally {
-    if (button) {
-      button.textContent = "Export PowerPoint";
-      button.disabled = false;
-    }
-  }
-}
-
-async function buildPptxSlides() {
-  const slides = [];
-  const imageSlide = await buildPptxImageSlide();
-  if (imageSlide.images.length) slides.push(imageSlide);
-  state.sharedAnalyses.forEach((analysis, index) => {
-    slides.push(buildPptxGraphSlide(analysis, index));
-  });
-  return slides;
-}
-
-async function buildPptxImageSlide() {
-  const imageSlide = { type: PPTX_IMAGE_SLIDE_TYPE, images: [] };
-  for (let index = 0; index < state.sharedAnalyses.length; index += 1) {
-    const image = await sampleBlotPptxImage(index);
-    if (image) imageSlide.images.push(image);
-  }
-  const controlImage = await controlBlotPptxImage();
-  if (controlImage) imageSlide.images.push(controlImage);
-  return imageSlide;
-}
-
-async function sampleBlotPptxImage(index) {
-  const blotSelect = document.querySelector(`[data-blot-source-blot="sample-${index}"]`);
-  const usingBlot = blotSelect && !document.getElementById(`sampleBlot${index}`)?.hidden;
-  if (!usingBlot || !blotSelect?.value) return null;
-
-  return {
-    image: await compositeToImageDataUrl(blotSelect.value, "grayscale"),
-    label: `anti-${state.sharedAnalyses[index].name}`,
-  };
-}
-
-async function controlBlotPptxImage() {
-  const blotSelect = document.querySelector(`[data-blot-source-blot="control-0"]`);
-  const usingBlot = blotSelect && !document.getElementById("controlBlot0")?.hidden;
-  if (!usingBlot || !blotSelect?.value) return null;
-
-  const scanSelect = document.querySelector(`[data-blot-source-scan="control-0"]`);
-  const scan = findScanByRef(blotSelect.value, scanSelect?.value);
-  return {
-    image: await compositeToImageDataUrl(blotSelect.value, "grayscale"),
-    label: `anti-${scan?.proteinName || "Loading control"}`,
-  };
-}
-
-function buildPptxGraphSlide(analysis, index) {
-  return {
-    type: PPTX_GRAPH_SLIDE_TYPE,
-    title: analysis.title,
-    graphs: buildPptxGraphImages(analysis, index),
-  };
-}
-
-function buildPptxGraphImages(analysis, index) {
-  const graphs = [
-    renderChartDataUrl(960, 520, (canvas) => drawBarChart(canvas, analysis.results, analysis.title)),
-  ];
-
-  if (els.enableGroupedGraphs.checked) {
-    const previousActiveSampleIndex = state.activeSampleIndex;
-    state.activeSampleIndex = index;
-    const groups = buildGroupedRows(analysis);
-    state.activeSampleIndex = previousActiveSampleIndex;
-
-    groups.forEach((group) => {
-      const normalizedRows = normalizedGroupRows(group);
-      if (!normalizedRows) throw new Error(groupBaselineError(group));
-      graphs.push(renderChartDataUrl(640, 360, (canvas) => drawBarChart(canvas, normalizedRows, group.name)));
-    });
-  }
-
-  return graphs;
-}
-
-function renderChartDataUrl(width, height, draw) {
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  draw(canvas);
-  return canvasToImageDataUrl(canvas);
-}
-
-async function requestPptxBlob(slides) {
-  const response = await apiFetch(apiUrl("/generate-pptx"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ slides }),
-    timeoutMs: PPTX_EXPORT_TIMEOUT_MS,
-  });
-  if (!response.ok) {
-    throw new Error(await apiErrorMessage(response, "Failed to generate PowerPoint"));
-  }
-  return response.blob();
-}
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
 // ─── Workspace persistence (survive accidental reloads) ───────────────────────
 // The loaded blots, their extracted scans, and the active selection are mirrored
 // into sessionStorage so a same-tab reload restores the workspace instead of
@@ -4865,6 +6988,13 @@ function downloadBlob(blob, filename) {
 
 function hasUnsavedWork() {
   return blotState.blots.length > 0;
+}
+
+function setWorkspaceRecoveryStatus(message, isError = false) {
+  const status = document.getElementById("workspaceRecoveryStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
 }
 
 function serializeWorkspace() {
@@ -4885,11 +7015,24 @@ function saveWorkspace() {
   try {
     if (!hasUnsavedWork()) {
       window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
-      return;
+      setWorkspaceRecoveryStatus(sessionStartupWarning);
+      return true;
     }
     window.sessionStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(serializeWorkspace()));
+    sessionRecoveryAvailable = true;
+    setWorkspaceRecoveryStatus(
+      canvasState.boxes.length
+        ? "Tab recovery saved. Drawn boxes become recoverable after you save the scan."
+        : "Tab recovery saved. Export results before closing this tab.",
+    );
+    return true;
   } catch (_error) {
-    /* sessionStorage may be unavailable or full — persistence is best-effort. */
+    sessionRecoveryAvailable = false;
+    setWorkspaceRecoveryStatus(
+      "Tab recovery is unavailable or full. Export results before leaving this page.",
+      true,
+    );
+    return false;
   }
 }
 
@@ -4911,9 +7054,9 @@ function syncClearWorkspaceButton() {
 // instead of waiting for the TTL sweep, and we drop the saved snapshot too.
 async function clearWorkspace() {
   if (!blotState.blots.length) return;
-  if (!window.confirm("Clear all loaded blots and their scans from this session? This cannot be undone.")) return;
+  if (!confirmUserAction("Clear all loaded blots and their scans from this session? This cannot be undone.")) return;
 
-  void cleanupBlots(blotState.blots.slice());
+  await cleanupBlots(blotState.blots.slice());
   clearSavedWorkspace();
   disposeCanvasResources();
 
@@ -4927,6 +7070,7 @@ async function clearWorkspace() {
   renderBlotAnalysisEmpty("Select a blot to adjust channels and draw boxes.");
   renderBlotList();
   refreshBlotDependentControls();
+  setWorkspaceRecoveryStatus(sessionStartupWarning || "Work is temporary. Export results before closing this tab.", Boolean(sessionStartupWarning));
   setZipUploadStatus("Workspace cleared.", true);
 }
 
@@ -4998,7 +7142,62 @@ function restoreWorkspace() {
     // still present because we no longer delete it on reload.
     void selectBlot(activeIndex);
   }
+  setWorkspaceRecoveryStatus("Workspace restored for this tab. Export results before closing it.");
+  void backfillBlotFingerprints();
   return true;
+}
+
+// Fill in fingerprints for restored blots that have none, so duplicate detection works for
+// blots the user already has on screen and not just for freshly uploaded ones. Fire and
+// forget: it only affects a later upload, so nothing waits on it.
+// Matches MAX_FINGERPRINT_BLOTS in backend/app.py. A single scanner ZIP can hold ten blots,
+// so a few uploads would blow past the per-request cap and the whole backfill would 400.
+const FINGERPRINT_BATCH_SIZE = 50;
+// Backstop on the retry loop below. Only reached if every round keeps hitting the backend's
+// byte budget, which at 50 blots a round is far more workspace than a browser tab holds.
+const FINGERPRINT_MAX_ROUNDS = 20;
+
+async function backfillBlotFingerprints() {
+  const missing = blotState.blots.filter((blot) => !blotFingerprint(blot) && blot.files);
+  if (!missing.length) return;
+  let filled = 0;
+  try {
+    let pending = missing;
+    for (let round = 0; pending.length && round < FINGERPRINT_MAX_ROUNDS; round += 1) {
+      const batch = pending.slice(0, FINGERPRINT_BATCH_SIZE);
+      const response = await apiFetch(apiUrl("/blot-fingerprints"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: activeSessionId, blots: batch }),
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      const fingerprints = payload?.fingerprints;
+      if (!fingerprints || typeof fingerprints !== "object") break;
+      let gained = 0;
+      batch.forEach((blot) => {
+        const fingerprint = fingerprints[blot.id];
+        if (typeof fingerprint === "string" && fingerprint && !blotFingerprint(blot)) {
+          blot.fingerprint = fingerprint;
+          gained += 1;
+        }
+      });
+      filled += gained;
+      // The backend also caps total bytes read per request, so a batch of large TIFs can
+      // come back part-done. `truncated` means it stopped early and the tail was never
+      // read — keep those queued rather than writing them off. Anything else it declined
+      // (files already swept) will never hash, so drop the batch and move on.
+      pending = (payload.truncated === true ? pending : pending.slice(batch.length))
+        .filter((blot) => !blotFingerprint(blot));
+      // Truncated but nothing gained means the budget cannot fit even one blot; retrying
+      // the identical request would spin forever.
+      if (payload.truncated === true && !gained) break;
+    }
+  } catch (error) {
+    // Non-fatal: duplicate detection just stays limited to newly uploaded blots.
+    console.warn("Could not backfill blot fingerprints", error);
+  }
+  if (filled) saveWorkspace();
 }
 
 window.addEventListener("beforeunload", (event) => {
@@ -5030,5 +7229,6 @@ if (window.__WESTERN_BLOT_TEST__) {
     syncClearWorkspaceButton,
   };
 } else {
-  restoreWorkspace();
+  const restored = restoreWorkspace();
+  if (!restored) setWorkspaceRecoveryStatus(sessionStartupWarning || "Work is temporary. Export results before closing this tab.", Boolean(sessionStartupWarning));
 }
