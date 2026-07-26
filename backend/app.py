@@ -240,6 +240,9 @@ MAX_INTERACTIVE_PIXELS = int(os.environ.get("MAX_INTERACTIVE_PIXELS", 2_000_000)
 # raise decoded values by this same power; see the endpoint's docstring for why it is not
 # linear. Keep in sync with PIXEL_QUANTIZE_CURVE in frontend/app.js.
 PIXEL_QUANTIZE_CURVE = 2.0
+# Blots per /blot-fingerprints request. Each one re-reads both TIFs to hash them, so this
+# bounds the I/O a single call can trigger.
+MAX_FINGERPRINT_BLOTS = int(os.environ.get("MAX_FINGERPRINT_BLOTS", 50))
 # Default display window percentiles. The white point sits above p99 because bands
 # occupy well under 1% of a blot's pixels, so p99 lands on a band's shoulder and
 # flattens every core to one value.
@@ -1339,10 +1342,28 @@ def enforce_blot_member_sizes(zf, members):
     enforce_zip_member_size(zf, members["jpg"], MAX_JPEG_BYTES, "Blot preview image is too large.")
 
 
+def update_channel_fingerprint(digest, channel, member_bytes):
+    """Feed one channel's bytes into a blot fingerprint, in the caller's channel order
+    ("700" then "800"). Shared by the upload path and /blot-fingerprints so the two can
+    never disagree about how a blot is identified — if they drifted, a re-upload would stop
+    being recognised as a duplicate. Length-prefixed and channel-labelled so the same bytes
+    appearing under a different channel cannot collide."""
+    digest.update(f"{channel}:{len(member_bytes)}:".encode("ascii"))
+    digest.update(member_bytes)
+
+
 def store_blot_archive_members(zf, members, session_id, blot_id):
     """Validate and store one archive member at a time so a large preview and
-    both TIF channels are never retained in memory together."""
+    both TIF channels are never retained in memory together.
+
+    Returns (files, fingerprint). The fingerprint is a SHA-256 over the MEASURED channel
+    bytes only, so the client can recognise a blot it already holds and refuse to add it
+    twice. The preview JPG is excluded deliberately: it is cosmetic, and a re-export could
+    change it while the data is identical. Metadata is excluded for the same reason — if
+    the pixels are byte-identical it is the same scan, whatever it has been renamed to.
+    """
     files = {}
+    digest = hashlib.sha256()
     try:
         member_settings = (
             ("jpg", "preview.jpg", JPEG_MIMETYPE, None),
@@ -1356,6 +1377,7 @@ def store_blot_archive_members(zf, members, session_id, blot_id):
             member_bytes = zf.read(archive_name)
             if tif_label:
                 validate_tif_pixels(member_bytes, tif_label)
+                update_channel_fingerprint(digest, kind, member_bytes)
             descriptor = store_temp_file(
                 session_id,
                 blot_id,
@@ -1366,7 +1388,7 @@ def store_blot_archive_members(zf, members, session_id, blot_id):
             if descriptor:
                 files[kind] = descriptor
             del member_bytes
-        return files
+        return files, digest.hexdigest()
     except Exception:
         delete_temp_files_safely(
             list(files.values()),
@@ -1376,10 +1398,13 @@ def store_blot_archive_members(zf, members, session_id, blot_id):
         raise
 
 
-def blot_record(blot_id, blot_name, created_at, members, files):
+def blot_record(blot_id, blot_name, created_at, members, files, fingerprint=""):
     return {
         "id": blot_id,
         "name": blot_name,
+        # Content hash of the measured channels. The client uses it to skip a blot it
+        # already holds; blot ids are freshly generated per upload and cannot serve.
+        "fingerprint": fingerprint,
         "hasJpg": members["jpg"] is not None,
         "has700": members["700"] is not None,
         "has800": members["800"] is not None,
@@ -1400,8 +1425,8 @@ def parse_zip_folder(zf, folder, folder_index, files, session_id):
     txt_content = zf.read(members["txt"]).decode("utf-8", errors="ignore")
     blot_name, created_at = parse_blot_metadata(txt_content, folder)
     blot_id = f"{uuid.uuid4().hex}_{folder}".replace(" ", "_")
-    stored_files = store_blot_archive_members(zf, members, session_id, blot_id)
-    return blot_record(blot_id, blot_name, created_at, members, stored_files)
+    stored_files, fingerprint = store_blot_archive_members(zf, members, session_id, blot_id)
+    return blot_record(blot_id, blot_name, created_at, members, stored_files, fingerprint)
 
 
 def parse_zip(zip_source, session_id):
@@ -1651,6 +1676,68 @@ def render_composite():
     except Exception as error:
         app.logger.exception("Composite render failed")
         return error_response(error, "Could not render blot image.")
+
+
+@app.route("/blot-fingerprints", methods=["POST"])
+@app.route("/api/blot-fingerprints", methods=["POST"])
+@limiter.limit("30 per minute")
+def blot_fingerprints():
+    """Content fingerprints for blots the client already holds, computed from their stored
+    temp files. Needed because fingerprints only started being returned at upload time:
+    without this, a workspace restored from before the change would have none, so
+    re-uploading the same ZIP would still add a duplicate — the feature would look broken
+    for exactly the blots a user already has on screen.
+
+    Produces the same digest as the upload path (both go through
+    update_channel_fingerprint) because the stored file is byte-identical to the ZIP member
+    it came from."""
+    data = request.get_json(silent=True) or {}
+    session_id = request_session_id(data)
+    try:
+        blots = data.get("blots")
+        if not isinstance(blots, list):
+            return jsonify({"error": "Blots must be a list."}), 400
+        if len(blots) > MAX_FINGERPRINT_BLOTS:
+            return jsonify({
+                "error": f"Too many blots. Maximum is {MAX_FINGERPRINT_BLOTS} per request.",
+            }), 400
+
+        fingerprints = {}
+        for entry in blots:
+            try:
+                blot = load_payload_blot(entry, (), session_id)
+            except PublicError:
+                continue        # a blot whose files have already been swept: just skip it
+            blot_id = blot.get("id")
+            if not isinstance(blot_id, str) or not blot_id:
+                continue
+            digest = hashlib.sha256()
+            complete = True
+            hashed_any = False
+            for channel in ("700", "800"):
+                descriptor = blot["files"].get(channel)
+                if not descriptor:
+                    continue        # single-channel blot: the upload path skipped it too
+                try:
+                    channel_bytes = read_temp_file(
+                        descriptor, session_id, max_bytes=BLOT_FILE_LIMITS[channel]
+                    )
+                except Exception:
+                    complete = False
+                    break
+                update_channel_fingerprint(digest, channel, channel_bytes)
+                hashed_any = True
+            # Only report a whole fingerprint. A partial one would hash fewer channels than
+            # the upload path did, so it could never match — and worse, two different blots
+            # that both failed on their second channel would hash the same.
+            if complete and hashed_any:
+                fingerprints[blot_id] = digest.hexdigest()
+        return jsonify({"fingerprints": fingerprints})
+    except PublicError as error:
+        return error_response(error, "Could not fingerprint blots.")
+    except Exception as error:
+        app.logger.exception("Blot fingerprinting failed")
+        return error_response(error, "Could not fingerprint blots.")
 
 
 @app.route("/channel-stats", methods=["POST"])

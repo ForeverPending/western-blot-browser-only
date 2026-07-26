@@ -3403,18 +3403,48 @@ function normalizeBlot(blot) {
     ? blot.files
     : {};
   const createdAt = typeof blot.createdAt === "string" ? blot.createdAt : "";
-  return { ...blot, id, name, files, createdAt };
+  const fingerprint = typeof blot.fingerprint === "string" ? blot.fingerprint.trim() : "";
+  return { ...blot, id, name, files, createdAt, fingerprint };
 }
 
+// Content hash of a blot's measured channels, or "" when unknown. Blots saved by an older
+// version have no fingerprint, and "" must NEVER count as a match — otherwise every
+// legacy blot would look identical to every other one.
+function blotFingerprint(blot) {
+  return typeof blot?.fingerprint === "string" ? blot.fingerprint.trim() : "";
+}
+
+function findBlotByFingerprint(fingerprint, pool) {
+  if (!fingerprint) return null;
+  return pool.find((candidate) => blotFingerprint(candidate) === fingerprint) || null;
+}
+
+// Merges uploaded blots into state, skipping any whose content is already loaded. Blot ids
+// are regenerated on every upload, so re-uploading the same ZIP would otherwise stack up
+// identical copies. Returns { added, duplicates } — the caller is responsible for releasing
+// the skipped blots' temp files, which the backend has already stored by this point.
 function mergeBlots(blots) {
   if (!Array.isArray(blots)) throw new Error("ZIP processing returned invalid blot data.");
   const activeBlotId = blotState.blots[blotState.activeBlotIndex]?.id;
+  const added = [];
+  const duplicates = [];
   blots.map(normalizeBlot).forEach((blot) => {
     const existingIndex = blotState.blots.findIndex((candidate) => candidate.id === blot.id);
     if (existingIndex >= 0) {
+      // Same id: a refresh of a blot we already have, not a duplicate. Keep the merge
+      // behaviour so re-processing an upload can fill in fields.
       blotState.blots[existingIndex] = { ...blotState.blots[existingIndex], ...blot };
     } else {
+      // Check against what is already loaded AND against earlier blots in this same batch,
+      // so a ZIP containing the same folder twice collapses to one too.
+      const twin = findBlotByFingerprint(blotFingerprint(blot), blotState.blots)
+        || findBlotByFingerprint(blotFingerprint(blot), added);
+      if (twin) {
+        duplicates.push({ blot, existing: twin });
+        return;
+      }
       blotState.blots.push(blot);
+      added.push(blot);
     }
     if (!blotState.scans[blot.id]) blotState.scans[blot.id] = [];
   });
@@ -3423,6 +3453,21 @@ function mergeBlots(blots) {
     ? blotState.blots.findIndex((blot) => blot.id === activeBlotId)
     : -1;
   blotState.activeBlotIndex = activeIndex >= 0 ? activeIndex : null;
+  return { added, duplicates };
+}
+
+// One line describing what a merge skipped, naming the blot it already had so the user can
+// tell an accidental re-upload from two genuinely different scans.
+function duplicateSkipMessage(duplicates) {
+  if (!duplicates.length) return "";
+  if (duplicates.length === 1) {
+    const { blot, existing } = duplicates[0];
+    const sameName = blot.name === existing.name;
+    return sameName
+      ? `Skipped "${blot.name}" — already loaded.`
+      : `Skipped "${blot.name}" — same image data as "${existing.name}", already loaded.`;
+  }
+  return `Skipped ${duplicates.length} blots already loaded.`;
 }
 
 function sortBlotsByCreatedAt() {
@@ -3784,16 +3829,32 @@ async function uploadZip(file, signal) {
     setZipUploadStatus(`Processing ${file.name}...`);
     const data = await processZipFile(file, signal);
 
-    mergeBlots(data.blots || []);
+    const { added, duplicates } = mergeBlots(data.blots || []);
     if (data.scans) {
       Object.entries(data.scans).forEach(([blotId, scans]) => {
         setScansForBlot(blotId, scans);
       });
     }
+    // The backend stored these before we knew they were duplicates, so release them rather
+    // than leaving orphaned temp files behind until the session sweep.
+    if (duplicates.length) {
+      void cleanupBlots(duplicates.map((entry) => entry.blot));
+    }
     renderBlotList();
     refreshBlotDependentControls();
     saveWorkspace();
-    setZipUploadStatus(`${file.name} imported.`, true);
+    const skipped = duplicateSkipMessage(duplicates);
+    if (added.length) {
+      setZipUploadStatus(
+        skipped ? `${file.name} imported (${added.length} added). ${skipped}` : `${file.name} imported.`,
+        true,
+      );
+    } else if (skipped) {
+      // Nothing new: say so plainly instead of reporting a successful import.
+      setZipUploadStatus(`Nothing to import from ${file.name}. ${skipped}`, true);
+    } else {
+      setZipUploadStatus(`${file.name} imported.`, true);
+    }
     return { ok: true };
   } catch (error) {
     const cancelled = signal?.aborted || error.name === "AbortError" || /cancelled/i.test(error.message);
@@ -6954,7 +7015,45 @@ function restoreWorkspace() {
     void selectBlot(activeIndex);
   }
   setWorkspaceRecoveryStatus("Workspace restored for this tab. Export results before closing it.");
+  void backfillBlotFingerprints();
   return true;
+}
+
+// Fill in fingerprints for restored blots that have none, so duplicate detection works for
+// blots the user already has on screen and not just for freshly uploaded ones. Fire and
+// forget: it only affects a later upload, so nothing waits on it.
+// Matches MAX_FINGERPRINT_BLOTS in backend/app.py. A single scanner ZIP can hold ten blots,
+// so a few uploads would blow past the per-request cap and the whole backfill would 400.
+const FINGERPRINT_BATCH_SIZE = 50;
+
+async function backfillBlotFingerprints() {
+  const missing = blotState.blots.filter((blot) => !blotFingerprint(blot) && blot.files);
+  if (!missing.length) return;
+  let filled = 0;
+  try {
+    for (let start = 0; start < missing.length; start += FINGERPRINT_BATCH_SIZE) {
+      const batch = missing.slice(start, start + FINGERPRINT_BATCH_SIZE);
+      const response = await apiFetch(apiUrl("/blot-fingerprints"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: activeSessionId, blots: batch }),
+      });
+      if (!response.ok) break;
+      const { fingerprints } = await response.json();
+      if (!fingerprints || typeof fingerprints !== "object") break;
+      batch.forEach((blot) => {
+        const fingerprint = fingerprints[blot.id];
+        if (typeof fingerprint === "string" && fingerprint && !blotFingerprint(blot)) {
+          blot.fingerprint = fingerprint;
+          filled += 1;
+        }
+      });
+    }
+  } catch (error) {
+    // Non-fatal: duplicate detection just stays limited to newly uploaded blots.
+    console.warn("Could not backfill blot fingerprints", error);
+  }
+  if (filled) saveWorkspace();
 }
 
 window.addEventListener("beforeunload", (event) => {

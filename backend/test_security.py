@@ -501,6 +501,127 @@ class StatelessSessionBackendTests(unittest.TestCase):
             span = float(truth.max() - truth.min()) or 1.0
             self.assertLess(float(np.abs(decoded - truth).max()) / span, 1e-4)
 
+    def test_blot_fingerprint_identifies_identical_content(self):
+        # Blot ids are regenerated per upload, so the client needs a content hash to notice
+        # it is being handed the same scan twice.
+        first = self.upload_blot()
+        second = self.upload_blot()
+        self.assertTrue(first["fingerprint"])
+        self.assertNotEqual(first["id"], second["id"], "ids are per-upload")
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_backfilled_fingerprint_matches_the_upload_fingerprint(self):
+        # The whole point of /blot-fingerprints is to recognise a re-upload of a blot that
+        # was stored before fingerprints existed. If the two digests differ by so much as a
+        # byte ordering, the backfill is worse than useless — it would report a fingerprint
+        # that never matches anything.
+        blot = self.upload_blot()
+        response = self.client.post(
+            "/blot-fingerprints", json={"sessionId": SESSION_ID, "blots": [blot]},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(
+            response.get_json()["fingerprints"][blot["id"]], blot["fingerprint"]
+        )
+
+    def test_backfilled_fingerprint_matches_for_a_single_channel_blot(self):
+        upload = self.client.post(
+            "/upload-zip",
+            data={"sessionId": SESSION_ID, "file": (make_single_channel_zip(), "single.zip")},
+            content_type="multipart/form-data",
+        )
+        blot = upload.get_json()["blots"][0]
+        response = self.client.post(
+            "/blot-fingerprints", json={"sessionId": SESSION_ID, "blots": [blot]},
+        )
+        self.assertEqual(
+            response.get_json()["fingerprints"][blot["id"]], blot["fingerprint"]
+        )
+
+    def test_blot_fingerprints_is_session_scoped_and_bounded(self):
+        blot = self.upload_blot()
+        other_session = self.client.post(
+            "/blot-fingerprints", json={"sessionId": "someone-elses-session", "blots": [blot]},
+        )
+        # Unreadable in another session: reported as absent rather than leaking a hash of
+        # content that session cannot see.
+        self.assertEqual(other_session.status_code, 200)
+        self.assertEqual(other_session.get_json()["fingerprints"], {})
+
+        too_many = self.client.post(
+            "/blot-fingerprints",
+            json={"sessionId": SESSION_ID, "blots": [blot] * (backend.MAX_FINGERPRINT_BLOTS + 1)},
+        )
+        self.assertEqual(too_many.status_code, 400)
+
+        not_a_list = self.client.post(
+            "/blot-fingerprints", json={"sessionId": SESSION_ID, "blots": "nope"},
+        )
+        self.assertEqual(not_a_list.status_code, 400)
+
+    def test_blot_fingerprint_changes_with_pixel_data(self):
+        def upload(pixels):
+            tif = io.BytesIO(); tifffile.imwrite(tif, pixels)
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Blot A/metadata.txt", "Image metadata\n#Fri May 15 16:38:05 PDT 2026\nRemarks=x")
+                zf.writestr("Blot A/image_700.tif", tif.getvalue())
+                zf.writestr("Blot A/image_800.tif", tif.getvalue())
+            archive.seek(0)
+            response = self.client.post(
+                "/upload-zip",
+                data={"sessionId": SESSION_ID, "file": (archive, "scanner.zip")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            return response.get_json()["blots"][0]["fingerprint"]
+
+        base = np.arange(64, dtype=np.uint16).reshape(8, 8)
+        changed = base.copy()
+        changed[0, 0] += 1
+        self.assertNotEqual(upload(base), upload(changed), "one pixel must change the hash")
+
+    def test_blot_fingerprint_ignores_the_preview_image(self):
+        # The JPG is cosmetic; a re-export that only changes it is still the same scan.
+        def upload(preview):
+            tif = io.BytesIO(); tifffile.imwrite(tif, np.arange(64, dtype=np.uint16).reshape(8, 8))
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Blot A/metadata.txt", "Image metadata\n#Fri May 15 16:38:05 PDT 2026\nRemarks=x")
+                zf.writestr("Blot A/image_700.tif", tif.getvalue())
+                zf.writestr("Blot A/image_800.tif", tif.getvalue())
+                zf.writestr("Blot A/preview.jpg", preview)
+            archive.seek(0)
+            response = self.client.post(
+                "/upload-zip",
+                data={"sessionId": SESSION_ID, "file": (archive, "scanner.zip")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            return response.get_json()["blots"][0]["fingerprint"]
+
+        self.assertEqual(upload(b"first-preview-bytes"), upload(b"different-preview-bytes"))
+
+    def test_blot_fingerprint_distinguishes_channel_assignment(self):
+        # Same bytes, different channel. The digest is channel-labelled so a single-channel
+        # 800nm blot cannot collide with a single-channel 700nm one.
+        def upload(channel):
+            tif = io.BytesIO(); tifffile.imwrite(tif, np.arange(64, dtype=np.uint16).reshape(8, 8))
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Blot A/metadata.txt", "Image metadata\n#Fri May 15 16:38:05 PDT 2026\nRemarks=x")
+                zf.writestr(f"Blot A/image_{channel}.tif", tif.getvalue())
+            archive.seek(0)
+            response = self.client.post(
+                "/upload-zip",
+                data={"sessionId": SESSION_ID, "file": (archive, "scanner.zip")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            return response.get_json()["blots"][0]["fingerprint"]
+
+        self.assertNotEqual(upload("700"), upload("800"))
+
     def test_disabled_channel_is_dropped_from_the_composite(self):
         blot = self.upload_blot()
 
