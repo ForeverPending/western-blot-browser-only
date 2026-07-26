@@ -64,6 +64,12 @@
   backend/Vercel environment variables.
 - Do not put Blob tokens, backend secrets, or private object URLs in
   `frontend/config.js`.
+- `BLOB_HOST_PIN` ships as `log`. Descriptor URLs are host-checked against
+  `*.blob.vercel-storage.com`, which does not pin the *store*, so a request can
+  name a store this deployment does not own. In `log` mode a mismatch is reported
+  as `blob_host_pin_mismatch` and allowed; every legitimate descriptor is one your
+  own store minted, so the expected count is zero. Once a full traffic cycle
+  confirms that, set `BLOB_HOST_PIN=enforce`.
 - Keep `MAX_ZIP_BYTES`, `MAX_ZIP_UPLOAD_BYTES`, and
   `BLOB_UPLOAD_TOKEN_RATE_LIMIT` aligned with your hosting memory and cost
   limits.
