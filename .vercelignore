@@ -32,6 +32,30 @@ __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Rebuilt by the install step from package.json + package-lock.json, which DO ship — the
+# @vercel/blob import in api/blob-upload.js resolves from that install, not from an upload.
+node_modules/
+
+# Written by `vercel link` / the first CLI deploy. Holds projectId and orgId; no reason for
+# it to make the round trip back up.
+.vercel/
+
+# macOS writes these into every directory it browses, and each one lists the directory's
+# contents — including names of files since deleted. Three exist in this tree today.
+.DS_Store
+**/.DS_Store
+
+# Local-only data and scratch output, all gitignored, none of it runtime input.
+*.sqlite
+*.sqlite3
+*.log
+logs/
 
 .pre-commit-config.yaml
 .claude/
+.vscode/
+.idea/

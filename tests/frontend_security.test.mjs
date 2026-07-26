@@ -59,7 +59,16 @@ test("deployment never ships a .env or local blot data", () => {
   assert.match(vercelIgnore, /^\*\*\/\.env$/m);
   assert.match(vercelIgnore, /^!\*\*\/\.env\.example$/m);
   assert.match(vercelIgnore, /^test_blots\/$/m);
+  assert.match(vercelIgnore, /^\.vercel\/$/m);      // projectId / orgId
+  assert.match(vercelIgnore, /^\*\*\/\.DS_Store$/m);
   assert.doesNotMatch(vercelIgnore, /^backend\/$/m, "excluding backend/ would 404 the whole API");
+  // These three are runtime inputs, not clutter: Vercel installs Python deps from
+  // requirements.txt and Node deps from package.json + lock. Excluding any of them would
+  // break the deployment rather than tidy it.
+  ["requirements.txt", "package.json", "package-lock.json"].forEach((needed) => {
+    assert.doesNotMatch(vercelIgnore, new RegExp(`^${needed.replace(".", "\\.")}$`, "m"),
+      `${needed} is needed by the install step`);
+  });
 });
 
 test("the vendored SheetJS bundle matches its pinned hash", () => {
