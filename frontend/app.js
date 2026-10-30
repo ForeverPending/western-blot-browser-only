@@ -2145,7 +2145,7 @@ function groupSelectionKeys(group, rows, keyForRow) {
 }
 
 function setGroupSelectionKeys(group, rows, keyForRow, selectedKeys) {
-  const wanted = new Set(selectedKeys.map((key) => String(key)));
+  const wanted = new Set(selectedKeys);
   const orderedKeys = [];
   const orderedIndices = [];
   rows.forEach((row, index) => {
